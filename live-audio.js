@@ -1,24 +1,21 @@
 /**
- * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine
+ * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees:
- * 1. Opens a FRESH WebSocket connection per vocabulary word so the context window
- *    never accumulates multi-word audio history, eliminating context degradation and
- *    staying well under Free Tier / AI Pro 65k TPM limits.
- * 2. Streams 16kHz 16-bit mono PCM from the Pixel 9 / car Bluetooth microphone
- *    via an inline Blob AudioWorkletProcessor, gated strictly during tutor speech,
- *    turn commits, and tool calls so leaked mic frames never cause `1007` disconnects.
- * 3. Plays 24kHz 16-bit mono PCM audio chunks from Gemini Live seamlessly.
- * 4. Handles terminal tools (`complete_word` and `session_control`) deterministically:
- *    once the tutor's farewell audio is queued and `complete_word` is emitted, closes
- *    the WebSocket immediately without sending a redundant `toolResponse` (preventing
- *    post-tool generation/thinking loops and `1007` errors) while letting WebAudio
- *    finish playing naturally before advancing to the next word.
- * 5. Records structured protocol, VAD, tool-call, WebSocket close reason, and hidden
- *    model-thought traces into `debugLogger` (`localStorage`) for 1-tap Gemini debugging.
+ * Key architectural guarantees (v13):
+ * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
+ * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
+ *    Real-world telemetry proved Gemini Live native-audio models (`2.5` / `3.x`) run pure
+ *    Speech-to-Speech turns cleanly, whereas mid-audio `functionCall` generation triggers
+ *    server-side `1011 Internal error occurred` and `1007` disconnects. Instead, the tutor
+ *    uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
+ *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading runs asynchronously
+ *    over standard REST JSON in the background after the word ends!
+ * 3. Mid-sentence crash recovery: if a cellular drop or server `1011` interrupts the tutor
+ *    BEFORE `turnComplete`, auto-reconnect rotates to the next healthy Live model immediately
+ *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
  */
 
-import { debugLogger } from './debug-logger.js?v=12';
+import { debugLogger } from './debug-logger.js?v=13';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -49,6 +46,32 @@ class PcmRecorderProcessor extends AudioWorkletProcessor {
 registerProcessor('pcm-recorder-processor', PcmRecorderProcessor);
 `;
 
+/**
+ * Deterministic spoken sign-off phrase detector on `outputAudioTranscription`.
+ * Eliminates fragile `BidiGenerateContent` tool calls completely!
+ */
+export function detectSpokenTerminalCue(spokenText = '') {
+  const clean = String(spokenText || '').replace(/\s+/g, '');
+  if (!clean) return null;
+
+  if (/已標記問題卡片|標記問題卡片|標記這題|標記這張卡片/.test(clean)) {
+    return { type: 'control', action: 'flag_bad_card' };
+  }
+  if (/我們跳過這題|跳過這題|跳過這一題|跳過這個單字/.test(clean)) {
+    return { type: 'control', action: 'skip' };
+  }
+  if (/我們先暫停練習|先暫停練習|暫停練習/.test(clean)) {
+    return { type: 'control', action: 'pause' };
+  }
+  if (/今天的練習結束|結束今天的練習|練習結束囉|結束練習囉/.test(clean)) {
+    return { type: 'control', action: 'end_session' };
+  }
+  if (/我們看下一題|看下一題吧|看下一題囉|進入下一題|換下一題|來看下一題|進行下一題|下一個單字/.test(clean)) {
+    return { type: 'complete_word' };
+  }
+  return null;
+}
+
 export function buildWordSystemInstruction(word, priorTurns = []) {
   const referenceMandarin = (word.mandarin_sentence || word.sample_mandarin || '').trim();
   const synonymsLine = word.common_synonyms
@@ -60,7 +83,7 @@ export function buildWordSystemInstruction(word, priorTurns = []) {
     const formattedTurns = priorTurns
       .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
       .join('\n');
-    resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段，若學生已反問問題則簡短回答一句並呼叫一次 \`complete_word\`。`;
+    resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段；若學生已反問問題（或已完成三輪問答），請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。`;
   }
 
   return `你是一位專業、親切、有耐心的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
@@ -87,97 +110,28 @@ export function buildWordSystemInstruction(word, priorTurns = []) {
      - 若學生用了近義詞而非「${word.traditional}」：先肯定他的句子很自然，並溫柔提示他換成今天要練習的目標詞（不要直接唸出目標詞讀音，且不計入發音或語法扣分）。
      - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、漏掉目標詞、或語法不自然**：請參考「${referenceMandarin}」，用自然慢速的台灣華語清楚給予回饋與糾正（明確指出哪個字幾聲或哪裡語法怎麼改比較自然），清楚示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
      - 若學生問任何問題：請用簡單慢速的台灣華語清楚回答，然後引導他回到這句話的練習。
-     - 若學生主動要求「提示 / Hint」或「直接給我答案」：可給他提示或直接示範「${referenceMandarin}」（並在最後紀錄 \`needed_hint: true\`），但仍請他跟著親口唸出完整正確的句子一次。
+     - 若學生主動要求「提示 / Hint」或「直接給我答案」：可給他提示或直接示範「${referenceMandarin}」，但仍請他跟著親口唸出完整正確的句子一次。
   3. 持續互動直到學生親口完整說出包含「${word.traditional}」且語法自然、發音正確的句子為止。
 
 - **階段二（老師延伸提問）**：
   當學生成功說出正確自然的句子後，先簡短肯定他（例如：「說得很好！」），並立刻根據這句話的情境，用**簡單、自然慢速的台灣華語**問他一個簡短的日常**延伸問題（follow-up question）**（使用基礎詞彙，6～12 個字以內）。
 
-- **階段三（學生回答＋反問老師）**：
-  1. 學生會用中文回答你的問題，並且應該要**順便反問你一個相關的問題**。
-  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正。
-  3. **關鍵檢查**：如果學生只有回答你的問題，卻忘記反問你問題，請溫柔提醒他：「很好！那你也問我一個問題吧！」並等待他提問。
+- **階段三（學生回答＋請學生反問老師）**：
+  1. 學生會用中文回答你的問題，並且應該要順便反問你一個相關的問題。
+  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正一句。
+  3. **關鍵規則**：如果學生只有回答你的問題、還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並等待他提問。如果學生已經反問你問題了，就直接進入階段四。
 
-- **階段四（老師簡短回答並立刻結束本題）**：
-  當學生提出他的問題後，請不要過度思考或重複說話——請先用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，接著說聲「好，我們看下一題！」，**在把話講完的最後立刻呼叫一次工具函式 \`complete_word\`**。呼叫 \`complete_word\` 後本題連線就會立刻結束，請絕對不要重複回答或再次呼叫工具。
+- **階段四（老師簡短回答並說出固定換題口令）**：
+  當學生提出他的問題後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+  （注意：在階段一至階段三未完成前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）
 
-【免持語音控制指令】
-如果學生隨時用中文或英文說：
-- 「跳過 / 下一題 / Skip / Next word」 -> 簡短回應「好，跳過這題」並立刻呼叫 \`session_control(action="skip")\`
-- 「這題怪怪的 / 標記問題卡片 / Flag card」 -> 呼叫 \`session_control(action="flag_bad_card")\`
-- 「再說一次英文 / Repeat the English sentence」 -> 重新清楚唸一次英文題目："${word.english_prompt}"
-- 「暫停 / Pause」 -> 呼叫 \`session_control(action="pause")\`
-- 「結束練習 / 停止 / End session」 -> 呼叫 \`session_control(action="end_session")\`${resumeSection}`;
+【免持語音控制固定口令（僅在學生主動要求時說出對應句子）】
+- 學生說「跳過 / 下一題 / Skip / Next word」 -> 請直接說：**「好，我們跳過這題！」**
+- 學生說「這題怪怪的 / 標記問題卡片 / Flag card」 -> 請直接說：**「好，已標記問題卡片，我們跳過這題！」**
+- 學生說「再說一次英文 / Repeat the English sentence」 -> 重新清楚唸一次英文題目："${word.english_prompt}"
+- 學生說「暫停 / Pause」 -> 請直接說：**「好，我們先暫停練習。」**
+- 學生說「結束練習 / 停止 / End session」 -> 請直接說：**「好，今天的練習結束囉！」**${resumeSection}`;
 }
-
-export const TUTOR_TOOLS_DECLARATION = [
-  {
-    functionDeclarations: [
-      {
-        name: 'complete_word',
-        description:
-          '在完成四階段練習、且老師已經用口語回答完學生的反問並說出「好，我們看下一題！」之後，於該回合最後呼叫一次此函式以紀錄學生的表現並切換到下一個單字（呼叫後本題即結束，請勿重複呼叫或繼續說話）。',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            target_word_recalled: {
-              type: 'BOOLEAN',
-              description: '學生是否在沒有直接偷看答案的情況下想出目標詞彙（若只是一開始猜到同義詞再換回來，仍視為 true）。'
-            },
-            needed_hint: {
-              type: 'BOOLEAN',
-              description: '學生是否明確要求提示（hint）或要求老師直接給出目標詞讀音才能完成。'
-            },
-            pronunciation_attempts: {
-              type: 'INTEGER',
-              description: '學生在階段一嘗試說出正確發音/聲調的次數（一次就唸對填 1）。'
-            },
-            grammar_errors: {
-              type: 'INTEGER',
-              description: '學生在翻譯或延伸對話中發生的語法錯誤次數（沒有錯誤填 0）。'
-            },
-            conversation_fluency: {
-              type: 'STRING',
-              enum: ['natural', 'good', 'struggled'],
-              description: '學生在階段一至階段三整體的口語流暢度（natural=非常自然流暢, good=良好但有小修正, struggled=明顯卡頓吃力）。'
-            },
-            notes: {
-              type: 'STRING',
-              description: '簡短繁體中文備註：紀錄學生哪個字聲調或語法需要注意（例如：「餐館的三聲變調很準」或「需要注意量詞家/間」）。'
-            }
-          },
-          required: [
-            'target_word_recalled',
-            'needed_hint',
-            'pronunciation_attempts',
-            'grammar_errors',
-            'conversation_fluency'
-          ]
-        }
-      },
-      {
-        name: 'session_control',
-        description:
-          '當學生口頭要求跳過單字（skip）、標記問題卡片（flag_bad_card）、暫停練習（pause）或結束練習（end_session）時呼叫。',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            action: {
-              type: 'STRING',
-              enum: ['skip', 'flag_bad_card', 'pause', 'end_session'],
-              description: '要執行的控制動作。'
-            },
-            reason: {
-              type: 'STRING',
-              description: '簡短原因說明。'
-            }
-          },
-          required: ['action']
-        }
-      }
-    ]
-  }
-];
 
 export class GeminiLiveVoicePipeline {
   constructor(callbacks = {}) {
@@ -198,11 +152,11 @@ export class GeminiLiveVoicePipeline {
     this.isActive = false;
     this.intentionalClose = false;
     this.wordTerminalActionLocked = false;
+    this.usedHintInWord = false;
 
     this.nextPlayTime = 0;
     this.activeSources = new Set();
     this.pendingActionAfterPlayback = null;
-    this.terminalFallbackTimer = null;
 
     // Hybrid VAD (Server automaticActivityDetection + Client 2.8s silence backup)
     this.silenceWaitMs = 2800;
@@ -217,6 +171,7 @@ export class GeminiLiveVoicePipeline {
     this.noiseFloor = 0.005;
     this.currentTurnUserTranscript = '';
     this.currentTurnTutorTranscript = '';
+    this.interruptedTutorPartialText = '';
     this.noReplyRecoveryTimer = null;
     this.reconnectTimer = null;
     this.postPlaybackCooldownUntil = 0;
@@ -316,13 +271,6 @@ export class GeminiLiveVoicePipeline {
     }
   }
 
-  /**
-   * Hybrid VAD per Google's Gemini Live specification:
-   * - Server-side `automaticActivityDetection` (`prefixPaddingMs: 300, silenceDurationMs: 2200`) handles primary
-   *   speech-start lookback and natural 2.2s end-of-turn detection.
-   * - Client-side VAD gates out mic frames while the tutor speaks, during post-playback echo cooldown, or once a
-   *   terminal tool call (`complete_word`) is locked — closing the audio leakage gap that causes `1007` disconnects.
-   */
   _processMicFrameWithVad(float32Samples, rms) {
     const now = performance.now();
 
@@ -347,12 +295,10 @@ export class GeminiLiveVoicePipeline {
     const speechContinueThreshold = Math.max(0.011, Math.min(0.036, this.noiseFloor * 1.9));
 
     if (!this.userSpokeInTurn) {
-      // Stream live 100ms PCM frames continuously so server `prefixPaddingMs` captures the very first syllable
       this._sendAudioChunk(pcm16Base64);
 
       if (rms >= speechStartThreshold) {
         this.consecutiveSpeechFrames += 1;
-        // Require 300ms (3 x 100ms frames) of sustained voice energy so brief clicks/breaths don't false-trigger
         if (this.consecutiveSpeechFrames >= 3) {
           this.userSpokeInTurn = true;
           this.lastVoiceActivityTime = now;
@@ -371,7 +317,6 @@ export class GeminiLiveVoicePipeline {
       return;
     }
 
-    // User has started speaking in this turn
     this._sendAudioChunk(pcm16Base64);
 
     if (rms >= speechContinueThreshold) {
@@ -433,11 +378,6 @@ export class GeminiLiveVoicePipeline {
     } catch (_) {}
   }
 
-  /**
-   * Commits the user's spoken Mandarin turn using protocol-clean `realtimeInput.audioStreamEnd`.
-   * - Uses an 8.5s recovery window when speech was detected (and cancels immediately if ANY server
-   *   thought, transcription, audio chunk, or tool call arrives) so it NEVER fires mid-thinking!
-   */
   commitUserSpeechTurn(reason = 'auto_silence') {
     if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (this.tutorTurnActive || this.wordTerminalActionLocked) return;
@@ -509,9 +449,6 @@ export class GeminiLiveVoicePipeline {
     }, recoveryWaitMs);
   }
 
-  /**
-   * Allows the user to manually finish their speaking turn immediately (e.g. tapping "Done Speaking" or the Orb).
-   */
   finishUserTurnNow() {
     if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     if (this.listeningForUser && !this.wordTerminalActionLocked) {
@@ -521,9 +458,6 @@ export class GeminiLiveVoicePipeline {
     return false;
   }
 
-  /**
-   * Plays a subtle, eyes-free earcon chime when starting a word, scoring a word, or pausing.
-   */
   playChime(type = 'next') {
     if (!this.audioCtx) return;
     try {
@@ -565,6 +499,7 @@ export class GeminiLiveVoicePipeline {
     this.closeCurrentWordSocket();
     this.pendingActionAfterPlayback = null;
     this.wordTerminalActionLocked = false;
+    this.usedHintInWord = false;
     this.isActive = true;
     this.intentionalClose = false;
     this.currentWord = word;
@@ -572,6 +507,7 @@ export class GeminiLiveVoicePipeline {
     this.wordTurns = [];
     this.currentTurnUserTranscript = '';
     this.currentTurnTutorTranscript = '';
+    this.interruptedTutorPartialText = '';
     this.serverAckedCurrentUserTurn = false;
     this.sentAudioChunksInTurn = 0;
     this.turnAudioChunks = 0;
@@ -598,12 +534,11 @@ export class GeminiLiveVoicePipeline {
   }
 
   /**
-   * Manually or automatically reconnects the active word session without losing conversation progress.
+   * Manually reconnects the active word session without losing conversation progress.
    */
   async reconnectCurrentWord() {
     if (!this.currentWord || !this.lastLiveConfig) return;
-    this._commitPendingUserTranscriptToTurns();
-    this._commitPendingTutorTranscriptToTurns();
+    this._capturePreDisconnectState();
     this._closeRawSocketOnly();
     this.isActive = true;
     this.intentionalClose = false;
@@ -611,7 +546,8 @@ export class GeminiLiveVoicePipeline {
     this.reconnectAttempts = 0;
     this.isReconnecting = false;
     debugLogger.log('info', 'manual_reconnect', 'User triggered manual reconnect for current word', {
-      wordTurnsCount: this.wordTurns.length
+      wordTurnsCount: this.wordTurns.length,
+      interruptedTutorPartialText: this.interruptedTutorPartialText
     });
     await this._openSocketWithFallbacks(this.currentWord, this.lastLiveConfig, true, 0);
   }
@@ -627,13 +563,29 @@ export class GeminiLiveVoicePipeline {
     }
   }
 
-  _commitPendingTutorTranscriptToTurns() {
-    const pendingTutor = this.currentTurnTutorTranscript.trim();
-    if (pendingTutor) {
+  _commitCompletedTutorTranscriptToTurns() {
+    const completedTutor = this.currentTurnTutorTranscript.trim();
+    if (completedTutor) {
       const last = this.wordTurns[this.wordTurns.length - 1];
-      if (!last || last.role !== 'tutor' || last.text !== pendingTutor) {
-        this.wordTurns.push({ role: 'tutor', text: pendingTutor });
+      if (!last || last.role !== 'tutor' || last.text !== completedTutor) {
+        this.wordTurns.push({ role: 'tutor', text: completedTutor });
       }
+      this.currentTurnTutorTranscript = '';
+    }
+    this.interruptedTutorPartialText = '';
+  }
+
+  /**
+   * Distinguishes between a COMPLETED tutor turn (`turnComplete` already arrived) vs. an
+   * INTERRUPTED mid-sentence tutor turn (`tutorTurnActive === true` when the socket dropped!).
+   * Never marks an interrupted tutor utterance as a finished turn, so reconnect immediately
+   * finishes speaking instead of freezing in `listening`!
+   */
+  _capturePreDisconnectState() {
+    this._commitPendingUserTranscriptToTurns();
+    const partialTutor = this.currentTurnTutorTranscript.trim();
+    if (partialTutor) {
+      this.interruptedTutorPartialText = partialTutor;
       this.currentTurnTutorTranscript = '';
     }
   }
@@ -653,9 +605,18 @@ export class GeminiLiveVoicePipeline {
       return;
     }
 
-    // Preserve BOTH user and partial tutor transcripts so reconnecting never repeats an already-spoken answer!
-    this._commitPendingUserTranscriptToTurns();
-    this._commitPendingTutorTranscriptToTurns();
+    this._capturePreDisconnectState();
+
+    // Check if the partial tutor utterance right before disconnect ALREADY contained the terminal sign-off!
+    if (this.interruptedTutorPartialText) {
+      const partialCue = detectSpokenTerminalCue(this.interruptedTutorPartialText);
+      if (partialCue) {
+        this.wordTurns.push({ role: 'tutor', text: this.interruptedTutorPartialText });
+        this.interruptedTutorPartialText = '';
+        this._executeTerminalCue(partialCue, 'partial_before_disconnect');
+        return;
+      }
+    }
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       debugLogger.log(
@@ -669,12 +630,12 @@ export class GeminiLiveVoicePipeline {
 
     this.isReconnecting = true;
     this.reconnectAttempts += 1;
-    const delayMs = this.reconnectAttempts === 1 ? 500 : this.reconnectAttempts === 2 ? 1200 : 2200;
+    const delayMs = this.reconnectAttempts === 1 ? 450 : this.reconnectAttempts === 2 ? 1100 : 2000;
 
-    // If a specific model failed mid-word with 1007/1008/1011, rotate model candidates on attempt >= 2
+    // Immediately rotate to the next Live model candidate if a model crashed mid-word with 1007/1008/1011!
     const modelRotationOffset =
-      (closeCode === 1007 || closeCode === 1008 || closeCode === 1011) && this.reconnectAttempts >= 2
-        ? this.reconnectAttempts - 1
+      closeCode === 1007 || closeCode === 1008 || closeCode === 1011
+        ? this.reconnectAttempts
         : 0;
 
     debugLogger.log(
@@ -685,7 +646,8 @@ export class GeminiLiveVoicePipeline {
         closeCode,
         closeReason,
         modelRotationOffset,
-        wordTurnsCount: this.wordTurns.length
+        wordTurnsCount: this.wordTurns.length,
+        interruptedTutorPartialText: this.interruptedTutorPartialText || null
       }
     );
 
@@ -746,7 +708,6 @@ export class GeminiLiveVoicePipeline {
       liveConfig.fallbackLiveModel
     ].filter((m, idx, arr) => m && arr.indexOf(m) === idx);
 
-    // Apply optional rotation offset when recovering from a model-specific 1007/1011 error
     const candidateModels =
       rotationOffset > 0 && rawCandidates.length > 1
         ? [
@@ -767,7 +728,6 @@ export class GeminiLiveVoicePipeline {
         return;
       } catch (errExt) {
         lastErr = errExt;
-        // Retry same model once with minimal setup config in case a preview model rejects extended VAD/thinking/compression fields
         try {
           await this._connectSingleModelSocket(word, apiKey, modelId, voiceName, false, isReconnect);
           return;
@@ -833,22 +793,20 @@ export class GeminiLiveVoicePipeline {
           }
         };
 
-        // Disable unconstrained dynamic thinking on Gemini 2.5 Native Audio models so Phase 4
-        // tool calls (`complete_word`) never spiral into multi-paragraph internal reasoning loops!
-        // (Omitted on 3.1/3.8 Live models per Google's docs, where minimal/interleaved reasoning is default.)
         if (useExtendedConfig && modelId.includes('2.5')) {
           generationConfig.thinkingConfig = {
             thinkingBudget: 0
           };
         }
 
+        // Pure Speech-to-Speech setup: NO `tools` array!
+        // Prevents 100% of Live API `1011 Internal error occurred` and `1007` tool-call crashes.
         const setupObj = {
           model: modelId,
           generationConfig,
           systemInstruction: {
             parts: [{ text: buildWordSystemInstruction(word, isReconnect ? this.wordTurns : []) }]
           },
-          tools: TUTOR_TOOLS_DECLARATION,
           inputAudioTranscription: {},
           outputAudioTranscription: {}
         };
@@ -865,7 +823,7 @@ export class GeminiLiveVoicePipeline {
           };
         }
 
-        debugLogger.log('ws', 'ws_setup_sent', `Sent BidiGenerateContentSetup`, {
+        debugLogger.log('ws', 'ws_setup_sent', 'Sent BidiGenerateContentSetup (pure audio, zero tools)', {
           model: modelId,
           voiceName,
           useExtendedConfig,
@@ -895,20 +853,36 @@ export class GeminiLiveVoicePipeline {
 
             const lastTurn = this.wordTurns.length > 0 ? this.wordTurns[this.wordTurns.length - 1] : null;
 
-            if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
-              // The tutor already spoke before the blip — resume listening directly without repeating tutor speech!
-              this._beginListeningTurn('Reconnected — speak in Mandarin');
+            // Case 1: Reconnecting after the tutor crashed MID-SENTENCE before `turnComplete`!
+            if (isReconnect && this.interruptedTutorPartialText) {
+              const partial = this.interruptedTutorPartialText;
+              this.interruptedTutorPartialText = '';
+              this.tutorTurnActive = true;
+              this.listeningForUser = false;
+              this.turnCommitPerfMs = performance.now();
+              this._emitState('speaking', 'Tutor finishing response...');
+              const finishPrompt = `剛才語音連線在你講到「${partial}」時短暫重連。請不要重複前面講過的話，直接把最後一句簡短講完！（如果本題練習已經完成，請直接說出：「好，我們看下一題！」）`;
+              debugLogger.log('ws', 'realtime_text_sent', 'Sent mid-sentence recovery prompt to finish tutor turn', {
+                interruptedPartial: partial
+              });
+              ws.send(
+                JSON.stringify({
+                  realtimeInput: {
+                    text: finishPrompt
+                  }
+                })
+              );
               resolve();
               return;
             }
 
+            // Case 2: Reconnecting after the user spoke (tutor hadn't started speaking yet)
             if (isReconnect && lastTurn && lastTurn.role === 'user') {
-              // The user had just spoken before the blip — use universal `realtimeInput.text` (never `clientContent`)
               this.tutorTurnActive = true;
               this.listeningForUser = false;
               this.turnCommitPerfMs = performance.now();
               this._emitState('speaking', 'Tutor responding...');
-              const resumePrompt = `剛才語音連線短暫重連。我最後說的是：「${lastTurn.text}」。請不要重新唸英文題目，也不要重複說過的話，直接根據系統提示中的對話紀錄接續回應我！`;
+              const resumePrompt = `剛才語音連線短暫重連。我最後說的是：「${lastTurn.text}」。請不要重新唸英文題目，直接根據系統提示中的對話紀錄接續回應我！`;
               debugLogger.log('ws', 'realtime_text_sent', 'Sent reconnect continuation prompt', {
                 lastUserText: lastTurn.text
               });
@@ -923,8 +897,15 @@ export class GeminiLiveVoicePipeline {
               return;
             }
 
-            // Fresh word start: kick off Phase 1 using universal `realtimeInput.text`
-            // (compatible with Gemini 2.5 Native Audio, 3.1 Flash Live, and 3.8 Live without clientContent 1007 issues)
+            // Case 3: Reconnecting after a COMPLETED tutor turn (user's turn to speak)
+            if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
+              debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening');
+              this._beginListeningTurn('Reconnected — speak in Mandarin');
+              resolve();
+              return;
+            }
+
+            // Case 4: Fresh word start -> kick off Phase 1
             if (!isReconnect) {
               this.playChime('start');
             }
@@ -946,7 +927,7 @@ export class GeminiLiveVoicePipeline {
             return;
           }
 
-          this._handleServerMessage(msg, ws);
+          this._handleServerMessage(msg);
         } catch (parseErr) {
           debugLogger.log('error', 'ws_frame_parse_error', parseErr.message || String(parseErr));
           console.error('Error parsing Live WebSocket frame:', parseErr);
@@ -985,20 +966,12 @@ export class GeminiLiveVoicePipeline {
           return;
         }
 
-        // If `complete_word` or `session_control` was already locked in, any socket close is benign:
-        // just let any queued farewell audio finish playing and fire the completion callback!
         if (this.wordTerminalActionLocked || this.intentionalClose || !this.isActive) {
           debugLogger.log('ws', 'ws_close_clean', `WebSocket closed cleanly (${code})`, {
             code,
             reason,
-            wasClean,
-            wordTerminalActionLocked: this.wordTerminalActionLocked
+            wasClean
           });
-          if (this.pendingActionAfterPlayback) {
-            const fn = this.pendingActionAfterPlayback;
-            this.pendingActionAfterPlayback = null;
-            this._schedulePostPlaybackCallback(fn);
-          }
           return;
         }
 
@@ -1013,7 +986,8 @@ export class GeminiLiveVoicePipeline {
             modelId,
             tutorTurnActive: this.tutorTurnActive,
             listeningForUser: this.listeningForUser,
-            turnAudioChunks: this.turnAudioChunks
+            turnAudioChunks: this.turnAudioChunks,
+            partialTutorText: this.currentTurnTutorTranscript.trim() || null
           }
         );
 
@@ -1039,8 +1013,67 @@ export class GeminiLiveVoicePipeline {
     );
   }
 
-  _handleServerMessage(msg, ws) {
-    // 0. Proactive GoAway handling before periodic server disconnect
+  _executeTerminalCue(cue, triggerSource = 'turn_complete') {
+    if (this.wordTerminalActionLocked) return;
+    this.wordTerminalActionLocked = true;
+    this.intentionalClose = true;
+    this.listeningForUser = false;
+    this.tutorTurnActive = true;
+
+    const remainSec = Number(this._getRemainingPlaybackSec().toFixed(2));
+    debugLogger.log(
+      'tool',
+      'spoken_cue_detected',
+      `Detected spoken sign-off cue (${cue.type}${cue.action ? ':' + cue.action : ''}) via ${triggerSource}; playing ${remainSec}s remaining audio`,
+      { cue, remainingAudioSec: remainSec, turnsCount: this.wordTurns.length }
+    );
+
+    // Close WebSocket cleanly right away while WebAudio plays out the remaining farewell speech!
+    this._closeRawSocketOnly();
+
+    const turnsSnapshot = this.wordTurns.slice();
+    const usedHint = this.usedHintInWord;
+
+    this._schedulePostPlaybackCallback(() => {
+      if (cue.type === 'complete_word') {
+        this.playChime('complete');
+        this.onCompleteWord({
+          wordTurns: turnsSnapshot,
+          usedHintButton: usedHint
+        });
+      } else {
+        this.playChime('skip');
+        this.onSessionControl({
+          action: cue.action || 'skip',
+          reason: 'Voice spoken command'
+        });
+      }
+    });
+  }
+
+  _markTutorTurnStartedFromServer() {
+    this.serverAckedCurrentUserTurn = true;
+    if (this.noReplyRecoveryTimer) {
+      clearTimeout(this.noReplyRecoveryTimer);
+      this.noReplyRecoveryTimer = null;
+    }
+    if (!this.tutorTurnActive) {
+      if (this.listeningForUser) {
+        // Server-side automatic VAD committed the user's turn before the 2.8s client silence backup!
+        debugLogger.finalizeStreamingEntries('input_transcript');
+        this.turnCommitPerfMs = performance.now();
+        debugLogger.log('info', 'server_vad_turn_committed', 'Server VAD detected end of user speech', {
+          userTranscript: this.currentTurnUserTranscript.trim()
+        });
+      }
+      this._commitPendingUserTranscriptToTurns();
+      this.tutorTurnActive = true;
+      this.listeningForUser = false;
+      this.hasUnflushedAudio = false;
+    }
+  }
+
+  _handleServerMessage(msg) {
     if (
       msg.goAway &&
       this.isActive &&
@@ -1061,7 +1094,6 @@ export class GeminiLiveVoicePipeline {
       });
     }
 
-    // 1. Handle Server Content (Audio chunks, interruption, spoken transcripts, and hidden model thoughts)
     if (msg.serverContent) {
       const sc = msg.serverContent;
 
@@ -1086,14 +1118,8 @@ export class GeminiLiveVoicePipeline {
         }
       }
 
-      // Only show `outputTranscription.text` (the actual audio spoken to the user) in the UI transcript feed,
-      // while also logging it to `debugLogger`!
       if (sc.outputTranscription && sc.outputTranscription.text) {
-        this.serverAckedCurrentUserTurn = true;
-        if (this.noReplyRecoveryTimer) {
-          clearTimeout(this.noReplyRecoveryTimer);
-          this.noReplyRecoveryTimer = null;
-        }
+        this._markTutorTurnStartedFromServer();
         const spokenText = sc.outputTranscription.text;
         this.currentTurnTutorTranscript += spokenText;
         debugLogger.appendStream('info', 'output_transcript', spokenText);
@@ -1101,21 +1127,9 @@ export class GeminiLiveVoicePipeline {
       }
 
       if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
-        this.serverAckedCurrentUserTurn = true;
-        if (this.noReplyRecoveryTimer) {
-          clearTimeout(this.noReplyRecoveryTimer);
-          this.noReplyRecoveryTimer = null;
-        }
-        if (!this.tutorTurnActive) {
-          this._commitPendingUserTranscriptToTurns();
-          this.tutorTurnActive = true;
-          this.listeningForUser = false;
-          this.hasUnflushedAudio = false;
-        }
+        this._markTutorTurnStartedFromServer();
 
         for (const part of sc.modelTurn.parts) {
-          // Capture internal model thoughts (`part.thought` or non-audio `part.text`) STRICTLY in debug logs
-          // so we can diagnose any reasoning/loop behavior without polluting the user's transcript UI!
           if (part.thought || (typeof part.text === 'string' && part.text.trim())) {
             debugLogger.appendStream(
               'thought',
@@ -1154,169 +1168,34 @@ export class GeminiLiveVoicePipeline {
         this.turnAudioChunks = 0;
         this.turnAudioSec = 0;
 
-        if (completedTutorText) {
-          this.wordTurns.push({ role: 'tutor', text: completedTutorText });
-          this.currentTurnTutorTranscript = '';
-        }
-        // Reset auto-reconnect counter once a healthy model turn completes
+        this._commitCompletedTutorTranscriptToTurns();
         this.reconnectAttempts = 0;
-
         this.onTranscript('turn_end', '');
 
-        if (this.pendingActionAfterPlayback) {
-          if (this.terminalFallbackTimer) {
-            clearTimeout(this.terminalFallbackTimer);
-            this.terminalFallbackTimer = null;
-          }
-          const fn = this.pendingActionAfterPlayback;
-          this.pendingActionAfterPlayback = null;
-          // Close the WebSocket now that the final spoken turn is complete; WebAudio keeps playing buffered farewell!
-          this.intentionalClose = true;
-          this._closeRawSocketOnly();
-          this._schedulePostPlaybackCallback(fn);
-        } else {
-          this._schedulePostPlaybackCallback(() => {
-            if (this.isActive && !this.wordTerminalActionLocked) {
-              this._beginListeningTurn();
-            }
-          });
-        }
-      }
-    }
-
-    // 2. Handle Terminal Tool Calls (`complete_word` or `session_control`)
-    if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
-      this.serverAckedCurrentUserTurn = true;
-      if (this.noReplyRecoveryTimer) {
-        clearTimeout(this.noReplyRecoveryTimer);
-        this.noReplyRecoveryTimer = null;
-      }
-      debugLogger.finalizeStreamingEntries();
-
-      if (this.wordTerminalActionLocked) {
-        debugLogger.log(
-          'warn',
-          'tool_call_duplicate_ignored',
-          'Ignored duplicate toolCall after word terminal action was already locked',
-          { functionCalls: msg.toolCall.functionCalls.map((f) => f.name) }
-        );
-        return;
-      }
-
-      for (const fc of msg.toolCall.functionCalls) {
-        const args = fc.args || {};
-        debugLogger.log('tool', 'tool_call_received', `Received toolCall: ${fc.name}`, {
-          id: fc.id || null,
-          name: fc.name,
-          args
-        });
-
-        if (fc.name === 'complete_word' || fc.name === 'session_control') {
-          this.wordTerminalActionLocked = true;
-          this.intentionalClose = true;
-          this.listeningForUser = false;
-          this.tutorTurnActive = true;
-
-          let callbackFired = false;
-          const runTerminalOnce = () => {
-            if (callbackFired) return;
-            callbackFired = true;
-            if (this.terminalFallbackTimer) {
-              clearTimeout(this.terminalFallbackTimer);
-              this.terminalFallbackTimer = null;
-            }
-            this.pendingActionAfterPlayback = null;
-            if (fc.name === 'complete_word') {
-              this.playChime('complete');
-              this.onCompleteWord(args);
-            } else {
-              this.playChime('skip');
-              this.onSessionControl(args);
-            }
-          };
-
-          const hasSpokenInTurn =
-            this.currentTurnTutorTranscript.trim().length > 0 ||
-            this.turnAudioChunks > 0 ||
-            this.isTutorPlayingAudio();
-
-          if (hasSpokenInTurn || fc.name === 'session_control') {
-            // CRITICAL FIX: The tutor already streamed its farewell audio into `this.audioCtx`!
-            // Do NOT send `toolResponse` (which triggers a brand-new post-tool generation turn,
-            // causing the model to repeat itself or crash with 1007 while farewell audio plays).
-            // Instead, close the WebSocket immediately while letting WebAudio finish playback!
-            this._commitPendingTutorTranscriptToTurns();
-            this.onTranscript('turn_end', '');
-            const remainSec = Number(this._getRemainingPlaybackSec().toFixed(2));
-            debugLogger.log(
-              'tool',
-              'tool_terminal_socket_closed',
-              `Closed WebSocket on ${fc.name} without toolResponse (playing ${remainSec}s buffered farewell)`,
-              { name: fc.name, remainingAudioSec: remainSec }
-            );
-            this._closeRawSocketOnly();
-            this._schedulePostPlaybackCallback(runTerminalOnce);
-          } else {
-            // Rare edge case: model invoked `complete_word` BEFORE speaking its Phase 4 answer.
-            // Send exactly one clean `toolResponse` so it can speak 1 short sentence, then close on `turnComplete`.
-            this.pendingActionAfterPlayback = runTerminalOnce;
-            const fnResp = {
-              name: fc.name,
-              response: {
-                result: {
-                  ok: true,
-                  instruction:
-                    '已記錄分數。請用一句簡短台灣華語回答學生的問題並說「好，我們看下一題！」，講完即停止，請勿再次呼叫 complete_word。'
-                }
-              }
-            };
-            if (fc.id !== undefined && fc.id !== null) {
-              fnResp.id = fc.id;
-            }
-
-            debugLogger.log(
-              'tool',
-              'tool_response_sent',
-              'Model called complete_word before speaking; sent single toolResponse for short farewell',
-              { id: fc.id || null }
-            );
-
-            if (ws.readyState === WebSocket.OPEN) {
-              try {
-                ws.send(
-                  JSON.stringify({
-                    toolResponse: {
-                      functionResponses: [fnResp]
-                    }
-                  })
-                );
-              } catch (_) {}
-            }
-
-            // Safety fallback so even if the model sends no follow-up turnComplete, we still advance cleanly
-            this.terminalFallbackTimer = setTimeout(() => {
-              this.terminalFallbackTimer = null;
-              debugLogger.log(
-                'warn',
-                'tool_terminal_fallback_timer',
-                'Advancing word via 8s post-tool safety timer'
-              );
-              this._closeRawSocketOnly();
-              this._schedulePostPlaybackCallback(runTerminalOnce);
-            }, 8000);
-          }
+        // Check if the tutor spoke a deterministic terminal sign-off phrase (`「好，我們看下一題！」`, etc.)
+        const cue = detectSpokenTerminalCue(completedTutorText);
+        if (cue) {
+          this._executeTerminalCue(cue, 'turn_complete');
           return;
         }
+
+        this._schedulePostPlaybackCallback(() => {
+          if (this.isActive && !this.wordTerminalActionLocked) {
+            this._beginListeningTurn();
+          }
+        });
       }
     }
   }
 
   /**
    * Sends a text command into the active Live session (e.g., if the user taps "Repeat" or "Hint")
-   * using `realtimeInput.text` (after flushing any open mic stream) so it never collides with `realtimeInput.audio`.
    */
-  sendTextCommand(text) {
+  sendTextCommand(text, options = {}) {
     if (this.wordTerminalActionLocked) return;
+    if (options.isHint) {
+      this.usedHintInWord = true;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       if (this.isDisconnected() && this.currentWord) {
         this.reconnectCurrentWord().catch(() => {});
@@ -1423,10 +1302,7 @@ export class GeminiLiveVoicePipeline {
     this.tutorTurnActive = false;
     this.userSpokeInTurn = false;
     this.pendingActionAfterPlayback = null;
-    if (this.terminalFallbackTimer) {
-      clearTimeout(this.terminalFallbackTimer);
-      this.terminalFallbackTimer = null;
-    }
+    this.interruptedTutorPartialText = '';
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1466,7 +1342,6 @@ export class GeminiLiveVoicePipeline {
       const ratio = inputRate / outputRate;
       const newLength = Math.round(buffer.length / ratio);
       samples = new Float32Array(newLength);
-      // Anti-aliased averaging filter for crisp 16kHz Mandarin consonants and tones
       for (let i = 0; i < newLength; i++) {
         const start = i * ratio;
         const end = start + ratio;

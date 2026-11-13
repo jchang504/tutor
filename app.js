@@ -14,9 +14,80 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=12';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=12';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=13';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=13';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
+
+/**
+ * Instant, deterministic 0ms FSRS rubric derivation from the completed spoken word dialogue.
+ * Used immediately when the tutor speaks `「好，我們看下一題！」` so the next word starts right away,
+ * and serves as the fallback if background REST JSON grading is offline or times out.
+ */
+export function deriveHeuristicTelemetryFromTurns(
+  word = {},
+  wordTurns = [],
+  usedHintButton = false,
+  peeked = false
+) {
+  const turns = Array.isArray(wordTurns) ? wordTurns : [];
+  const userTurns = turns.filter((t) => t && t.role === 'user' && t.text);
+  const tutorTurns = turns.filter((t) => t && t.role === 'tutor' && t.text);
+
+  const userAskedForHint = userTurns.some((t) =>
+    /提示|\bhint\b|不知道怎麼說|給我答案|直接告訴我/i.test(t.text)
+  );
+  const tutorGaveExplicitAnswerHint = tutorTurns
+    .slice(1)
+    .some((t) => /給你一點提示|提示你一下/.test(t.text));
+
+  const neededHint = Boolean(usedHintButton || peeked || userAskedForHint || tutorGaveExplicitAnswerHint);
+
+  // Skip index 0 (initial Phase 1 English prompt) when counting tutor corrections
+  const feedbackTutorTurns = tutorTurns.slice(1);
+  let pronunciationCorrections = 0;
+  let grammarCorrections = 0;
+
+  for (const t of feedbackTutorTurns) {
+    const txt = t.text;
+    const hasToneOrPronFix = /聲調|幾聲|一聲|二聲|三聲|四聲|輕聲|發音|唸成|讀音/.test(txt);
+    const hasGrammarOrRetryFix =
+      /語法|語序|比較自然|漏了|少了|句子可以改成|再完整說一次|重新說一次/.test(txt);
+    if (hasToneOrPronFix) {
+      pronunciationCorrections += 1;
+    } else if (hasGrammarOrRetryFix) {
+      grammarCorrections += 1;
+    }
+  }
+
+  const pronunciationAttempts = 1 + pronunciationCorrections;
+  const totalFixes = pronunciationCorrections + grammarCorrections;
+  const fluency =
+    totalFixes >= 3 || (neededHint && totalFixes >= 2)
+      ? 'struggled'
+      : totalFixes >= 1 || userTurns.length >= 5
+      ? 'good'
+      : 'natural';
+
+  let notes = 'Clean recall & natural conversation';
+  if (neededHint) {
+    notes = usedHintButton ? 'Used Hint button' : peeked ? 'Peeked target word' : 'Requested hint';
+  } else if (pronunciationCorrections > 0 && grammarCorrections > 0) {
+    notes = 'Practiced tones & phrasing';
+  } else if (pronunciationCorrections > 0) {
+    notes = 'Practiced pronunciation / tones';
+  } else if (grammarCorrections > 0) {
+    notes = 'Refined sentence grammar';
+  }
+
+  return {
+    target_word_recalled: !neededHint,
+    needed_hint: neededHint,
+    pronunciation_attempts: pronunciationAttempts,
+    grammar_errors: grammarCorrections,
+    conversation_fluency: fluency,
+    notes
+  };
+}
 
 const STORAGE_KEYS = {
   GAS_URL: 'tw_tutor_gas_url',
@@ -37,6 +108,17 @@ class MandarinTutorApp {
     this.sessionActive = false;
     this.sessionPaused = false;
     this.revealTarget = localStorage.getItem(STORAGE_KEYS.REVEAL_TARGET) === 'true';
+    this.peekedInCurrentWord = false;
+    this.isPageUnloading = false;
+    this.cachedGradingModel = null;
+    this.lastScoredWordId = null;
+
+    window.addEventListener('beforeunload', () => {
+      this.isPageUnloading = true;
+    });
+    window.addEventListener('pagehide', () => {
+      this.isPageUnloading = true;
+    });
 
     this.liveAuth = {
       apiKey: localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) || '',
@@ -53,7 +135,7 @@ class MandarinTutorApp {
     this.pipeline = new GeminiLiveVoicePipeline({
       onStateChange: (state, statusText) => this.handlePipelineState(state, statusText),
       onTranscript: (role, text) => this.handleTranscript(role, text),
-      onCompleteWord: (telemetry) => this.handleWordCompleted(telemetry),
+      onCompleteWord: (completionPayload) => this.handleWordCompleted(completionPayload),
       onSessionControl: (cmd) => this.handleVoiceControlCommand(cmd),
       onAudioLevel: (lvl) => this.updateAudioMeter(lvl),
       onError: (err) => {
@@ -173,13 +255,19 @@ class MandarinTutorApp {
       this.pipeline.sendTextCommand('請再用正常語速清楚唸一次這題的英文句子。');
     });
     this.els.btnHint.addEventListener('click', () => {
-      this.pipeline.sendTextCommand('請用簡單、自然慢速的台灣中文給我一點提示，但先不要直接講出整句答案。');
+      this.pipeline.sendTextCommand(
+        '請用簡單、自然慢速的台灣中文給我一點提示，但先不要直接講出整句答案。',
+        { isHint: true }
+      );
     });
     this.els.btnSkipWord.addEventListener('click', () => this.skipCurrentWord('manual_skip'));
     this.els.btnEndSession.addEventListener('click', () => this.stopDrivingSession());
 
     this.els.btnToggleReveal.addEventListener('click', () => {
       this.revealTarget = !this.revealTarget;
+      if (this.revealTarget && this.sessionActive) {
+        this.peekedInCurrentWord = true;
+      }
       localStorage.setItem(STORAGE_KEYS.REVEAL_TARGET, String(this.revealTarget));
       this.renderCurrentWordCard();
     });
@@ -388,10 +476,20 @@ class MandarinTutorApp {
       return data;
     } catch (err) {
       if (!String(err.message || '').startsWith('Apps Script')) {
-        debugLogger.log('error', 'backend_rpc_network_error', `RPC ${action} error: ${err.message || err}`, {
-          action,
-          durationMs: Math.round(performance.now() - startMs)
-        });
+        const unloading = Boolean(
+          this.isPageUnloading || (typeof window !== 'undefined' && window.__swReloading)
+        );
+        debugLogger.log(
+          unloading ? 'info' : 'error',
+          unloading ? 'backend_rpc_aborted_reload' : 'backend_rpc_network_error',
+          unloading
+            ? `RPC ${action} aborted due to page reload`
+            : `RPC ${action} error: ${err.message || err}`,
+          {
+            action,
+            durationMs: Math.round(performance.now() - startMs)
+          }
+        );
       }
       throw err;
     }
@@ -544,6 +642,7 @@ class MandarinTutorApp {
     }
 
     const word = this.batch[this.currentIndex];
+    this.peekedInCurrentWord = Boolean(this.revealTarget);
     this.transcriptHistory = [];
     this.renderTranscriptFeed();
     this.setPhaseIndicator(1);
@@ -597,38 +696,185 @@ class MandarinTutorApp {
     }
   }
 
-  /**
-   * Called deterministically when Gemini Live invokes `complete_word(...)` at the end of Phase 4.
-   * 1. Reveals the target word briefly and computes the deterministic 1-4 score + FSRS v5 interval.
-   * 2. Sends the review asynchronously to the Google Sheet (`record_review`).
-   * 3. Advances to the next word in a brand-new WebSocket session!
-   */
-  async handleWordCompleted(telemetry = {}) {
-    const word = this.batch[this.currentIndex];
-    if (!word) return;
-
-    this.pipeline.closeCurrentWordSocket();
-    this.setPhaseIndicator(4);
-
-    const score = computeDeterministicScore(telemetry);
-    const fsrsPreview = computeFsrsV5(word, score, 0.90);
-
-    debugLogger.log('info', 'word_completed', `Completed ${word.traditional} -> Score ${score} (${scoreLabel(score)}, +${fsrsPreview.intervalDays}d)`, {
-      traditional: word.traditional,
-      score,
-      intervalDays: fsrsPreview.intervalDays,
-      telemetry
-    });
-
-    // Show score banner
+  _renderScoreBanner(word, score, intervalDays, notes = '') {
+    if (!this.els.lastScoreBanner) return;
     this.els.lastScoreBanner.classList.remove('hidden');
+    const cleanNotes = notes ? ` · ${this.escapeHtml(notes)}` : '';
     this.els.lastScoreBanner.innerHTML = `
-      <strong>${word.traditional} (${word.pinyin})</strong> →
+      <strong>${this.escapeHtml(word.traditional)} (${this.escapeHtml(word.pinyin || '')})</strong> →
       <span class="score-pill score-${score}">${scoreLabel(score)}</span>
-      <span class="next-due-note">Next review in ${fsrsPreview.intervalDays}d ${telemetry.notes ? '· ' + telemetry.notes : ''}</span>
+      <span class="next-due-note">Next review in ${intervalDays}d${cleanNotes}</span>
     `;
+  }
 
-    // Fire-and-forget write to Google Sheets so the transition to the next word is fast
+  async _discoverFastGradingModel(apiKey) {
+    if (this.cachedGradingModel) return this.cachedGradingModel;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    try {
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
+        { signal: ctrl.signal }
+      );
+      if (!resp.ok) throw new Error(`models.list HTTP ${resp.status}`);
+      const json = await resp.json();
+      const models = (json.models || []).filter(
+        (m) =>
+          m &&
+          m.name &&
+          Array.isArray(m.supportedGenerationMethods) &&
+          m.supportedGenerationMethods.includes('generateContent') &&
+          !/tts|image|imagen|veo|live|native-audio|embedding|aqa|robotics|computer-use/i.test(
+            m.name
+          )
+      );
+      const names = models.map((m) => m.name);
+      const preferredMatchers = [
+        /gemini-3\.\d+-flash-lite/i,
+        /flash-lite/i,
+        /gemini-3(\.\d+)?-flash/i,
+        /gemini-2\.5-flash/i,
+        /flash/i
+      ];
+      for (const rx of preferredMatchers) {
+        const hit = names.find((n) => rx.test(n));
+        if (hit) {
+          this.cachedGradingModel = hit;
+          return hit;
+        }
+      }
+      if (names.length > 0) {
+        this.cachedGradingModel = names[0];
+        return names[0];
+      }
+    } catch (_) {
+      // Fall back to standard gemini-2.5-flash if models.list fails
+    } finally {
+      clearTimeout(timer);
+    }
+    return 'models/gemini-2.5-flash';
+  }
+
+  async gradeWordTranscriptWithFlash(word, wordTurns, fallbackTelemetry, forceNeededHint = false) {
+    const apiKey = (this.liveAuth && this.liveAuth.apiKey ? this.liveAuth.apiKey : '').trim();
+    if (!apiKey || !Array.isArray(wordTurns) || wordTurns.length === 0) {
+      return fallbackTelemetry;
+    }
+
+    const startMs = performance.now();
+    const modelName = await this._discoverFastGradingModel(apiKey);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4500);
+
+    try {
+      const dialogueText = wordTurns
+        .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
+        .join('\n');
+
+      const generationConfig = {
+        temperature: 0.1,
+        responseMimeType: 'application/json'
+      };
+      if (modelName.includes('2.5')) {
+        generationConfig.thinkingConfig = { thinkingBudget: 0 };
+      }
+
+      const gradingPrompt = `Evaluate this completed Taiwanese Mandarin voice tutor dialogue for spaced-repetition (FSRS v5) scoring and return ONLY a JSON object with these exact keys:
+{
+  "target_word_recalled": boolean,
+  "needed_hint": boolean,
+  "pronunciation_attempts": integer (>=1),
+  "grammar_errors": integer (>=0),
+  "conversation_fluency": "natural" | "good" | "struggled",
+  "notes": "short English note <= 8 words"
+}
+
+Grading rules:
+- Target word: "${word.traditional}" (${word.pinyin || ''}, meaning "${word.english_gloss || ''}")
+- English prompt: "${word.english_prompt || ''}"
+- Reference Mandarin: "${word.mandarin_sentence || word.sample_mandarin || ''}"
+- IMPORTANT: The student ("學生") lines come from speech-to-text ASR, which may contain minor homophones or segmentation quirks (e.g. 餐館/餐廳, 設一個/是個). Always trust the tutor's ("老師") spoken reaction! If the tutor immediately praised the student ("說得很好！", etc.) without correcting tones or grammar, set target_word_recalled=true, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural".
+- Only set pronunciation_attempts > 1 if the tutor explicitly corrected the student's tones/pronunciation and asked them to repeat.
+- Only set grammar_errors > 0 if the tutor explicitly corrected ungrammatical phrasing or a missing target word.
+- Set needed_hint=true ONLY if the student asked for a hint/answer or the tutor gave away a hint before recall.
+
+Dialogue:
+${dialogueText}`;
+
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: gradingPrompt }] }],
+            generationConfig
+          }),
+          signal: ctrl.signal
+        }
+      );
+
+      if (!resp.ok) {
+        if (resp.status === 404) this.cachedGradingModel = null;
+        throw new Error(`Grading HTTP ${resp.status} on ${modelName}`);
+      }
+
+      const data = await resp.json();
+      const rawJson = (
+        data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || ''
+      )
+        .replace(/^```json\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+
+      const parsed = JSON.parse(rawJson);
+      const neededHint = Boolean(forceNeededHint || parsed.needed_hint);
+      const normalized = {
+        target_word_recalled: neededHint ? false : parsed.target_word_recalled !== false,
+        needed_hint: neededHint,
+        pronunciation_attempts: Math.max(1, Number(parsed.pronunciation_attempts) || 1),
+        grammar_errors: Math.max(0, Number(parsed.grammar_errors) || 0),
+        conversation_fluency: ['natural', 'good', 'struggled'].includes(
+          parsed.conversation_fluency
+        )
+          ? parsed.conversation_fluency
+          : fallbackTelemetry.conversation_fluency,
+        notes: String(parsed.notes || fallbackTelemetry.notes || '').slice(0, 60)
+      };
+
+      debugLogger.log(
+        'info',
+        'word_graded_ai',
+        `Graded ${word.traditional} via ${modelName.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
+        { model: modelName, normalized }
+      );
+      return normalized;
+    } catch (err) {
+      debugLogger.log(
+        'warn',
+        'word_graded_heuristic_fallback',
+        `Using local heuristic rubric for ${word.traditional} (${err.message || err})`
+      );
+      return fallbackTelemetry;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async persistAndGradeWordReview(word, wordTurns, heuristicTelemetry, forceNeededHint) {
+    const finalTelemetry = await this.gradeWordTranscriptWithFlash(
+      word,
+      wordTurns,
+      heuristicTelemetry,
+      forceNeededHint
+    );
+    const finalScore = computeDeterministicScore(finalTelemetry);
+    const finalFsrs = computeFsrsV5(word, finalScore, 0.90);
+
+    if (this.lastScoredWordId === word.id) {
+      this._renderScoreBanner(word, finalScore, finalFsrs.intervalDays, finalTelemetry.notes);
+    }
+
     const gasUrl = (localStorage.getItem(STORAGE_KEYS.GAS_URL) || '').trim();
     const secret = (localStorage.getItem(STORAGE_KEYS.SECRET) || '').trim();
     if (gasUrl && secret) {
@@ -637,18 +883,65 @@ class MandarinTutorApp {
         traditional: word.traditional,
         english_prompt: word.english_prompt,
         mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || '',
-        telemetry
+        telemetry: finalTelemetry
       })
         .then(() => this.refreshBackendStatus(false))
         .catch((err) => console.warn('Failed to persist review to Sheet:', err));
     }
+  }
+
+  /**
+   * Called deterministically when the tutor speaks `「好，我們看下一題！」` at the end of Phase 4.
+   * 1. Computes an instant 0ms score preview and advances immediately to the next word's clean WebSocket!
+   * 2. Runs background REST JSON transcript grading + Google Sheet FSRS v5 persistence without blocking audio!
+   */
+  async handleWordCompleted(completionPayload = {}) {
+    const word = this.batch[this.currentIndex];
+    if (!word) return;
+
+    this.pipeline.closeCurrentWordSocket();
+    this.setPhaseIndicator(4);
+
+    const hasTurnsPayload = Array.isArray(completionPayload.wordTurns);
+    const wordTurns = hasTurnsPayload ? completionPayload.wordTurns : [];
+    const usedHintButton = Boolean(completionPayload.usedHintButton);
+    const peeked = Boolean(this.peekedInCurrentWord);
+    const forceNeededHint = Boolean(usedHintButton || peeked);
+
+    const initialTelemetry = hasTurnsPayload
+      ? deriveHeuristicTelemetryFromTurns(word, wordTurns, usedHintButton, peeked)
+      : completionPayload;
+
+    const score = computeDeterministicScore(initialTelemetry);
+    const fsrsPreview = computeFsrsV5(word, score, 0.90);
+    this.lastScoredWordId = word.id;
+
+    debugLogger.log(
+      'info',
+      'word_completed',
+      `Completed ${word.traditional} -> Instant Score ${score} (${scoreLabel(score)}, +${fsrsPreview.intervalDays}d)`,
+      {
+        traditional: word.traditional,
+        score,
+        intervalDays: fsrsPreview.intervalDays,
+        turnsCount: wordTurns.length,
+        initialTelemetry
+      }
+    );
+
+    this._renderScoreBanner(word, score, fsrsPreview.intervalDays, initialTelemetry.notes);
+
+    // Non-blocking background AI transcript grading + Sheet persistence
+    this.persistAndGradeWordReview(word, wordTurns, initialTelemetry, forceNeededHint).catch(
+      (err) => console.warn('Background grading error:', err)
+    );
 
     this.currentIndex += 1;
     setTimeout(() => {
       if (this.sessionActive && !this.sessionPaused) {
         this.launchCurrentWord();
       }
-    }, 900);
+    }, 800);
   }
 
   /**
@@ -1423,6 +1716,9 @@ class MandarinTutorApp {
   }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  window.tutorApp = new MandarinTutorApp();
-});
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', () => {
+    window.tutorApp = new MandarinTutorApp();
+  });
+}
+
