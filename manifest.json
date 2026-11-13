@@ -1,0 +1,18 @@
+{
+  "name": "台灣華語口說家教 · Mandarin Driving Tutor",
+  "short_name": "華語家教",
+  "description": "Hands-free, eyes-free Taiwanese Mandarin vocabulary & sentence tutor powered by Gemini Live and FSRS v5.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0c0e14",
+  "theme_color": "#0c0e14",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

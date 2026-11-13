@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="56" fill="#0f131c"/>
+  <rect x="14" y="14" width="228" height="228" rx="44" fill="#171d2b" stroke="#29b88d" stroke-width="6"/>
+  <text x="128" y="166" text-anchor="middle" font-family="Noto Sans TC, PingFang TC, sans-serif" font-size="124" font-weight="700" fill="#f3a833">臺</text>
+</svg>
