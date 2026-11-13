@@ -14,8 +14,8 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=15';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=15';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=16';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=16';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 /**
@@ -196,7 +196,7 @@ class MandarinTutorApp {
     this.revealTarget = localStorage.getItem(STORAGE_KEYS.REVEAL_TARGET) === 'true';
     this.peekedInCurrentWord = false;
     this.isPageUnloading = false;
-    this.cachedGradingModel = null;
+    this.cachedGradingCandidates = null;
     this.lastScoredWordId = null;
 
     window.addEventListener('beforeunload', () => {
@@ -794,8 +794,10 @@ class MandarinTutorApp {
     `;
   }
 
-  async _discoverFastGradingModel(apiKey) {
-    if (this.cachedGradingModel) return this.cachedGradingModel;
+  async _discoverFastGradingCandidates(apiKey) {
+    if (Array.isArray(this.cachedGradingCandidates) && this.cachedGradingCandidates.length > 0) {
+      return this.cachedGradingCandidates;
+    }
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 3500);
     try {
@@ -816,31 +818,34 @@ class MandarinTutorApp {
           )
       );
       const names = models.map((m) => m.name);
-      // Prefer GA gemini-2.5-flash (with thinkingBudget: 0) over preview -lite endpoints that frequently return HTTP 503
+      const ordered = [];
       const preferredMatchers = [
         /gemini-2\.5-flash$/i,
-        /gemini-3(\.\d+)?-flash$/i,
+        /gemini-3(\.\d+)?-flash(-preview)?$/i,
         /gemini-2\.5-flash/i,
         /flash-lite/i,
         /flash/i
       ];
       for (const rx of preferredMatchers) {
-        const hit = names.find((n) => rx.test(n));
-        if (hit) {
-          this.cachedGradingModel = hit;
-          return hit;
+        for (const n of names) {
+          if (rx.test(n) && !ordered.includes(n)) {
+            ordered.push(n);
+          }
         }
       }
-      if (names.length > 0) {
-        this.cachedGradingModel = names[0];
-        return names[0];
+      for (const n of names) {
+        if (!ordered.includes(n)) ordered.push(n);
+      }
+      if (ordered.length > 0) {
+        this.cachedGradingCandidates = ordered.slice(0, 4);
+        return this.cachedGradingCandidates;
       }
     } catch (_) {
-      // Fall back to standard gemini-2.5-flash if models.list fails
+      // Fall back to standard Flash model IDs if models.list fails
     } finally {
       clearTimeout(timer);
     }
-    return 'models/gemini-2.5-flash';
+    return ['models/gemini-2.5-flash', 'models/gemini-3-flash-preview', 'models/gemini-3.1-flash-lite-preview'];
   }
 
   async _requestGradingJsonFromModel(modelName, apiKey, gradingPrompt, signal) {
@@ -889,9 +894,9 @@ class MandarinTutorApp {
     }
 
     const startMs = performance.now();
-    let usedModel = await this._discoverFastGradingModel(apiKey);
+    const candidates = await this._discoverFastGradingCandidates(apiKey);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5500);
+    const timer = setTimeout(() => ctrl.abort(), 6500);
 
     try {
       const dialogueText = wordTurns
@@ -922,35 +927,41 @@ Grading rules:
 Dialogue:
 ${dialogueText}`;
 
-      let parsed;
-      try {
-        parsed = await this._requestGradingJsonFromModel(
-          usedModel,
-          apiKey,
-          gradingPrompt,
-          ctrl.signal
-        );
-      } catch (firstErr) {
-        if (
-          firstErr.httpStatus === 404 ||
-          firstErr.httpStatus === 429 ||
-          firstErr.httpStatus === 503
-        ) {
-          this.cachedGradingModel = null;
-          const retryModel =
-            usedModel === 'models/gemini-2.5-flash'
-              ? 'models/gemini-2.5-flash-lite'
-              : 'models/gemini-2.5-flash';
-          usedModel = retryModel;
+      let parsed = null;
+      let usedModel = candidates[0];
+      let lastErr = null;
+
+      for (let i = 0; i < Math.min(3, candidates.length); i++) {
+        usedModel = candidates[i];
+        try {
           parsed = await this._requestGradingJsonFromModel(
-            retryModel,
+            usedModel,
             apiKey,
             gradingPrompt,
             ctrl.signal
           );
-        } else {
-          throw firstErr;
+          lastErr = null;
+          break;
+        } catch (errTry) {
+          lastErr = errTry;
+          if (errTry.httpStatus === 404 && Array.isArray(this.cachedGradingCandidates)) {
+            this.cachedGradingCandidates = this.cachedGradingCandidates.filter(
+              (m) => m !== usedModel
+            );
+          }
+          if (
+            errTry.httpStatus !== 404 &&
+            errTry.httpStatus !== 429 &&
+            errTry.httpStatus !== 503 &&
+            errTry.httpStatus !== 400
+          ) {
+            break;
+          }
         }
+      }
+
+      if (!parsed) {
+        throw lastErr || new Error('All grading models failed');
       }
 
       const normalized = normalizeAiGradingTelemetry(

@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v15):
+ * Key architectural guarantees (v16):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -18,7 +18,7 @@
  *    paired with clean digital-zero 16kHz PCM gating so server VAD responds fast without road-noise lag.
  */
 
-import { debugLogger } from './debug-logger.js?v=15';
+import { debugLogger } from './debug-logger.js?v=16';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -312,8 +312,12 @@ export function buildWordSystemInstruction(word, priorTurns = []) {
      - 若學生主動要求「提示 / Hint」或「直接給我答案」：可給他提示或直接示範「${referenceMandarin}」，但仍請他跟著親口唸出完整正確的句子一次。
   3. 持續互動直到學生親口完整說出包含「${word.traditional}」且語法自然、發音正確的句子為止。
 
-- **階段二（老師延伸提問）**：
-  當學生成功說出正確自然的句子後，先簡短肯定他（例如：「說得很好！」），並立刻根據這句話的情境，用**簡單、自然慢速的台灣華語**問他一個簡短的日常**延伸問題（follow-up question）**（使用基礎詞彙，6～12 個字以內）。
+- **階段二（老師延伸提問——嚴禁把剛才翻譯的句子直接改成問句重複問！）**：
+  1. 當學生成功說出正確自然的句子後，先簡短肯定他（例如：「說得很好！」或「很自然！」），接著用**簡單、自然慢速的台灣華語**問他一個連結他自己日常生活、個人習慣、喜好或經驗的**延伸問題（follow-up question）**（1 句自然短句，約 8～18 個字，使用 TOCFL 1～2 級日常基礎詞彙）。
+  2. **絕對禁止「原句照抄改問句」（No Direct Restatement — 極重要）**：
+     - **千萬不要**只是把剛才翻譯的原句「${referenceMandarin}」（或學生剛說的那句話）把主詞換成「你」、或只在句尾加上「嗎？／對不對？／是不是？」就當作問題問回去！也不要問和原句幾乎一模一樣的內容。
+     - 錯誤示範（禁止）：若剛才翻譯「我覺得這杯咖啡很好喝。」，**絕對不可以**問「你覺得這杯咖啡好喝嗎？」；若剛才翻譯「明天可能會下雨。」，**絕對不可以**問「明天可能會下雨嗎？」；若剛才翻譯「我以為他回家了。」，**絕對不可以**問「你以為他回家了嗎？」。
+     - 正確示範（請往外延伸一步，改問新的生活角度、個人偏好或二選一／疑問詞問題）：優先使用「什麼、哪裡、哪一種、什麼時候、平常都怎麼…、喜歡…還是…」來開啟新話題，若自然順口可帶入目標詞「${word.traditional}」（不順則不必硬塞）。例如：「你平常早上喜歡喝咖啡還是喝茶？」、「如果週末下雨，你通常會在家做什麼？」、「你以前有沒有認錯人或記錯時間的經驗？」。
 
 - **階段三（學生回答＋請學生反問老師）**：
   1. 學生會用中文回答你的問題，並且應該要順便反問你一個相關的問題。

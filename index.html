@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=15" />
+  <link rel="stylesheet" href="./index.css?v=16" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -385,7 +385,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=15"></script>
+  <script type="module" src="./app.js?v=16"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -397,7 +397,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=15').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=16').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });
