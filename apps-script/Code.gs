@@ -845,7 +845,15 @@ function handleImportHanping_(body) {
     throw new Error('Empty Hanping CSV text.');
   }
 
-  const parsedEntries = parseHanpingText_(csvText);
+  // Also cross-reference PSeitz/tocfl if cached so Hanping/AnkiDroid words get Zhuyin, TOCFL level & spoken frequency!
+  let tocflMap = {};
+  try {
+    tocflMap = fetchTocflLookupMap_();
+  } catch (e) {
+    // Non-fatal if GitHub fetch fails during import
+  }
+
+  const parsedEntries = parseHanpingText_(csvText, tocflMap);
   if (parsedEntries.length === 0) {
     throw new Error('No valid Chinese vocabulary rows found in the provided file.');
   }
@@ -855,14 +863,6 @@ function handleImportHanping_(body) {
   existing.forEach(function(w) {
     existingMap[String(w.traditional).trim()] = w;
   });
-
-  // Also cross-reference PSeitz/tocfl if cached so Hanping words get Zhuyin, TOCFL level & spoken frequency!
-  let tocflMap = {};
-  try {
-    tocflMap = fetchTocflLookupMap_();
-  } catch (e) {
-    // Non-fatal if GitHub fetch fails during import
-  }
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TAB_VOCAB);
@@ -918,84 +918,202 @@ function handleImportHanping_(body) {
 }
 
 /**
- * Flexible parser for Hanping CSV/TSV/CEDICT-style exports.
+ * Flexible parser for:
+ * 1. AnkiDroid "Notes in Plain Text (.txt)" / "Cards in Plain Text (.txt)" (including `Hanping Chinese Type` notes,
+ *    optional GUID/notetype/deck prefix columns, `#...` header directives, HTML spans, and `[sound:...]` tags)
+ * 2. Hanping Local Backup JSON / JSONL or plain-text word lists
+ * 3. Standard Hanping CSV/TSV or CC-CEDICT (`傳統[传统] chuán tǒng /tradition/`)
  */
-function parseHanpingText_(rawText) {
-  const lines = rawText.split(/\r?\n/);
+function parseHanpingText_(rawText, tocflMap) {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed) return [];
+  const lookup = tocflMap || {};
+
+  // 0. Check if input is a JSON array or object (e.g. from a Hanping local backup or JSON export)
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsedJson = JSON.parse(trimmed);
+      const list = Array.isArray(parsedJson)
+        ? parsedJson
+        : (parsedJson.words || parsedJson.items || parsedJson.vocab || parsedJson.starred || parsedJson.entries || []);
+      if (Array.isArray(list) && list.length > 0) {
+        const jsonResults = [];
+        list.forEach(function(item) {
+          if (typeof item === 'string') {
+            const sub = parseHanpingText_(item, lookup);
+            if (sub.length > 0) jsonResults.push(sub[0]);
+          } else if (item && typeof item === 'object') {
+            const trad = String(item.traditional || item.trad || item.hanzi || item.headword || item.word || item.text || '').trim();
+            const simp = String(item.simplified || item.simp || '').trim();
+            const pinyin = String(item.pinyin || item.pronunciation || '').trim();
+            const gloss = cleanAnkiHtml_(String(item.english_gloss || item.english || item.definition || item.defn || item.meaning || item.gloss || ''));
+            if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(trad)) {
+              jsonResults.push({
+                traditional: trad,
+                simplified: simp,
+                pinyin: pinyin,
+                english_gloss: gloss
+              });
+            }
+          }
+        });
+        if (jsonResults.length > 0) return jsonResults;
+      }
+    } catch (e) {
+      // Fall through to line-by-line parsing
+    }
+  }
+
+  const lines = trimmed.split(/\r?\n/);
   const results = [];
+  let tagsColIndex = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+    if (!line || line.startsWith('//')) continue;
 
-    // 1. Check CEDICT / Hanping plain text format: `餐館[餐馆] cān guǎn /restaurant/` or `餐館 cān guǎn /restaurant/`
+    // Parse Anki 2.1.54+ / AnkiDroid plain-text export header directives
+    if (line.startsWith('#')) {
+      const tagColMatch = line.match(/^#tags\s+column:(\d+)/i);
+      if (tagColMatch) {
+        tagsColIndex = Number(tagColMatch[1]) - 1;
+      }
+      continue;
+    }
+
+    // 1. Check CEDICT / Hanping bracket format: `餐館[餐馆] cān guǎn /restaurant/` or `餐館 cān guǎn /restaurant/`
     const cedictMatch = line.match(/^([^\s\[\],;]+)(?:\[([^\]]+)\])?\s+([a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\s:·]+?)\s+\/(.+)\/$/);
-    if (cedictMatch) {
+    if (cedictMatch && /[\u4e00-\u9fff\u3400-\u4dbf]/.test(cedictMatch[1])) {
       results.push({
         traditional: cedictMatch[1].trim(),
         simplified: (cedictMatch[2] || '').trim(),
         pinyin: cedictMatch[3].trim(),
-        english_gloss: cedictMatch[4].replace(/\//g, '; ').trim()
+        english_gloss: cleanAnkiHtml_(cedictMatch[4].replace(/\//g, '; '))
       });
       continue;
     }
 
-    // 2. Parse delimiter (Tab or Comma)
-    const fields = line.indexOf('\t') !== -1 ? line.split('\t') : parseCsvLine_(line);
-    if (fields.length === 0) continue;
+    // 2. Parse delimiter (Tab for AnkiDroid .txt / TSV, or Comma for CSV)
+    const rawFields = line.indexOf('\t') !== -1 ? line.split('\t') : parseCsvLine_(line);
+    if (rawFields.length === 0) continue;
 
-    // Skip header row if detected
-    const firstLower = String(fields[0]).toLowerCase().trim();
-    if (firstLower === 'traditional' || firstLower === 'hanzi' || firstLower === 'word' || firstLower === 'headword' || firstLower === 'id') {
+    // Skip obvious header row
+    const firstLower = cleanAnkiHtml_(rawFields[0]).toLowerCase();
+    if (firstLower === 'traditional' || firstLower === 'hanzi' || firstLower === 'word' || firstLower === 'headword') {
       continue;
     }
 
-    // Identify columns heuristically
-    let trad = String(fields[0] || '').trim();
-    // Handle `餐館[餐馆]` or `餐館 (餐馆)` in column 0
-    let simp = '';
-    const bracketInFirst = trad.match(/^([^\[\(\s]+)[\[\(]([^\]\)]+)[\]\)]/);
-    if (bracketInFirst) {
-      trad = bracketInFirst[1].trim();
-      simp = bracketInFirst[2].trim();
-    }
+    // Clean HTML & [sound:...] from all fields
+    const fields = rawFields.map(function(f, idx) {
+      if (tagsColIndex !== -1 && idx === tagsColIndex) return '';
+      return cleanAnkiHtml_(f);
+    });
 
-    // Must contain at least one CJK character
-    if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(trad)) continue;
-
+    // Scan fields to find Chinese headword column(s), Pinyin column, and English definition column.
+    // This automatically skips AnkiDroid leading metadata columns like GUID (`k8J9a!2x`),
+    // Note Type (`Hanping Chinese Type`), or Deck Name (`Chinese::Hanping`).
+    const cjkCols = [];
     let pinyin = '';
-    let gloss = '';
+    const glossParts = [];
 
-    if (fields.length === 2) {
-      gloss = String(fields[1] || '').trim();
-    } else if (fields.length === 3) {
-      pinyin = String(fields[1] || '').trim();
-      gloss = String(fields[2] || '').trim();
-    } else if (fields.length >= 4) {
-      // Check if col 1 is simplified Hanzi or Pinyin
-      const col1 = String(fields[1] || '').trim();
-      if (/^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(col1)) {
-        simp = simp || col1;
-        pinyin = String(fields[2] || '').trim();
-        gloss = fields.slice(3).join('; ').trim();
-      } else {
-        pinyin = col1;
-        gloss = fields.slice(2).join('; ').trim();
+    for (let c = 0; c < fields.length; c++) {
+      const val = fields[c];
+      if (!val) continue;
+
+      // Skip Anki metadata columns
+      if (/^hanping\s+chinese/i.test(val) || /^chinese::/i.test(val) || /^default$/i.test(val)) {
+        continue;
+      }
+      // Skip Anki GUID in col 0..1 (8-12 ASCII chars with no spaces and no CJK, when there are 4+ columns)
+      if (c <= 1 && fields.length >= 4 && !/[\u4e00-\u9fff\u3400-\u4dbf\s]/.test(val) && /^[!-~]{6,14}$/.test(val)) {
+        continue;
+      }
+
+      // Check if this field is a pure CJK headword (or `餐館[餐馆]` / `餐館 (餐馆)`)
+      const bracketMatch = val.match(/^([\u4e00-\u9fff\u3400-\u4dbf\uff0c\u3001]+)[\[\(\uff08]([\u4e00-\u9fff\u3400-\u4dbf\uff0c\u3001]+)[\]\)\uff09]$/);
+      if (bracketMatch) {
+        cjkCols.push(bracketMatch[1].trim());
+        cjkCols.push(bracketMatch[2].trim());
+        continue;
+      }
+
+      if (/^[\u4e00-\u9fff\u3400-\u4dbf]{1,12}$/.test(val)) {
+        cjkCols.push(val);
+        continue;
+      }
+
+      // If we haven't found any CJK headword yet, skip leading metadata
+      if (cjkCols.length === 0) continue;
+
+      // Detect Pinyin column (tone marks or tone numbers, short length)
+      if (!pinyin && val.length <= 60 && isLikelyPinyin_(val)) {
+        pinyin = val;
+        continue;
+      }
+
+      // Detect English definition column (contains Latin letters, not just a single tag token)
+      if (/[a-zA-Z]{2,}/.test(val) && !/^(hanping|starred|tocfl|anki)/i.test(val)) {
+        glossParts.push(val);
       }
     }
 
-    // Strip HTML tags from Anki/Hanping exports
-    gloss = gloss.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (cjkCols.length === 0) continue;
+
+    // Determine which CJK column is Traditional vs Simplified:
+    // In AnkiDroid's `Hanping Chinese Type`, both Simplified and Traditional fields are often present.
+    // If one of them is in `PSeitz/tocfl` (which is 100% Traditional), prefer that as Traditional!
+    let trad = cjkCols[0];
+    let simp = cjkCols.length > 1 ? cjkCols[1] : '';
+    if (cjkCols.length >= 2) {
+      if (!lookup[cjkCols[0]] && lookup[cjkCols[1]]) {
+        trad = cjkCols[1];
+        simp = cjkCols[0];
+      }
+    }
 
     results.push({
       traditional: trad,
-      simplified: simp,
+      simplified: simp === trad ? '' : simp,
       pinyin: pinyin,
-      english_gloss: gloss
+      english_gloss: glossParts.join('; ').trim()
     });
   }
 
   return results;
+}
+
+/**
+ * Strips Anki `[sound:...]` tags, HTML tags (`<span class="tone1">`, `<br>`, `<div>`),
+ * and decodes common HTML entities.
+ */
+function cleanAnkiHtml_(str) {
+  return String(str || '')
+    .replace(/\[sound:[^\]]+\]/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '; ')
+    .replace(/<\/div\s*>/gi, '; ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .replace(/^[;\s]+|[;\s]+$/g, '')
+    .trim();
+}
+
+/**
+ * Returns true if a string looks like Mandarin Pinyin (with tone marks or tone numbers 1-5).
+ */
+function isLikelyPinyin_(str) {
+  const s = String(str || '').trim();
+  if (!s) return false;
+  // Contains Pinyin tone diacritics
+  if (/[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]/i.test(s)) return true;
+  // Or syllable + tone number pattern like `can1 guan3` or `shun4 bian4`
+  if (/^[a-zA-ZüÜvV]{1,6}[1-5](\s+[a-zA-ZüÜvV]{1,6}[1-5])*$/.test(s)) return true;
+  return false;
 }
 
 function parseCsvLine_(line) {

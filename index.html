@@ -23,7 +23,7 @@
     <!-- Top Header -->
     <header class="top-header">
       <div class="brand-group">
-        <div class="brand-seal" aria-hidden="true">TW</div>
+        <div class="brand-seal" aria-hidden="true">臺</div>
         <div class="brand-titles">
           <h1>Mandarin Driving Tutor</h1>
           <div class="brand-subtitle">Hands-Free Taiwanese Mandarin · FSRS v5</div>
@@ -244,18 +244,20 @@
 
       <div class="form-grid">
         <div class="field-group">
-          <label for="file-hanping-csv">1. Import from Hanping Chinese Dictionary Export (CSV / TXT)</label>
-          <input id="file-hanping-csv" type="file" accept=".csv,.txt,.tsv" />
-          <span class="field-hint">Supports Hanping CSV/TSV exports, CEDICT-style exports, and Anki plain-text exports. Automatically cross-references <code>PSeitz/tocfl</code> to attach Zhuyin and spoken frequency!</span>
+          <label for="file-hanping-csv">1. Import from AnkiDroid (<code>.txt</code>) or Hanping Backup / Export</label>
+          <input id="file-hanping-csv" type="file" accept=".txt,.csv,.tsv,.json,.bak,.gz,.hbackup" />
+          <span class="field-hint">
+            <strong>Free AnkiDroid Workaround:</strong> In AnkiDroid, tap <strong>⋮ &rarr; Export</strong>, choose <strong>Export format: Notes in Plain Text (.txt)</strong>, and pick that <code>.txt</code> file here! Also supports Hanping Local Backup files (<code>.bak</code> / <code>.gz</code> / <code>.json</code>) and CSV/TSV exports. Automatically cross-references <code>PSeitz/tocfl</code> for Zhuyin &amp; spoken frequency.
+          </span>
         </div>
 
         <div class="field-group">
-          <label for="textarea-hanping-csv">Or Paste Hanping / CSV Rows Directly</label>
-          <textarea id="textarea-hanping-csv" placeholder="餐館[餐馆] cān guǎn /restaurant/&#10;順便,shùn biàn,conveniently; in passing"></textarea>
+          <label for="textarea-hanping-csv">Or Paste AnkiDroid / Hanping Rows Directly</label>
+          <textarea id="textarea-hanping-csv" placeholder="餐館&#9;餐馆&#9;cān guǎn&#9;restaurant&#10;順便,shùn biàn,conveniently; in passing"></textarea>
         </div>
 
         <button id="btn-upload-hanping" class="btn-primary" type="button">
-          Import Hanping CSV to Sheet
+          Import Vocab to Sheet
         </button>
 
         <div class="divider-line"></div>

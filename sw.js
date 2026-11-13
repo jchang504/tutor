@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tw-mandarin-tutor-v2';
+const CACHE_NAME = 'tw-mandarin-tutor-v3';
 const ASSETS = [
   './',
   './index.html',

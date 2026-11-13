@@ -678,20 +678,69 @@ class MandarinTutorApp {
   }
 
   /**
-   * Hanping CSV file picker & upload to Google Sheet.
+   * File picker for AnkiDroid Plain Text (.txt) exports, Hanping local backups (.bak/.gz/.json), or CSV/TSV.
    */
   async handleFilePicked(event) {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
-    const text = await file.text();
-    this.els.textareaHanpingCsv.value = text;
-    this.showToast(`Loaded ${file.name} (${text.split(/\r?\n/).length} lines).`, 'info');
+
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let text = '';
+
+      // 1. Check for GZIP magic bytes (0x1f 0x8b) used by Hanping local backups (.bak / .gz)
+      if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b && 'DecompressionStream' in window) {
+        const ds = new DecompressionStream('gzip');
+        const decompressedStream = new Blob([bytes]).stream().pipeThrough(ds);
+        const decompressedBuf = await new Response(decompressedStream).arrayBuffer();
+        text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(decompressedBuf));
+      } else {
+        text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      }
+
+      // 2. If the decoded content contains null bytes (e.g. a binary SQLite backup file),
+      // extract clean printable lines / CJK + Pinyin segments
+      if (text.includes('\u0000')) {
+        text = this.extractVocabFromBinaryText(text);
+      }
+
+      this.els.textareaHanpingCsv.value = text;
+      const lineCount = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#')).length;
+      this.showToast(`Loaded ${file.name} (${lineCount} entries ready to import).`, 'info');
+    } catch (err) {
+      this.showToast(`Could not read ${file.name}: ${err.message}`, 'error');
+    }
+  }
+
+  /**
+   * Fallback extractor if a user selects a binary SQLite / Anki / Hanping backup file:
+   * pulls out `\x1f`-delimited Anki note fields or CJK headwords.
+   */
+  extractVocabFromBinaryText(raw) {
+    const outLines = [];
+    // Anki SQLite `notes.flds` separates fields with ASCII Unit Separator (0x1f)
+    if (raw.includes('\x1f')) {
+      const chunks = raw.split(/[\x00-\x08\x0b-\x1e]+/);
+      for (const chunk of chunks) {
+        if (chunk.includes('\x1f') && /[\u4e00-\u9fff]/.test(chunk)) {
+          const tabLine = chunk.replace(/\x1f/g, '\t').replace(/[^\x09\x20-\x7e\u00a0-\uffff]/g, '').trim();
+          if (tabLine) outLines.push(tabLine);
+        }
+      }
+      if (outLines.length > 0) return outLines.join('\n');
+    }
+
+    // Otherwise extract unique CJK vocabulary tokens
+    const matches = raw.match(/[\u4e00-\u9fff]{1,8}/g) || [];
+    const unique = [...new Set(matches)];
+    return unique.join('\n');
   }
 
   async uploadHanpingCsv() {
     const csvText = this.els.textareaHanpingCsv.value.trim();
     if (!csvText) {
-      this.showToast('Please select a Hanping CSV/TXT export file or paste rows first.', 'error');
+      this.showToast('Please select an AnkiDroid .txt export, Hanping backup, or paste rows first.', 'error');
       return;
     }
     try {
@@ -701,13 +750,13 @@ class MandarinTutorApp {
       this.els.importResultBox.classList.remove('hidden');
       this.els.importResultBox.textContent =
         `Imported ${res.addedCount} new words into Google Sheet (${res.skippedDuplicate} existing duplicates preserved).`;
-      this.showToast(`Added ${res.addedCount} words from Hanping!`, 'success');
+      this.showToast(`Added ${res.addedCount} words to Sheet!`, 'success');
       await this.refreshBackendStatus(false);
     } catch (err) {
       this.showToast(err.message, 'error');
     } finally {
       this.els.btnUploadHanping.disabled = false;
-      this.els.btnUploadHanping.textContent = 'Import Hanping CSV to Sheet';
+      this.els.btnUploadHanping.textContent = 'Import Vocab to Sheet';
     }
   }
 
