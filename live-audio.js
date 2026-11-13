@@ -1,21 +1,21 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v13):
+ * Key architectural guarantees (v14):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
- *    Real-world telemetry proved Gemini Live native-audio models (`2.5` / `3.x`) run pure
- *    Speech-to-Speech turns cleanly, whereas mid-audio `functionCall` generation triggers
- *    server-side `1011 Internal error occurred` and `1007` disconnects. Instead, the tutor
- *    uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
+ *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
  *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading runs asynchronously
  *    over standard REST JSON in the background after the word ends!
- * 3. Mid-sentence crash recovery: if a cellular drop or server `1011` interrupts the tutor
+ * 3. Model-aware cold-start `clientContent` (`turnComplete: true` on 2.5) + real-time 24kHz PCM
+ *    audibility RMS verification (`turnAudibleSec`) that automatically detects and regenerates
+ *    silent (`0` audio / `AAA=` zeros) or missing-English Phase 1 prompts without user intervention.
+ * 4. Mid-sentence crash recovery: if a cellular drop or server `1011` interrupts the tutor
  *    BEFORE `turnComplete`, auto-reconnect rotates to the next healthy Live model immediately
  *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
  */
 
-import { debugLogger } from './debug-logger.js?v=13';
+import { debugLogger } from './debug-logger.js?v=14';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -176,11 +176,17 @@ export class GeminiLiveVoicePipeline {
     this.reconnectTimer = null;
     this.postPlaybackCooldownUntil = 0;
 
-    // Diagnostics & timing per turn
+    // Diagnostics, PCM audibility & silent-turn auto-recovery per turn
     this.turnCommitPerfMs = 0;
     this.sentAudioChunksInTurn = 0;
     this.turnAudioChunks = 0;
     this.turnAudioSec = 0;
+    this.turnAudibleChunks = 0;
+    this.turnAudibleSec = 0;
+    this.hasSentRealtimeAudioOnSocket = false;
+    this.isPhase1InitialTurn = false;
+    this.silentTurnRetries = 0;
+    this.lastTutorPromptRequestText = '';
 
     // Mid-word auto-reconnect state so transient network/1007/1011 drops self-heal seamlessly
     this.currentWord = null;
@@ -350,6 +356,7 @@ export class GeminiLiveVoicePipeline {
       return;
     }
     this.hasUnflushedAudio = true;
+    this.hasSentRealtimeAudioOnSocket = true;
     this.sentAudioChunksInTurn += 1;
     this.ws.send(
       JSON.stringify({
@@ -384,6 +391,8 @@ export class GeminiLiveVoicePipeline {
 
     const hadUserSpeech = this.userSpokeInTurn;
     const chunksSent = this.sentAudioChunksInTurn;
+    this.isPhase1InitialTurn = false;
+    this.silentTurnRetries = 0;
     this.listeningForUser = false;
     this.userSpokeInTurn = false;
     this.serverAckedCurrentUserTurn = false;
@@ -512,6 +521,11 @@ export class GeminiLiveVoicePipeline {
     this.sentAudioChunksInTurn = 0;
     this.turnAudioChunks = 0;
     this.turnAudioSec = 0;
+    this.turnAudibleChunks = 0;
+    this.turnAudibleSec = 0;
+    this.isPhase1InitialTurn = true;
+    this.silentTurnRetries = 0;
+    this.lastTutorPromptRequestText = '';
     this.reconnectAttempts = 0;
     this.isReconnecting = false;
 
@@ -745,14 +759,58 @@ export class GeminiLiveVoicePipeline {
     throw lastErr || new Error('Unable to establish Gemini Live WebSocket connection.');
   }
 
+  /**
+   * Model-aware text prompt sender:
+   * - On Gemini 2.5 Native Audio BEFORE mic audio chunks have streamed on this socket, uses
+   *   `clientContent` with `turnComplete: true` (giving 2.5 an explicit turn boundary under
+   *   `TURN_INCLUDES_ONLY_ACTIVITY` and preventing cold-start 0-audio / cut-off turns).
+   * - On Gemini 3.1 / 3.8 Live (or after realtimeInput audio has begun), uses `realtimeInput.text`.
+   */
+  _sendPromptTurn(ws, modelId, text, tag = 'prompt', extraLog = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const targetModel = String(modelId || this.activeModelId || '');
+    this.lastTutorPromptRequestText = text;
+    const useClientContent = targetModel.includes('2.5') && !this.hasSentRealtimeAudioOnSocket;
+
+    if (useClientContent) {
+      debugLogger.log('ws', 'client_content_sent', `Sent clientContent (${tag})`, {
+        tag,
+        ...extraLog
+      });
+      ws.send(
+        JSON.stringify({
+          clientContent: {
+            turns: [{ role: 'user', parts: [{ text }] }],
+            turnComplete: true
+          }
+        })
+      );
+    } else {
+      debugLogger.log('ws', 'realtime_text_sent', `Sent realtimeInput.text (${tag})`, {
+        tag,
+        ...extraLog
+      });
+      ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            text
+          }
+        })
+      );
+    }
+  }
+
   _connectSingleModelSocket(word, apiKey, modelId, voiceName, useExtendedConfig = true, isReconnect = false) {
     return new Promise((resolve, reject) => {
       this._closeRawSocketOnly();
       let setupCompleted = false;
       const connectStartMs = performance.now();
       this.hasUnflushedAudio = false;
+      this.hasSentRealtimeAudioOnSocket = false;
       this.turnAudioChunks = 0;
       this.turnAudioSec = 0;
+      this.turnAudibleChunks = 0;
+      this.turnAudibleSec = 0;
 
       const wsUrl = `${LIVE_WS_ENDPOINT}?key=${encodeURIComponent(apiKey)}`;
       const ws = new WebSocket(wsUrl);
@@ -857,72 +915,55 @@ export class GeminiLiveVoicePipeline {
             if (isReconnect && this.interruptedTutorPartialText) {
               const partial = this.interruptedTutorPartialText;
               this.interruptedTutorPartialText = '';
+              this.isPhase1InitialTurn = false;
               this.tutorTurnActive = true;
               this.listeningForUser = false;
               this.turnCommitPerfMs = performance.now();
               this._emitState('speaking', 'Tutor finishing response...');
               const finishPrompt = `剛才語音連線在你講到「${partial}」時短暫重連。請不要重複前面講過的話，直接把最後一句簡短講完！（如果本題練習已經完成，請直接說出：「好，我們看下一題！」）`;
-              debugLogger.log('ws', 'realtime_text_sent', 'Sent mid-sentence recovery prompt to finish tutor turn', {
+              this._sendPromptTurn(ws, modelId, finishPrompt, 'mid_sentence_recovery', {
                 interruptedPartial: partial
               });
-              ws.send(
-                JSON.stringify({
-                  realtimeInput: {
-                    text: finishPrompt
-                  }
-                })
-              );
               resolve();
               return;
             }
 
             // Case 2: Reconnecting after the user spoke (tutor hadn't started speaking yet)
             if (isReconnect && lastTurn && lastTurn.role === 'user') {
+              this.isPhase1InitialTurn = false;
               this.tutorTurnActive = true;
               this.listeningForUser = false;
               this.turnCommitPerfMs = performance.now();
               this._emitState('speaking', 'Tutor responding...');
               const resumePrompt = `剛才語音連線短暫重連。我最後說的是：「${lastTurn.text}」。請不要重新唸英文題目，直接根據系統提示中的對話紀錄接續回應我！`;
-              debugLogger.log('ws', 'realtime_text_sent', 'Sent reconnect continuation prompt', {
+              this._sendPromptTurn(ws, modelId, resumePrompt, 'reconnect_continuation', {
                 lastUserText: lastTurn.text
               });
-              ws.send(
-                JSON.stringify({
-                  realtimeInput: {
-                    text: resumePrompt
-                  }
-                })
-              );
               resolve();
               return;
             }
 
             // Case 3: Reconnecting after a COMPLETED tutor turn (user's turn to speak)
             if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
+              this.isPhase1InitialTurn = false;
               debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening');
               this._beginListeningTurn('Reconnected — speak in Mandarin');
               resolve();
               return;
             }
 
-            // Case 4: Fresh word start -> kick off Phase 1
+            // Case 4: Fresh word start (or Phase 1 retry reconnect) -> kick off Phase 1
             if (!isReconnect) {
               this.playChime('start');
             }
+            this.isPhase1InitialTurn = true;
             this.tutorTurnActive = true;
             this.listeningForUser = false;
             this.turnCommitPerfMs = performance.now();
             this._emitState('speaking', 'Tutor reading English prompt...');
 
-            const kickoffText = `請開始第一階段：先用正常語速清楚唸出這題的英文句子 "${word.english_prompt}"，接著用對華語學習者說話的自然慢速台灣華語（語調自然連貫，不要刻意在詞與詞之間停頓）請我把這句話翻成中文（千萬不要先把目標詞「${word.traditional}」說出來）。`;
-            debugLogger.log('ws', 'realtime_text_sent', 'Sent Phase 1 kick-off prompt');
-            ws.send(
-              JSON.stringify({
-                realtimeInput: {
-                  text: kickoffText
-                }
-              })
-            );
+            const kickoffText = `請直接開口清楚說出下面這兩句話（第一句英文請用正常語速唸出來，第二句台灣華語請用對學習者說話的自然慢速唸出來，兩句都必須發出清楚完整的語音，絕對不要省略英文句子）：\n${word.english_prompt} 請試著把這句話翻成中文。`;
+            this._sendPromptTurn(ws, modelId, kickoffText, 'phase1_kickoff');
             resolve();
             return;
           }
@@ -1060,6 +1101,8 @@ export class GeminiLiveVoicePipeline {
     if (!this.tutorTurnActive) {
       if (this.listeningForUser) {
         // Server-side automatic VAD committed the user's turn before the 2.8s client silence backup!
+        this.isPhase1InitialTurn = false;
+        this.silentTurnRetries = 0;
         debugLogger.finalizeStreamingEntries('input_transcript');
         this.turnCommitPerfMs = performance.now();
         debugLogger.log('info', 'server_vad_turn_committed', 'Server VAD detected end of user speech', {
@@ -1071,6 +1114,22 @@ export class GeminiLiveVoicePipeline {
       this.listeningForUser = false;
       this.hasUnflushedAudio = false;
     }
+  }
+
+  _speakBrowserFallbackIfAvailable(text, onDone) {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window && text) {
+      try {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = /[A-Za-z]{3,}/.test(text) ? 'en-US' : 'zh-TW';
+        utter.rate = 0.92;
+        utter.onend = () => onDone();
+        utter.onerror = () => onDone();
+        window.speechSynthesis.speak(utter);
+        return;
+      } catch (_) {}
+    }
+    onDone();
   }
 
   _handleServerMessage(msg) {
@@ -1149,9 +1208,13 @@ export class GeminiLiveVoicePipeline {
               });
             }
             this._emitState('speaking', 'Tutor speaking...');
-            const dur = this._enqueuePcm24kAudio(part.inlineData.data);
+            const chunkStats = this._enqueuePcm24kAudio(part.inlineData.data);
             this.turnAudioChunks += 1;
-            this.turnAudioSec += dur;
+            this.turnAudioSec += chunkStats.duration;
+            if (chunkStats.isAudible) {
+              this.turnAudibleChunks += 1;
+              this.turnAudibleSec += chunkStats.duration;
+            }
           }
         }
       }
@@ -1159,23 +1222,180 @@ export class GeminiLiveVoicePipeline {
       if (sc.turnComplete) {
         debugLogger.finalizeStreamingEntries();
         const completedTutorText = this.currentTurnTutorTranscript.trim();
+        const totalAudioChunks = this.turnAudioChunks;
+        const totalAudioSec = Number(this.turnAudioSec.toFixed(2));
+        const audibleChunks = this.turnAudibleChunks;
+        const audibleSec = Number(this.turnAudibleSec.toFixed(2));
+
         debugLogger.log('info', 'tutor_turn_complete', 'Server signaled turnComplete', {
-          audioChunks: this.turnAudioChunks,
-          audioSec: Number(this.turnAudioSec.toFixed(2)),
+          audioChunks: totalAudioChunks,
+          audioSec: totalAudioSec,
+          audibleChunks,
+          audibleSec,
           spokenChars: completedTutorText.length
         });
 
         this.turnAudioChunks = 0;
         this.turnAudioSec = 0;
+        this.turnAudibleChunks = 0;
+        this.turnAudibleSec = 0;
 
+        const pendingCue = detectSpokenTerminalCue(completedTutorText);
+
+        // Guard 1: Detect completely silent tutor turn (0 audio chunks or all-zero `AAA=` chunks, e.g. Word #3 `可能`)
+        if (
+          this.isActive &&
+          !this.wordTerminalActionLocked &&
+          audibleSec < 0.45 &&
+          !(pendingCue && this.silentTurnRetries >= 1)
+        ) {
+          this.currentTurnTutorTranscript = '';
+          this.onTranscript('discard_last_tutor', '');
+
+          if (this.silentTurnRetries === 0 && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.silentTurnRetries = 1;
+            debugLogger.log(
+              'warn',
+              'silent_tutor_turn_retry',
+              'Tutor turn had <0.45s audible speech; regenerating spoken audio immediately',
+              {
+                audioChunks: totalAudioChunks,
+                audioSec: totalAudioSec,
+                audibleSec,
+                spokenChars: completedTutorText.length,
+                retry: 1
+              }
+            );
+            this.tutorTurnActive = true;
+            this.listeningForUser = false;
+            this.turnCommitPerfMs = performance.now();
+            this._emitState('speaking', 'Tutor speaking...');
+
+            const regenPrompt =
+              this.isPhase1InitialTurn && this.currentWord
+                ? `剛才沒有發出語音！請現在直接開口清楚唸出這句英文題目與中文提示（兩句都必須發出清楚聲音）：\n${this.currentWord.english_prompt} 請試著把這句話翻成中文。`
+                : completedTutorText
+                ? `剛才你的回覆沒有發出聲音，學生沒聽到！請現在直接開口把這句話清楚說出來：「${completedTutorText}」`
+                : this.lastTutorPromptRequestText ||
+                  '請用自然慢速的台灣華語簡短回應學生剛才說的話。';
+
+            this._sendPromptTurn(this.ws, this.activeModelId, regenPrompt, 'silent_turn_retry_1');
+            return;
+          }
+
+          if (this.silentTurnRetries === 1 && this.currentWord && this.lastLiveConfig) {
+            this.silentTurnRetries = 2;
+            debugLogger.log(
+              'warn',
+              'silent_tutor_turn_rotate_model',
+              'Second consecutive silent turn on socket; rotating to fallback Live model',
+              { failedModel: this.activeModelId }
+            );
+            this._closeRawSocketOnly();
+            this._openSocketWithFallbacks(
+              this.currentWord,
+              this.lastLiveConfig,
+              this.wordTurns.length > 0,
+              1
+            ).catch((err) => {
+              debugLogger.log('error', 'silent_rotate_failed', err.message || String(err));
+              this._beginListeningTurn();
+            });
+            return;
+          }
+
+          // Ultimate safety net if multiple sockets returned silent audio
+          const fallbackLine =
+            completedTutorText ||
+            (this.currentWord ? `${this.currentWord.english_prompt}` : '');
+          if (fallbackLine) {
+            this.onTranscript('tutor', fallbackLine);
+            this.onTranscript('turn_end', '');
+          }
+          this.isPhase1InitialTurn = false;
+          this.silentTurnRetries = 0;
+          this._speakBrowserFallbackIfAvailable(fallbackLine, () => {
+            if (this.isActive && !this.wordTerminalActionLocked) {
+              this._beginListeningTurn();
+            }
+          });
+          return;
+        }
+
+        // Guard 2: Detect Phase 1 greeting where English sentence was skipped or Chinese instruction truncated
+        // (e.g. Word #2 `正常`: 2.96s audio & truncated at `請試著`, or Word #1 try 1: 3.04s missing English audio)
+        if (
+          this.isActive &&
+          !this.wordTerminalActionLocked &&
+          this.isPhase1InitialTurn &&
+          this.silentTurnRetries === 0 &&
+          this.currentWord &&
+          !pendingCue
+        ) {
+          const engPrompt = String(this.currentWord.english_prompt || '').trim();
+          const engWords = engPrompt.match(/[A-Za-z0-9']+/g) || [];
+          const minBothSec = Math.min(3.65, Math.max(3.15, 2.35 + engWords.length * 0.19));
+          const hasChineseInstructionEnd = /中文|說說看|怎麼說|翻譯/.test(completedTutorText);
+          const lowerTranscript = completedTutorText.toLowerCase();
+          const matchedEngWords = engWords.filter((w) =>
+            lowerTranscript.includes(w.toLowerCase())
+          ).length;
+          const hasEnglishInTranscript =
+            engWords.length === 0 || matchedEngWords >= Math.ceil(engWords.length * 0.5);
+
+          if (audibleSec < minBothSec || !hasChineseInstructionEnd || !hasEnglishInTranscript) {
+            this.isPhase1InitialTurn = false;
+            this.silentTurnRetries = 1;
+            this._commitCompletedTutorTranscriptToTurns();
+            this.onTranscript('turn_end', '');
+
+            debugLogger.log(
+              'warn',
+              'partial_phase1_audio_autorepeat',
+              'Phase 1 audio was partial or truncated; auto-speaking English prompt clearly',
+              {
+                audibleSec,
+                minBothSec: Number(minBothSec.toFixed(2)),
+                hasChineseInstructionEnd,
+                hasEnglishInTranscript,
+                spokenText: completedTutorText
+              }
+            );
+
+            this._schedulePostPlaybackCallback(() => {
+              if (
+                !this.isActive ||
+                this.wordTerminalActionLocked ||
+                !this.ws ||
+                this.ws.readyState !== WebSocket.OPEN
+              ) {
+                return;
+              }
+              this.tutorTurnActive = true;
+              this.listeningForUser = false;
+              this.turnCommitPerfMs = performance.now();
+              this._emitState('speaking', 'Reading English sentence...');
+              const repeatEngPrompt = `請立刻用正常語速清楚唸出這題的英文句子："${engPrompt}"，接著簡短說：「請翻成中文。」`;
+              this._sendPromptTurn(
+                this.ws,
+                this.activeModelId,
+                repeatEngPrompt,
+                'phase1_missing_english_autofix'
+              );
+            });
+            return;
+          }
+        }
+
+        this.isPhase1InitialTurn = false;
+        this.silentTurnRetries = 0;
         this._commitCompletedTutorTranscriptToTurns();
         this.reconnectAttempts = 0;
         this.onTranscript('turn_end', '');
 
         // Check if the tutor spoke a deterministic terminal sign-off phrase (`「好，我們看下一題！」`, etc.)
-        const cue = detectSpokenTerminalCue(completedTutorText);
-        if (cue) {
-          this._executeTerminalCue(cue, 'turn_complete');
+        if (pendingCue) {
+          this._executeTerminalCue(pendingCue, 'turn_complete');
           return;
         }
 
@@ -1196,6 +1416,8 @@ export class GeminiLiveVoicePipeline {
     if (options.isHint) {
       this.usedHintInWord = true;
     }
+    this.isPhase1InitialTurn = false;
+    this.silentTurnRetries = 0;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       if (this.isDisconnected() && this.currentWord) {
         this.reconnectCurrentWord().catch(() => {});
@@ -1207,30 +1429,43 @@ export class GeminiLiveVoicePipeline {
     this.tutorTurnActive = true;
     this.turnCommitPerfMs = performance.now();
     this._emitState('connecting', 'Requesting from tutor...');
-    debugLogger.log('ws', 'realtime_text_sent', `User button command: ${text}`);
-    this.ws.send(
-      JSON.stringify({
-        realtimeInput: {
-          text
-        }
-      })
-    );
+    this._sendPromptTurn(this.ws, this.activeModelId, text, 'user_button_command');
   }
 
   _enqueuePcm24kAudio(base64Data) {
-    if (!this.audioCtx) return 0;
+    if (!base64Data) return { duration: 0, isAudible: false, rms: 0 };
     const binary = atob(base64Data);
     const byteLen = binary.length;
     const samples = byteLen >> 1;
-    if (samples === 0) return 0;
+    if (samples === 0) return { duration: 0, isAudible: false, rms: 0 };
 
     const float32 = new Float32Array(samples);
+    let sumSq = 0;
     for (let i = 0; i < samples; i++) {
       const lo = binary.charCodeAt(i * 2);
       const hi = binary.charCodeAt(i * 2 + 1);
       let int16 = (hi << 8) | lo;
       if (int16 >= 0x8000) int16 -= 0x10000;
-      float32[i] = int16 / 32768.0;
+      const s = int16 / 32768.0;
+      float32[i] = s;
+      sumSq += s * s;
+    }
+
+    const rms = Math.sqrt(sumSq / samples);
+    const duration = samples / 24000;
+    const isAudible = rms >= 0.0015;
+
+    if (!this.audioCtx) {
+      return { duration, isAudible, rms };
+    }
+
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {});
+    }
+
+    // Skip scheduling leading pure-zero (`AAA=`) digital-silence chunks before real speech begins
+    if (this.turnAudibleChunks === 0 && rms < 0.0004) {
+      return { duration, isAudible: false, rms };
     }
 
     const audioBuffer = this.audioCtx.createBuffer(1, float32.length, 24000);
@@ -1253,7 +1488,7 @@ export class GeminiLiveVoicePipeline {
       this.activeSources.delete(src);
     };
 
-    return audioBuffer.duration;
+    return { duration: audioBuffer.duration, isAudible, rms };
   }
 
   _schedulePostPlaybackCallback(cb) {

@@ -14,9 +14,60 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=13';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=13';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=14';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=14';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
+
+/**
+ * Inspects completed tutor feedback turns (excluding the initial Phase 1 prompt) to separate:
+ * - Benign synonym redirects (e.g. student used valid synonym `平常` while target `經常` was hidden,
+ *   then cleanly used `經常` on try #2) -> MUST NOT be penalized!
+ * - Real pronunciation / tone corrections
+ * - Real grammar / sentence-structure corrections
+ */
+export function analyzeTurnCorrections(wordTurns = []) {
+  const turns = Array.isArray(wordTurns) ? wordTurns : [];
+  const tutorTurns = turns.filter((t) => t && t.role === 'tutor' && t.text);
+  const feedbackTutorTurns = tutorTurns.slice(1);
+
+  let synonymRedirects = 0;
+  let pronunciationCorrections = 0;
+  let grammarCorrections = 0;
+
+  for (const t of feedbackTutorTurns) {
+    const txt = t.text;
+    const strippedPraise = txt.replace(/發音很(標準|好|清楚|自然|正確)|發音沒問題/g, '');
+
+    const isSynonymRedirect =
+      /也可以|意思差不多|意思很接近|意思一樣|近義詞|同義詞|要練習的詞是|今天要練的詞是|換成我們今天/.test(
+        txt
+      ) && /再說一次|試著用|換成/.test(txt);
+
+    const hasToneOrPronFix =
+      /聲調|幾聲|一聲|二聲|三聲|四聲|輕聲|唸成|唸錯|讀音|發音不|發音有誤|發音要|注意.*發音/.test(
+        strippedPraise
+      );
+
+    const hasRealGrammarFix =
+      /語法|語序|不通順|漏了|少了|句子可以改成|不能這樣用/.test(txt) ||
+      (!isSynonymRedirect && /比較自然.*再說一次|再完整說一次|重新說一次/.test(txt));
+
+    if (hasToneOrPronFix) {
+      pronunciationCorrections += 1;
+    } else if (hasRealGrammarFix) {
+      grammarCorrections += 1;
+    } else if (isSynonymRedirect) {
+      synonymRedirects += 1;
+    }
+  }
+
+  return {
+    synonymRedirects,
+    pronunciationCorrections,
+    grammarCorrections,
+    totalFixes: pronunciationCorrections + grammarCorrections
+  };
+}
 
 /**
  * Instant, deterministic 0ms FSRS rubric derivation from the completed spoken word dialogue.
@@ -42,29 +93,18 @@ export function deriveHeuristicTelemetryFromTurns(
 
   const neededHint = Boolean(usedHintButton || peeked || userAskedForHint || tutorGaveExplicitAnswerHint);
 
-  // Skip index 0 (initial Phase 1 English prompt) when counting tutor corrections
-  const feedbackTutorTurns = tutorTurns.slice(1);
-  let pronunciationCorrections = 0;
-  let grammarCorrections = 0;
-
-  for (const t of feedbackTutorTurns) {
-    const txt = t.text;
-    const hasToneOrPronFix = /聲調|幾聲|一聲|二聲|三聲|四聲|輕聲|發音|唸成|讀音/.test(txt);
-    const hasGrammarOrRetryFix =
-      /語法|語序|比較自然|漏了|少了|句子可以改成|再完整說一次|重新說一次/.test(txt);
-    if (hasToneOrPronFix) {
-      pronunciationCorrections += 1;
-    } else if (hasGrammarOrRetryFix) {
-      grammarCorrections += 1;
-    }
-  }
+  const {
+    synonymRedirects,
+    pronunciationCorrections,
+    grammarCorrections,
+    totalFixes
+  } = analyzeTurnCorrections(turns);
 
   const pronunciationAttempts = 1 + pronunciationCorrections;
-  const totalFixes = pronunciationCorrections + grammarCorrections;
   const fluency =
     totalFixes >= 3 || (neededHint && totalFixes >= 2)
       ? 'struggled'
-      : totalFixes >= 1 || userTurns.length >= 5
+      : totalFixes >= 1
       ? 'good'
       : 'natural';
 
@@ -77,6 +117,8 @@ export function deriveHeuristicTelemetryFromTurns(
     notes = 'Practiced pronunciation / tones';
   } else if (grammarCorrections > 0) {
     notes = 'Refined sentence grammar';
+  } else if (synonymRedirects > 0) {
+    notes = 'Used synonym first, then target word cleanly';
   }
 
   return {
@@ -86,6 +128,50 @@ export function deriveHeuristicTelemetryFromTurns(
     grammar_errors: grammarCorrections,
     conversation_fluency: fluency,
     notes
+  };
+}
+
+/**
+ * Deterministic post-normalization of the AI JSON grader output:
+ * Ensures that if the student only used a valid synonym on Attempt 1 (while the target word was hidden)
+ * and then cleanly produced the target word on Attempt 2 with zero real tone/grammar corrections,
+ * it is NEVER penalized as `pronunciation_attempts: 2` or `grammar_errors: 1` — guaranteeing Score 4 (`Easy`)!
+ */
+export function normalizeAiGradingTelemetry(
+  parsed = {},
+  wordTurns = [],
+  fallbackTelemetry = {},
+  forceNeededHint = false
+) {
+  const neededHint = Boolean(forceNeededHint || parsed.needed_hint);
+  const turnAnalysis = analyzeTurnCorrections(wordTurns);
+  const isCleanSynonymRedirectOnly =
+    !neededHint &&
+    (parsed.synonym_redirect_only === true ||
+      (turnAnalysis.synonymRedirects > 0 && turnAnalysis.totalFixes === 0));
+
+  if (isCleanSynonymRedirectOnly) {
+    return {
+      target_word_recalled: true,
+      needed_hint: false,
+      pronunciation_attempts: 1,
+      grammar_errors: 0,
+      conversation_fluency: 'natural',
+      notes: String(
+        parsed.notes || fallbackTelemetry.notes || 'Used synonym first, then target word cleanly'
+      ).slice(0, 60)
+    };
+  }
+
+  return {
+    target_word_recalled: neededHint ? false : parsed.target_word_recalled !== false,
+    needed_hint: neededHint,
+    pronunciation_attempts: Math.max(1, Number(parsed.pronunciation_attempts) || 1),
+    grammar_errors: Math.max(0, Number(parsed.grammar_errors) || 0),
+    conversation_fluency: ['natural', 'good', 'struggled'].includes(parsed.conversation_fluency)
+      ? parsed.conversation_fluency
+      : fallbackTelemetry.conversation_fluency || 'natural',
+    notes: String(parsed.notes || fallbackTelemetry.notes || '').slice(0, 60)
   };
 }
 
@@ -729,11 +815,12 @@ class MandarinTutorApp {
           )
       );
       const names = models.map((m) => m.name);
+      // Prefer GA gemini-2.5-flash (with thinkingBudget: 0) over preview -lite endpoints that frequently return HTTP 503
       const preferredMatchers = [
-        /gemini-3\.\d+-flash-lite/i,
-        /flash-lite/i,
-        /gemini-3(\.\d+)?-flash/i,
+        /gemini-2\.5-flash$/i,
+        /gemini-3(\.\d+)?-flash$/i,
         /gemini-2\.5-flash/i,
+        /flash-lite/i,
         /flash/i
       ];
       for (const rx of preferredMatchers) {
@@ -755,6 +842,45 @@ class MandarinTutorApp {
     return 'models/gemini-2.5-flash';
   }
 
+  async _requestGradingJsonFromModel(modelName, apiKey, gradingPrompt, signal) {
+    const generationConfig = {
+      temperature: 0.1,
+      responseMimeType: 'application/json'
+    };
+    if (modelName.includes('2.5')) {
+      generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    }
+
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: gradingPrompt }] }],
+          generationConfig
+        }),
+        signal
+      }
+    );
+
+    if (!resp.ok) {
+      const err = new Error(`Grading HTTP ${resp.status} on ${modelName}`);
+      err.httpStatus = resp.status;
+      throw err;
+    }
+
+    const data = await resp.json();
+    const rawJson = (
+      data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || ''
+    )
+      .replace(/^```json\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+
+    return JSON.parse(rawJson);
+  }
+
   async gradeWordTranscriptWithFlash(word, wordTurns, fallbackTelemetry, forceNeededHint = false) {
     const apiKey = (this.liveAuth && this.liveAuth.apiKey ? this.liveAuth.apiKey : '').trim();
     if (!apiKey || !Array.isArray(wordTurns) || wordTurns.length === 0) {
@@ -762,22 +888,14 @@ class MandarinTutorApp {
     }
 
     const startMs = performance.now();
-    const modelName = await this._discoverFastGradingModel(apiKey);
+    let usedModel = await this._discoverFastGradingModel(apiKey);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 4500);
+    const timer = setTimeout(() => ctrl.abort(), 5500);
 
     try {
       const dialogueText = wordTurns
         .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
         .join('\n');
-
-      const generationConfig = {
-        temperature: 0.1,
-        responseMimeType: 'application/json'
-      };
-      if (modelName.includes('2.5')) {
-        generationConfig.thinkingConfig = { thinkingBudget: 0 };
-      }
 
       const gradingPrompt = `Evaluate this completed Taiwanese Mandarin voice tutor dialogue for spaced-repetition (FSRS v5) scoring and return ONLY a JSON object with these exact keys:
 {
@@ -786,6 +904,7 @@ class MandarinTutorApp {
   "pronunciation_attempts": integer (>=1),
   "grammar_errors": integer (>=0),
   "conversation_fluency": "natural" | "good" | "struggled",
+  "synonym_redirect_only": boolean,
   "notes": "short English note <= 8 words"
 }
 
@@ -794,59 +913,57 @@ Grading rules:
 - English prompt: "${word.english_prompt || ''}"
 - Reference Mandarin: "${word.mandarin_sentence || word.sample_mandarin || ''}"
 - IMPORTANT: The student ("學生") lines come from speech-to-text ASR, which may contain minor homophones or segmentation quirks (e.g. 餐館/餐廳, 設一個/是個). Always trust the tutor's ("老師") spoken reaction! If the tutor immediately praised the student ("說得很好！", etc.) without correcting tones or grammar, set target_word_recalled=true, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural".
-- Only set pronunciation_attempts > 1 if the tutor explicitly corrected the student's tones/pronunciation and asked them to repeat.
-- Only set grammar_errors > 0 if the tutor explicitly corrected ungrammatical phrasing or a missing target word.
-- Set needed_hint=true ONLY if the student asked for a hint/answer or the tutor gave away a hint before recall.
+- SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT): Because the target word is hidden on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "平常" or "常常" when the hidden target is "經常"). When the tutor acknowledges the synonym is natural ("「平常」也可以，不過我們今天要練習的詞是「經常」。你可以試著用「經常」再說一次嗎？") and the student then cleanly produces the sentence with the target word on the next try without tone or grammar errors, DO NOT penalize them! You MUST set: target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
+- Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation.
+- Only set grammar_errors > 0 if the tutor explicitly corrected ungrammatical phrasing or wrong word order (NEVER count a valid synonym on try #1 as a grammar error).
+- Set needed_hint=true ONLY if the student didn't know how to translate and asked for a hint/answer, or the tutor had to give a clue before the student could form a sentence.
 
 Dialogue:
 ${dialogueText}`;
 
-      const resp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: gradingPrompt }] }],
-            generationConfig
-          }),
-          signal: ctrl.signal
+      let parsed;
+      try {
+        parsed = await this._requestGradingJsonFromModel(
+          usedModel,
+          apiKey,
+          gradingPrompt,
+          ctrl.signal
+        );
+      } catch (firstErr) {
+        if (
+          firstErr.httpStatus === 404 ||
+          firstErr.httpStatus === 429 ||
+          firstErr.httpStatus === 503
+        ) {
+          this.cachedGradingModel = null;
+          const retryModel =
+            usedModel === 'models/gemini-2.5-flash'
+              ? 'models/gemini-2.5-flash-lite'
+              : 'models/gemini-2.5-flash';
+          usedModel = retryModel;
+          parsed = await this._requestGradingJsonFromModel(
+            retryModel,
+            apiKey,
+            gradingPrompt,
+            ctrl.signal
+          );
+        } else {
+          throw firstErr;
         }
-      );
-
-      if (!resp.ok) {
-        if (resp.status === 404) this.cachedGradingModel = null;
-        throw new Error(`Grading HTTP ${resp.status} on ${modelName}`);
       }
 
-      const data = await resp.json();
-      const rawJson = (
-        data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || ''
-      )
-        .replace(/^```json\s*/i, '')
-        .replace(/```$/i, '')
-        .trim();
-
-      const parsed = JSON.parse(rawJson);
-      const neededHint = Boolean(forceNeededHint || parsed.needed_hint);
-      const normalized = {
-        target_word_recalled: neededHint ? false : parsed.target_word_recalled !== false,
-        needed_hint: neededHint,
-        pronunciation_attempts: Math.max(1, Number(parsed.pronunciation_attempts) || 1),
-        grammar_errors: Math.max(0, Number(parsed.grammar_errors) || 0),
-        conversation_fluency: ['natural', 'good', 'struggled'].includes(
-          parsed.conversation_fluency
-        )
-          ? parsed.conversation_fluency
-          : fallbackTelemetry.conversation_fluency,
-        notes: String(parsed.notes || fallbackTelemetry.notes || '').slice(0, 60)
-      };
+      const normalized = normalizeAiGradingTelemetry(
+        parsed,
+        wordTurns,
+        fallbackTelemetry,
+        forceNeededHint
+      );
 
       debugLogger.log(
         'info',
         'word_graded_ai',
-        `Graded ${word.traditional} via ${modelName.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
-        { model: modelName, normalized }
+        `Graded ${word.traditional} via ${usedModel.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
+        { model: usedModel, normalized }
       );
       return normalized;
     } catch (err) {
@@ -1027,6 +1144,15 @@ ${dialogueText}`;
   }
 
   handleTranscript(role, text) {
+    if (role === 'discard_last_tutor') {
+      const lastIdx = this.transcriptHistory.length - 1;
+      if (lastIdx >= 0 && this.transcriptHistory[lastIdx].role === 'tutor') {
+        this.transcriptHistory.pop();
+        this.renderTranscriptFeed();
+      }
+      return;
+    }
+
     if (role === 'turn_end') {
       const last = this.transcriptHistory[this.transcriptHistory.length - 1];
       if (last) last.finalized = true;
