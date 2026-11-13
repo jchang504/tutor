@@ -14,7 +14,8 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=11';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=12';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=12';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 const STORAGE_KEYS = {
@@ -25,7 +26,8 @@ const STORAGE_KEYS = {
   TOCFL_LEVEL: 'tw_tutor_tocfl_level',
   BATCH_SIZE: 'tw_tutor_batch_size',
   NEW_RATIO: 'tw_tutor_new_ratio',
-  VOICE_NAME: 'tw_tutor_voice_name'
+  VOICE_NAME: 'tw_tutor_voice_name',
+  PREFERRED_LIVE_MODEL: 'tw_tutor_preferred_live_model'
 };
 
 class MandarinTutorApp {
@@ -39,7 +41,8 @@ class MandarinTutorApp {
     this.liveAuth = {
       apiKey: localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) || '',
       liveModel: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-      fallbackLiveModel: 'models/gemini-3.8-live',
+      fallbackLiveModel: 'models/gemini-3.1-flash-live-preview',
+      preferredLiveModel: localStorage.getItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL) || 'auto',
       voiceName: localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede'
     };
 
@@ -53,13 +56,21 @@ class MandarinTutorApp {
       onCompleteWord: (telemetry) => this.handleWordCompleted(telemetry),
       onSessionControl: (cmd) => this.handleVoiceControlCommand(cmd),
       onAudioLevel: (lvl) => this.updateAudioMeter(lvl),
-      onError: (err) => this.showToast(err.message || String(err), 'error')
+      onError: (err) => {
+        debugLogger.log('error', 'pipeline_error', err.message || String(err));
+        this.showToast(err.message || String(err), 'error');
+      }
     });
 
     this.bindDom();
     this.loadSavedConfigIntoInputs();
+    this.setupDebugLogsSubscription();
     this.setupMediaSessionControls();
     this.setupWakeLockLifecycle();
+    debugLogger.log('info', 'app_boot', `Mandarin Driving Tutor ${APP_VERSION} booted`, {
+      preferredLiveModel: this.liveAuth.preferredLiveModel,
+      voiceName: this.liveAuth.voiceName
+    });
     this.refreshBackendStatus();
   }
 
@@ -103,6 +114,17 @@ class MandarinTutorApp {
       btnEndSession: document.getElementById('btn-end-session'),
       btnToggleReveal: document.getElementById('btn-toggle-reveal'),
 
+      btnOpenLogs: document.getElementById('btn-open-logs'),
+      logsAlertDot: document.getElementById('logs-alert-dot'),
+      drawerLogs: document.getElementById('drawer-logs'),
+      btnCloseLogs: document.getElementById('btn-close-logs'),
+      logsSummaryBox: document.getElementById('logs-summary-box'),
+      btnCopyLogsGemini: document.getElementById('btn-copy-logs-gemini'),
+      btnShareLogs: document.getElementById('btn-share-logs'),
+      btnClearLogs: document.getElementById('btn-clear-logs'),
+      selectLogFilter: document.getElementById('select-log-filter'),
+      logsViewer: document.getElementById('logs-viewer'),
+
       btnOpenSettings: document.getElementById('btn-open-settings'),
       btnOpenImport: document.getElementById('btn-open-import'),
       drawerSettings: document.getElementById('drawer-settings'),
@@ -117,7 +139,8 @@ class MandarinTutorApp {
       inputNewRatio: document.getElementById('input-new-ratio'),
       inputTocflLevel: document.getElementById('input-tocfl-level'),
       inputVoiceName: document.getElementById('input-voice-name'),
-      btnSaveSettings: document.getElementById('btn-save-settings'),
+      inputLiveModel: document.getElementById('input-live-model'),
+      btnSaveSettings: document.getElementById('input-save-settings') || document.getElementById('btn-save-settings'),
       btnTestConnection: document.getElementById('btn-test-connection'),
 
       fileHanpingCsv: document.getElementById('file-hanping-csv'),
@@ -179,6 +202,29 @@ class MandarinTutorApp {
       }
     });
 
+    if (this.els.btnOpenLogs) {
+      this.els.btnOpenLogs.addEventListener('click', () => this.openLogsDrawer());
+    }
+    if (this.els.btnCloseLogs) {
+      this.els.btnCloseLogs.addEventListener('click', () => this.els.drawerLogs.classList.add('hidden'));
+    }
+    if (this.els.btnCopyLogsGemini) {
+      this.els.btnCopyLogsGemini.addEventListener('click', () => this.copyLogsForGemini());
+    }
+    if (this.els.btnShareLogs) {
+      this.els.btnShareLogs.addEventListener('click', () => this.shareOrDownloadLogs());
+    }
+    if (this.els.btnClearLogs) {
+      this.els.btnClearLogs.addEventListener('click', () => {
+        debugLogger.clear();
+        this.renderLogsDrawer();
+        this.showToast('Cleared debug logs.', 'info');
+      });
+    }
+    if (this.els.selectLogFilter) {
+      this.els.selectLogFilter.addEventListener('change', () => this.renderLogsDrawer());
+    }
+
     this.els.btnOpenSettings.addEventListener('click', () => this.els.drawerSettings.classList.remove('hidden'));
     this.els.btnCloseSettings.addEventListener('click', () => this.els.drawerSettings.classList.add('hidden'));
     this.els.btnOpenImport.addEventListener('click', () => this.els.drawerImport.classList.remove('hidden'));
@@ -238,6 +284,9 @@ class MandarinTutorApp {
     this.els.inputNewRatio.value = localStorage.getItem(STORAGE_KEYS.NEW_RATIO) || '10';
     this.els.inputTocflLevel.value = localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || '2';
     this.els.inputVoiceName.value = localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede';
+    if (this.els.inputLiveModel) {
+      this.els.inputLiveModel.value = localStorage.getItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL) || 'auto';
+    }
     this.els.selectSupplementLevel.value = localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || '2';
   }
 
@@ -249,6 +298,7 @@ class MandarinTutorApp {
     const newRatioPct = this.els.inputNewRatio.value.trim() || '10';
     const tocflLevel = this.els.inputTocflLevel.value.trim() || '2';
     const voiceName = this.els.inputVoiceName.value.trim() || 'Aoede';
+    const preferredLiveModel = this.els.inputLiveModel ? this.els.inputLiveModel.value : 'auto';
 
     localStorage.setItem(STORAGE_KEYS.GAS_URL, gasUrl);
     localStorage.setItem(STORAGE_KEYS.SECRET, secret);
@@ -257,11 +307,21 @@ class MandarinTutorApp {
     localStorage.setItem(STORAGE_KEYS.NEW_RATIO, newRatioPct);
     localStorage.setItem(STORAGE_KEYS.TOCFL_LEVEL, tocflLevel);
     localStorage.setItem(STORAGE_KEYS.VOICE_NAME, voiceName);
+    localStorage.setItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL, preferredLiveModel);
 
     this.liveAuth.voiceName = voiceName;
+    this.liveAuth.preferredLiveModel = preferredLiveModel;
     if (directKey) {
       this.liveAuth.apiKey = directKey;
     }
+
+    debugLogger.log('info', 'settings_saved', 'Updated tutor settings', {
+      batchSize,
+      newRatioPct,
+      tocflLevel,
+      voiceName,
+      preferredLiveModel
+    });
 
     if (gasUrl && secret) {
       try {
@@ -292,24 +352,49 @@ class MandarinTutorApp {
       throw new Error('Google Sheet Web App URL or Secret is not configured yet.');
     }
 
+    const startMs = performance.now();
     const body = Object.assign({}, payload, { action, secret });
-    const response = await fetch(gasUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'text/plain;charset=utf-8'
-      },
-      body: JSON.stringify(body),
-      redirect: 'follow'
-    });
+    try {
+      const response = await fetch(gasUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8'
+        },
+        body: JSON.stringify(body),
+        redirect: 'follow'
+      });
 
-    if (!response.ok) {
-      throw new Error(`Apps Script HTTP ${response.status}`);
+      const durationMs = Math.round(performance.now() - startMs);
+      if (!response.ok) {
+        debugLogger.log('error', 'backend_rpc_http_error', `RPC ${action} HTTP ${response.status}`, {
+          action,
+          status: response.status,
+          durationMs
+        });
+        throw new Error(`Apps Script HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      if (!data.ok) {
+        debugLogger.log('error', 'backend_rpc_error', `RPC ${action} failed: ${data.error || 'unknown'}`, {
+          action,
+          durationMs
+        });
+        throw new Error(data.error || 'Apps Script backend error.');
+      }
+      debugLogger.log('info', 'backend_rpc_ok', `RPC ${action} succeeded in ${durationMs}ms`, {
+        action,
+        durationMs
+      });
+      return data;
+    } catch (err) {
+      if (!String(err.message || '').startsWith('Apps Script')) {
+        debugLogger.log('error', 'backend_rpc_network_error', `RPC ${action} error: ${err.message || err}`, {
+          action,
+          durationMs: Math.round(performance.now() - startMs)
+        });
+      }
+      throw err;
     }
-    const data = await response.json();
-    if (!data.ok) {
-      throw new Error(data.error || 'Apps Script backend error.');
-    }
-    return data;
   }
 
   async refreshBackendStatus(notify = false) {
@@ -416,13 +501,19 @@ class MandarinTutorApp {
 
       this.batch = res.batch || [];
       if (res.liveAuth && res.liveAuth.apiKey) {
-        this.liveAuth = Object.assign({}, this.liveAuth, res.liveAuth);
+        this.liveAuth = Object.assign({}, this.liveAuth, res.liveAuth, {
+          preferredLiveModel:
+            localStorage.getItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL) ||
+            this.liveAuth.preferredLiveModel ||
+            'auto'
+        });
       }
       if (directKey) {
         this.liveAuth.apiKey = directKey;
       }
 
       const sum = res.batchSummary || {};
+      debugLogger.log('info', 'batch_loaded', `Loaded ${this.batch.length} words from Sheet`, sum);
       this.showToast(
         `Loaded ${sum.total || this.batch.length} words (${sum.dueReviews || 0} due, ${sum.newWords || 0} new)`,
         'success'
@@ -430,6 +521,7 @@ class MandarinTutorApp {
     } else if (directKey) {
       this.liveAuth.apiKey = directKey;
       this.batch = SAMPLE_TAIWAN_BATCH.map((w) => Object.assign({}, w));
+      debugLogger.log('info', 'batch_loaded_sample', 'Loaded 5 sample words (Direct Key Mode)');
       this.showToast('Loaded 5 sample Taiwanese Mandarin words (Direct Key Mode).', 'info');
     } else {
       this.els.drawerSettings.classList.remove('hidden');
@@ -458,7 +550,8 @@ class MandarinTutorApp {
     this.renderCurrentWordCard();
     this.updateMediaSessionMetadata(word);
 
-    await this.pipeline.startWordSession(word, this.liveAuth);
+    const posLabel = `#${this.currentIndex + 1}/${this.batch.length}`;
+    await this.pipeline.startWordSession(word, this.liveAuth, posLabel);
   }
 
   renderCurrentWordCard() {
@@ -519,6 +612,13 @@ class MandarinTutorApp {
 
     const score = computeDeterministicScore(telemetry);
     const fsrsPreview = computeFsrsV5(word, score, 0.90);
+
+    debugLogger.log('info', 'word_completed', `Completed ${word.traditional} -> Score ${score} (${scoreLabel(score)}, +${fsrsPreview.intervalDays}d)`, {
+      traditional: word.traditional,
+      score,
+      intervalDays: fsrsPreview.intervalDays,
+      telemetry
+    });
 
     // Show score banner
     this.els.lastScoreBanner.classList.remove('hidden');
@@ -583,6 +683,7 @@ class MandarinTutorApp {
     this.pipeline.closeCurrentWordSocket();
     const word = this.batch[this.currentIndex];
     if (word) {
+      debugLogger.log('info', 'word_skipped', `Skipped ${word.traditional} (${reason})`);
       this.showToast(`Skipped ${word.traditional}`, 'info');
     }
     this.currentIndex += 1;
@@ -663,6 +764,10 @@ class MandarinTutorApp {
       if (latest.text.includes('問我') || latest.text.includes('問題')) {
         this.setPhaseIndicator(3);
       }
+    } else if (role === 'user' && latest && debugLogger.context.phase === 2) {
+      if (/[？?嗎呢什麼誰哪怎麼幾]/.test(latest.text)) {
+        this.setPhaseIndicator(3);
+      }
     }
 
     this.renderTranscriptFeed();
@@ -687,6 +792,7 @@ class MandarinTutorApp {
   }
 
   setPhaseIndicator(stepNum) {
+    debugLogger.setContext({ phase: stepNum });
     this.els.phaseSteps.forEach((el, idx) => {
       if (!el) return;
       const n = idx + 1;
@@ -1160,6 +1266,142 @@ class MandarinTutorApp {
       this.els.btnPregeneratePrompts.disabled = false;
       this.els.btnPregeneratePrompts.textContent = 'Generate / Refresh Mandarin → English Sentences';
     }
+  }
+
+  /**
+   * Persistent Debug Logs Drawer & 1-Tap Gemini Diagnostic Export
+   */
+  setupDebugLogsSubscription() {
+    const syncAlertState = () => {
+      const hasAlert = debugLogger.hasUnreadIssue;
+      if (this.els.logsAlertDot) {
+        this.els.logsAlertDot.classList.toggle('hidden', !hasAlert);
+      }
+      if (this.els.btnOpenLogs) {
+        this.els.btnOpenLogs.classList.toggle('has-alert', hasAlert);
+      }
+      if (this.els.drawerLogs && !this.els.drawerLogs.classList.contains('hidden')) {
+        this.renderLogsDrawer();
+      }
+    };
+    syncAlertState();
+    debugLogger.subscribe(() => syncAlertState());
+  }
+
+  openLogsDrawer() {
+    if (!this.els.drawerLogs) return;
+    debugLogger.markIssuesRead();
+    this.els.drawerLogs.classList.remove('hidden');
+    if (this.els.logsAlertDot) this.els.logsAlertDot.classList.add('hidden');
+    if (this.els.btnOpenLogs) this.els.btnOpenLogs.classList.remove('has-alert');
+    this.renderLogsDrawer();
+  }
+
+  renderLogsDrawer() {
+    if (!this.els.logsViewer || !this.els.logsSummaryBox) return;
+
+    const stats = debugLogger.getSummaryStats();
+    let closeNote = 'None (0 unexpected closes)';
+    if (stats.lastUnexpectedClose) {
+      const d = stats.lastUnexpectedClose.data || {};
+      closeNote = `code=${d.code ?? '?'}${d.reason ? ` ("${this.escapeHtml(d.reason)}")` : ''} (${stats.unexpectedCloseCount} total)`;
+    }
+
+    this.els.logsSummaryBox.innerHTML =
+      `<strong>App ${this.escapeHtml(stats.version)}</strong> · Model: <code>${this.escapeHtml(stats.activeModel)}</code> · Events: <strong>${stats.totalEntries}</strong> · Hidden Thoughts: <strong>${stats.thoughtTurnCount}</strong><br />` +
+      `Unexpected WS Closes: <strong>${closeNote}</strong><br />` +
+      `<span style="font-size:0.76rem; color:var(--text-muted);">Tap <strong>Copy Logs for Gemini</strong> below and paste directly into Gemini chat to debug any voice, thinking, or WebSocket issue.</span>`;
+
+    const filter = this.els.selectLogFilter ? this.els.selectLogFilter.value : 'all';
+    const entries = debugLogger.getEntries(filter);
+    if (entries.length === 0) {
+      this.els.logsViewer.textContent =
+        filter === 'highlights'
+          ? 'No warnings, errors, tool calls, or model thoughts recorded yet.'
+          : 'No events logged yet.';
+      return;
+    }
+
+    const htmlRows = entries.slice(-250).map((e) => {
+      const lineText = debugLogger._formatSingleEntryLine(e);
+      const cls = `log-row log-level-${e.level || 'info'}`;
+      return `<div class="${cls}">${this.escapeHtml(lineText)}</div>`;
+    });
+
+    this.els.logsViewer.innerHTML = htmlRows.join('');
+    this.els.logsViewer.scrollTop = this.els.logsViewer.scrollHeight;
+  }
+
+  async copyLogsForGemini() {
+    const markdownReport = debugLogger.formatForGemini(220);
+    let copied = false;
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(markdownReport);
+        copied = true;
+      } catch (_) {}
+    }
+
+    if (!copied) {
+      try {
+        const tempArea = document.createElement('textarea');
+        tempArea.value = markdownReport;
+        tempArea.style.position = 'fixed';
+        tempArea.style.opacity = '0';
+        document.body.appendChild(tempArea);
+        tempArea.focus();
+        tempArea.select();
+        copied = document.execCommand('copy');
+        tempArea.remove();
+      } catch (_) {}
+    }
+
+    if (copied) {
+      this.showToast('Copied diagnostic log! Paste directly into Gemini chat.', 'success');
+    } else {
+      this.showToast('Clipboard blocked — tap Share / Save .txt instead.', 'error');
+    }
+  }
+
+  async shareOrDownloadLogs() {
+    const markdownReport = debugLogger.formatForGemini(300);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `mandarin-tutor-logs-${stamp}.txt`;
+
+    // On Android Pixel 9 Chrome, native Web Share opens the Android share sheet (Gemini, Keep, Drive, Gmail, etc.)
+    if (navigator.share) {
+      try {
+        const file = new File([markdownReport], filename, { type: 'text/plain' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            title: 'Mandarin Tutor Diagnostic Log',
+            text: 'Diagnostic log bundle for Gemini debugging',
+            files: [file]
+          });
+          return;
+        }
+        await navigator.share({
+          title: 'Mandarin Tutor Diagnostic Log',
+          text: markdownReport
+        });
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+      }
+    }
+
+    // Fallback: direct .txt download
+    const blob = new Blob([markdownReport], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    this.showToast(`Downloaded ${filename}`, 'success');
   }
 
   showToast(message, type = 'info') {

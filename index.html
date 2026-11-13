@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=10" />
+  <link rel="stylesheet" href="./index.css?v=12" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -31,6 +31,10 @@
       </div>
 
       <div class="header-actions">
+        <button id="btn-open-logs" class="icon-btn" type="button" aria-label="Open Debug Logs for Gemini">
+          <span id="logs-alert-dot" class="alert-dot hidden" aria-hidden="true"></span>
+          <span>Logs</span>
+        </button>
         <button id="btn-open-import" class="icon-btn" type="button" aria-label="Import Hanping or TOCFL Vocab">
           <span>Sync Vocab</span>
         </button>
@@ -223,6 +227,17 @@
           </div>
         </div>
 
+        <div class="field-group">
+          <label for="input-live-model">Gemini Live Voice Model</label>
+          <select id="input-live-model">
+            <option value="auto" selected>Auto (2.5 Native Audio [No-Think] &rarr; 3.1 Flash Live &rarr; 3.8 Live)</option>
+            <option value="models/gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live Preview</option>
+            <option value="models/gemini-3.8-live">Gemini 3.8 Live (GA Low-Latency)</option>
+            <option value="models/gemini-2.5-flash-native-audio-preview-12-2025">Gemini 2.5 Native Audio (Thinking Disabled)</option>
+          </select>
+          <span class="field-hint">Auto disables thinking loops on 2.5 Native Audio and automatically rotates models if a server disconnect occurs.</span>
+        </div>
+
         <div class="divider-line"></div>
 
         <div class="field-group">
@@ -334,7 +349,43 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=11"></script>
+  <!-- Debug Logs Modal Drawer (For 1-Tap Sharing with Gemini) -->
+  <div id="drawer-logs" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="logs-title">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <h2 id="logs-title">Debug Logs (Share with Gemini)</h2>
+        <button id="btn-close-logs" class="btn-secondary" type="button">Close</button>
+      </div>
+
+      <div id="logs-summary-box" class="info-callout">
+        Loading diagnostic summary...
+      </div>
+
+      <div class="logs-toolbar">
+        <button id="btn-copy-logs-gemini" class="btn-primary" type="button" style="flex:1.4;">
+          Copy Logs for Gemini
+        </button>
+        <button id="btn-share-logs" class="btn-secondary" type="button" style="flex:1;">
+          Share / Save .txt
+        </button>
+        <button id="btn-clear-logs" class="btn-secondary" type="button">
+          Clear
+        </button>
+      </div>
+
+      <div class="field-group">
+        <label for="select-log-filter">View Filter (API keys &amp; secrets are automatically redacted)</label>
+        <select id="select-log-filter">
+          <option value="all" selected>All Events (WebSocket, VAD, Speech, Thoughts &amp; Tools)</option>
+          <option value="highlights">Highlights Only (Errors, WS Closes, Tool Calls &amp; Model Thoughts)</option>
+        </select>
+      </div>
+
+      <pre id="logs-viewer" class="logs-viewer" aria-live="off">No events logged yet.</pre>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js?v=12"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -345,7 +396,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=11').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=12').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

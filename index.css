@@ -738,7 +738,63 @@ body {
   display: none !important;
 }
 
+/* Debug Logs Drawer & Alert Dot */
+.alert-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-coral);
+  box-shadow: 0 0 8px var(--accent-coral);
+  display: inline-block;
+}
+
+.icon-btn.has-alert {
+  border-color: hsla(8, 78%, 60%, 0.55);
+}
+
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.logs-viewer {
+  min-height: 240px;
+  max-height: 44dvh;
+  overflow: auto;
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  line-height: 1.48;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.log-row {
+  padding: 2px 0;
+  border-bottom: 1px solid hsla(215, 20%, 85%, 0.04);
+}
+
+.log-level-error { color: var(--accent-coral); font-weight: 600; }
+.log-level-warn { color: var(--accent-amber); }
+.log-level-thought { color: hsl(275, 78%, 76%); }
+.log-level-tool { color: var(--accent-jade); font-weight: 600; }
+.log-level-ws { color: var(--accent-sky); }
+
 @media (max-width: 480px) {
+  .header-actions {
+    gap: 6px;
+  }
+  .icon-btn {
+    padding: 0 10px;
+    font-size: 0.78rem;
+  }
   .secondary-drive-grid {
     grid-template-columns: repeat(2, 1fr);
   }
