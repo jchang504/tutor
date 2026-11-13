@@ -14,7 +14,7 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=9';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=10';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 const STORAGE_KEYS = {
@@ -490,7 +490,10 @@ class MandarinTutorApp {
       this.els.targetWordBox.classList.remove('spoiler-masked');
       this.els.targetHanzi.textContent = word.traditional;
       this.els.targetPhonetics.textContent = [word.pinyin, word.zhuyin].filter(Boolean).join(' · ');
-      this.els.targetGloss.textContent = word.english_gloss || '';
+      const refMandarin = (word.mandarin_sentence || word.sample_mandarin || '').trim();
+      this.els.targetGloss.textContent = [word.english_gloss, refMandarin ? `Ref: ${refMandarin}` : '']
+        .filter(Boolean)
+        .join(' · ');
       this.els.btnToggleReveal.textContent = 'Hide Target Word';
     } else {
       this.els.targetWordBox.classList.add('spoiler-masked');
@@ -533,6 +536,7 @@ class MandarinTutorApp {
         word_id: word.id,
         traditional: word.traditional,
         english_prompt: word.english_prompt,
+        mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || '',
         telemetry
       })
         .then(() => this.refreshBackendStatus(false))
@@ -1048,16 +1052,34 @@ class MandarinTutorApp {
 
     try {
       this.els.btnUploadHanping.disabled = true;
-      this.els.btnUploadHanping.textContent = `Importing ${matchedCount} Notes & Pre-Generating Sentences...`;
+      this.els.btnUploadHanping.textContent = `Importing ${matchedCount} Notes & Generating Mandarin -> English...`;
       const res = await this.callBackend('import_hanping', {
         csvText,
         tagFilter,
         pruneNonMatching
       });
+
+      let totalPromptsGenerated = Number(res.promptsGenerated || 0);
+      let remaining = Number(res.remainingPrompts || 0);
+      let guard = 0;
+      while (remaining > 0 && guard < 20) {
+        guard++;
+        this.els.btnUploadHanping.textContent =
+          `Saved ${totalPromptsGenerated} Mandarin -> English pairs (${remaining} left)...`;
+        const waveRes = await this.callBackend('pregenerate_prompts', {
+          forceRefreshAll: false,
+          limit: 90
+        });
+        const newlyUpdated = Number(waveRes.updatedCount || 0);
+        totalPromptsGenerated += newlyUpdated;
+        remaining = Number(waveRes.remainingCount || 0);
+        if (newlyUpdated === 0) break;
+      }
+
       this.els.importResultBox.classList.remove('hidden');
       const tagSummary = tagFilter ? ` with tag "${tagFilter}"` : '';
       const prunedSummary = res.prunedCount ? `, removed ${res.prunedCount} non-matching unstudied words` : '';
-      const promptSummary = res.promptsGenerated ? `, pre-generated ${res.promptsGenerated} simple sentences` : '';
+      const promptSummary = totalPromptsGenerated ? `, pre-generated ${totalPromptsGenerated} Mandarin -> English sentence pairs` : '';
       this.els.importResultBox.textContent =
         `Matched ${matchedCount} notes${tagSummary} (out of ${totalCount} in file): ${res.addedCount} newly added to Sheet, ${res.skippedDuplicate} already in Sheet${prunedSummary}${promptSummary}.`;
       this.showToast(
@@ -1078,10 +1100,10 @@ class MandarinTutorApp {
     const count = Number(this.els.inputSupplementCount.value || 30);
     try {
       this.els.btnPullTocfl.disabled = true;
-      this.els.btnPullTocfl.textContent = `Pulling Level ${tocflLevel} & Generating Sentences...`;
+      this.els.btnPullTocfl.textContent = `Pulling Level ${tocflLevel} & Generating Mandarin -> English...`;
       const res = await this.callBackend('supplement_tocfl', { tocflLevel, count });
       this.els.importResultBox.classList.remove('hidden');
-      const promptInfo = res.promptsGenerated ? ` and pre-generated ${res.promptsGenerated} simple sentences` : '';
+      const promptInfo = res.promptsGenerated ? ` and pre-generated ${res.promptsGenerated} Mandarin -> English pairs` : '';
       this.els.importResultBox.textContent =
         `Added ${res.addedCount} highest-spoken-frequency TOCFL Level ${res.tocflLevel} words from PSeitz/tocfl${promptInfo} (${res.remainingInLevel} remaining in level).`;
       this.showToast(`Added ${res.addedCount} TOCFL L${tocflLevel} words!`, 'success');
@@ -1098,19 +1120,46 @@ class MandarinTutorApp {
     if (!this.els.btnPregeneratePrompts) return;
     try {
       this.els.btnPregeneratePrompts.disabled = true;
-      this.els.btnPregeneratePrompts.textContent = 'Generating Simple Everyday Sentences in Sheet...';
-      const res = await this.callBackend('pregenerate_prompts', {
-        forceRefreshAll: true
-      });
+      let offset = 0;
+      const limit = 90;
+      let totalUpdated = 0;
+      let totalEligible = 0;
+      let guard = 0;
+
+      while (guard < 30) {
+        guard++;
+        this.els.btnPregeneratePrompts.textContent = totalEligible > 0
+          ? `Saved ${totalUpdated} / ${totalEligible} Mandarin -> English pairs...`
+          : 'Generating Mandarin -> English Sentences (Wave 1)...';
+
+        const res = await this.callBackend('pregenerate_prompts', {
+          forceRefreshAll: true,
+          offset,
+          limit
+        });
+
+        totalEligible = Number(res.totalEligible || 0);
+        totalUpdated += Number(res.updatedCount || 0);
+
+        if (res.nextOffset === undefined) {
+          // Backward compatibility if Sheet hasn't been redeployed with offset/limit yet
+          break;
+        }
+        offset = Number(res.nextOffset);
+        if (offset >= totalEligible || Number(res.processedInCall || 0) === 0) {
+          break;
+        }
+      }
+
       this.els.importResultBox.classList.remove('hidden');
       this.els.importResultBox.textContent =
-        `Pre-generated ${res.updatedCount || 0} simple everyday English sentences across ${res.totalEligible || 0} words in your Sheet! Sessions will now start immediately.`;
-      this.showToast(`Pre-generated ${res.updatedCount || 0} simple sentences in Sheet!`, 'success');
+        `Pre-generated ${totalUpdated} natural Taiwanese Mandarin -> English sentence pairs across ${totalEligible} words in your Sheet! Sessions will now start immediately.`;
+      this.showToast(`Saved ${totalUpdated} Mandarin -> English sentence pairs in Sheet!`, 'success');
     } catch (err) {
       this.showToast(err.message, 'error');
     } finally {
       this.els.btnPregeneratePrompts.disabled = false;
-      this.els.btnPregeneratePrompts.textContent = 'Generate / Refresh Simple Sentences in Sheet';
+      this.els.btnPregeneratePrompts.textContent = 'Generate / Refresh Mandarin → English Sentences';
     }
   }
 

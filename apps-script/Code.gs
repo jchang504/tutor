@@ -44,9 +44,9 @@ const VOCAB_HEADERS = [
   'reps',
   'lapses',
   'last_score',
-  'last_prompt',
+  'english_prompt',
   'last_notes',
-  'sample_mandarin',
+  'mandarin_sentence',
   'common_synonyms'
 ];
 
@@ -66,7 +66,8 @@ const LOG_HEADERS = [
   'difficulty_after',
   'interval_days',
   'english_prompt',
-  'notes'
+  'notes',
+  'mandarin_sentence'
 ];
 
 const DEFAULT_SETTINGS = {
@@ -81,20 +82,22 @@ const DEFAULT_SETTINGS = {
 };
 
 /**
- * Adds a custom menu in the Google Sheet for one-click setup, TOCFL syncing, and sentence pre-generation.
+ * Adds a custom menu in the Google Sheet for one-click setup, TOCFL syncing, and Mandarin -> English sentence pre-generation.
  */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Mandarin Tutor')
     .addItem('Initialize / Verify Sheet Tabs', 'setupSheet')
-    .addItem('Generate / Refresh Simple Sentences for All Words', 'menuPregeneratePrompts')
+    .addItem('Generate Missing Mandarin -> English Sentences (Fast / Resume)', 'menuPregenerateMissingPrompts')
+    .addItem('Regenerate All Mandarin -> English Sentences (Refresh All)', 'menuPregeneratePrompts')
     .addItem('Pull 50 Words from PSeitz/tocfl (Target Level)', 'menuPullTocflWords')
     .addToUi();
 }
 
 /**
  * Initializes the 3 tabs (`Vocab`, `ReviewLog`, `Settings`) if they don't exist,
- * and upgrades `Vocab` headers in-place if new columns (`sample_mandarin`, `common_synonyms`) were added.
+ * upgrades `Vocab` headers in-place (`english_prompt`, `mandarin_sentence`),
+ * and migrates legacy `BATCH_GEN_MODEL` values to `gemini-2.5-flash`.
  */
 function setupSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -105,8 +108,16 @@ function setupSheet() {
     vocabSheet.appendRow(VOCAB_HEADERS);
     vocabSheet.getRange(1, 1, 1, VOCAB_HEADERS.length).setFontWeight('bold').setBackground('#f3f4f6');
     vocabSheet.setFrozenRows(1);
-  } else if (vocabSheet.getLastColumn() < VOCAB_HEADERS.length) {
-    vocabSheet.getRange(1, 1, 1, VOCAB_HEADERS.length).setValues([VOCAB_HEADERS]).setFontWeight('bold').setBackground('#f3f4f6');
+  } else {
+    const existingCols = Math.max(vocabSheet.getLastColumn(), VOCAB_HEADERS.length);
+    const currentHeaders = vocabSheet.getRange(1, 1, 1, existingCols).getValues()[0];
+    if (
+      vocabSheet.getLastColumn() < VOCAB_HEADERS.length ||
+      String(currentHeaders[18] || '').trim() !== 'english_prompt' ||
+      String(currentHeaders[20] || '').trim() !== 'mandarin_sentence'
+    ) {
+      vocabSheet.getRange(1, 1, 1, VOCAB_HEADERS.length).setValues([VOCAB_HEADERS]).setFontWeight('bold').setBackground('#f3f4f6');
+    }
   }
 
   let logSheet = ss.getSheetByName(TAB_LOG);
@@ -115,6 +126,8 @@ function setupSheet() {
     logSheet.appendRow(LOG_HEADERS);
     logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setFontWeight('bold').setBackground('#f3f4f6');
     logSheet.setFrozenRows(1);
+  } else if (logSheet.getLastColumn() < LOG_HEADERS.length) {
+    logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]).setFontWeight('bold').setBackground('#f3f4f6');
   }
 
   let settingsSheet = ss.getSheetByName(TAB_SETTINGS);
@@ -128,7 +141,7 @@ function setupSheet() {
       TOCFL_LEVEL: 'TOCFL level (1 to 7) to pull supplemental words from PSeitz/tocfl',
       LIVE_MODEL: 'Primary Gemini Live native audio WebSocket model ID',
       LIVE_FALLBACK_MODEL: 'Fallback Gemini Live model ID if primary model hits quota or is unavailable',
-      BATCH_GEN_MODEL: 'Gemini model used to pre-generate English translation sentences on import & SRS review',
+      BATCH_GEN_MODEL: 'Gemini model used to pre-generate Mandarin -> English sentences (gemini-2.5-flash or gemini-2.5-flash-lite)',
       VOICE_NAME: 'Gemini Live voice (Aoede, Kore, Puck, Charon, Fenrir)',
       DESIRED_RETENTION: 'Target FSRS memory retention probability (default 0.90)'
     };
@@ -136,6 +149,16 @@ function setupSheet() {
       settingsSheet.appendRow([k, DEFAULT_SETTINGS[k], descriptions[k] || '']);
     });
     settingsSheet.setFrozenRows(1);
+  } else {
+    // Auto-migrate legacy invalid/slow BATCH_GEN_MODEL values (e.g. gemini-3.8-flash) to gemini-2.5-flash
+    const sRows = settingsSheet.getDataRange().getValues();
+    for (let i = 1; i < sRows.length; i++) {
+      const k = String(sRows[i][0] || '').trim();
+      const v = String(sRows[i][1] || '').trim();
+      if (k === 'BATCH_GEN_MODEL' && v && v !== 'gemini-2.5-flash' && v !== 'gemini-2.5-flash-lite') {
+        settingsSheet.getRange(i + 1, 2).setValue('gemini-2.5-flash');
+      }
+    }
   }
 
   return { ok: true, message: 'Sheets initialized.' };
@@ -269,7 +292,8 @@ function handleUpdateSettings_(body) {
 }
 
 /**
- * Reads all rows from `Vocab` sheet as structured objects with their 1-based sheet row index.
+ * Reads all rows from `Vocab` sheet as structured objects with their 1-based sheet row index,
+ * normalizing `english_prompt` (or legacy `last_prompt`) and `mandarin_sentence` (or legacy `sample_mandarin`).
  */
 function readAllVocab_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -286,6 +310,13 @@ function readAllVocab_() {
     for (let c = 0; c < headers.length; c++) {
       obj[headers[c]] = row[c];
     }
+    // Normalize both new and legacy header names seamlessly
+    const enPrompt = String(obj.english_prompt || obj.last_prompt || row[18] || '').trim();
+    const zhSent = String(obj.mandarin_sentence || obj.sample_mandarin || row[20] || '').trim();
+    obj.english_prompt = enPrompt;
+    obj.last_prompt = enPrompt;
+    obj.mandarin_sentence = zhSent;
+    obj.sample_mandarin = zhSent;
     list.push(obj);
   }
   return list;
@@ -340,8 +371,8 @@ function handlePing_() {
  * - If the sheet doesn't have enough `new` words to fill those new-word slots,
  *   automatically pulls supplemental words from `PSeitz/tocfl` at `settings.TOCFL_LEVEL`
  *   sorted by `spoken_per_million` descending!
- * - Calls `gemini-3.8-flash` in one batch request to generate fresh English sentences
- *   that naturally require each target Mandarin word (and back-fills missing English glosses).
+ * - Reads pre-generated `mandarin_sentence` + `english_prompt` directly from the Sheet
+ *   (and back-fills on the fly only if any row is missing either sentence).
  */
 function handleGetBatch_(body) {
   const settings = getSettings_();
@@ -402,7 +433,6 @@ function handleGetBatch_(body) {
     const deficit = neededNewCount - combinedNewPool.length;
     const pullRes = supplementFromTocflInternal_(tocflLevel, Math.max(deficit, 25));
     autoSupplemented = pullRes.addedCount;
-    // Re-read vocab after adding TOCFL rows
     vocab = readAllVocab_();
     combinedNewPool = [];
     vocab.forEach(function(w) {
@@ -426,22 +456,23 @@ function handleGetBatch_(body) {
   // Interleave due and new words smoothly so new words are spread across the drive
   const batchWords = interleaveDueAndNew_(selectedDue, selectedNew);
 
-  // Sentences are pre-generated on import, TOCFL pull, and SRS review updates so get_batch is instant!
-  // Only generate on the fly if legacy rows in the Sheet happen to have a blank `last_prompt`.
+  // Back-fill on the fly if any word in this 20-word batch is missing EITHER `english_prompt` OR `mandarin_sentence`
   const missingPromptWords = batchWords.filter(function(w) {
-    return !String(w.last_prompt || '').trim();
+    return !String(w.english_prompt || '').trim() || !String(w.mandarin_sentence || '').trim();
   });
   let fallbackGeneratedMap = {};
   if (missingPromptWords.length > 0) {
-    fallbackGeneratedMap = populateSheetPromptsForWords_(missingPromptWords, settings).generatedMap;
+    fallbackGeneratedMap = populateSheetPromptsForWords_(missingPromptWords, settings, {
+      maxExecutionMs: 35000
+    }).generatedMap;
   }
 
   const enrichedBatch = batchWords.map(function(w) {
     const gen = fallbackGeneratedMap[w.traditional] || {};
-    const englishPrompt = String(w.last_prompt || gen.english_sentence || ('Please make a sentence using ' + w.traditional + '.')).trim();
+    const englishPrompt = String(gen.english_sentence || w.english_prompt || ('Please make a sentence using ' + w.traditional + '.')).trim();
+    const mandarinSentence = String(gen.mandarin_sentence || w.mandarin_sentence || '').trim();
     const englishGloss = String(w.english_gloss || gen.english_gloss || '').trim();
-    const sampleMandarin = String(w.sample_mandarin || gen.sample_mandarin || '').trim();
-    const synonymsNote = String(w.common_synonyms || gen.common_synonyms || '').trim();
+    const synonymsNote = String(gen.common_synonyms || w.common_synonyms || '').trim();
 
     return {
       id: w.id,
@@ -451,7 +482,7 @@ function handleGetBatch_(body) {
       pinyin: w.pinyin || '',
       zhuyin: w.zhuyin || '',
       english_gloss: englishGloss,
-      source: w.source || 'hanping',
+      source: w.source || 'ankidroid',
       tocfl_level: w.tocfl_level || '',
       spoken_freq: Number(w.spoken_freq || 0),
       status: w.status || 'new',
@@ -460,7 +491,8 @@ function handleGetBatch_(body) {
       reps: Number(w.reps || 0),
       lapses: Number(w.lapses || 0),
       english_prompt: englishPrompt,
-      sample_mandarin: sampleMandarin,
+      mandarin_sentence: mandarinSentence,
+      sample_mandarin: mandarinSentence,
       common_synonyms: synonymsNote
     };
   });
@@ -507,80 +539,252 @@ function interleaveDueAndNew_(dueList, newList) {
 }
 
 /**
- * Builds the Gemini prompt text for a chunk of words so every generated sentence is short (6-10 words),
- * conversational, and uses simple everyday vocabulary matching the target word's level.
+ * Enforces strict causal field order (`mandarin_sentence` FIRST, `english_sentence` SECOND)
+ * so Gemini always composes an idiomatic Taiwanese Mandarin sentence first and then translates it into English.
  */
-function buildSimpleSentencePromptText_(wordsChunk) {
+const SENTENCE_BATCH_SCHEMA = {
+  type: 'ARRAY',
+  items: {
+    type: 'OBJECT',
+    properties: {
+      traditional: { type: 'STRING' },
+      english_gloss: { type: 'STRING' },
+      mandarin_sentence: { type: 'STRING' },
+      english_sentence: { type: 'STRING' },
+      common_synonyms: { type: 'STRING' }
+    },
+    required: ['traditional', 'english_gloss', 'mandarin_sentence', 'english_sentence', 'common_synonyms'],
+    propertyOrdering: ['traditional', 'english_gloss', 'mandarin_sentence', 'english_sentence', 'common_synonyms']
+  }
+};
+
+/**
+ * Resolves a verified, fast structured-output Gemini model (`gemini-2.5-flash` or `gemini-2.5-flash-lite`),
+ * ignoring legacy/invalid values such as `gemini-3.8-flash` from older Settings sheets.
+ */
+function resolveFastBatchModel_(settings) {
+  const raw = String((settings && settings.BATCH_GEN_MODEL) || '')
+    .replace(/^models\//, '')
+    .trim();
+  if (raw === 'gemini-2.5-flash' || raw === 'gemini-2.5-flash-lite') {
+    return raw;
+  }
+  return 'gemini-2.5-flash';
+}
+
+/**
+ * Builds the Mandarin-first -> English translation prompt for a chunk of vocabulary words.
+ */
+function buildMandarinFirstPromptText_(wordsChunk) {
   const itemsPayload = wordsChunk.map(function(w) {
     return {
       traditional: w.traditional,
       pinyin: w.pinyin || '',
-      zhuyin: w.zhuyin || '',
       tocfl_level: w.tocfl_level || 2,
       english_gloss: w.english_gloss || '',
-      previous_prompt: w.previous_prompt || w.last_prompt || ''
+      previous_mandarin: w.previous_mandarin || w.mandarin_sentence || ''
     };
   });
 
   return [
-    'You are designing translation prompts for a beginner/intermediate Taiwanese Mandarin speaking student.',
-    'For each target Traditional Chinese vocabulary word below, generate:',
-    '1. `english_gloss`: A concise, accurate English definition (in Taiwanese Mandarin usage). If one is already provided, keep it concise.',
-    '2. `english_sentence`: A SHORT, SIMPLE, everyday conversational English sentence (6 to 10 words maximum!) that naturally translates into Taiwanese Mandarin using the target word.',
-    '   - CRITICAL DIFFICULTY RULE: Every other word in the sentence (outside the target word itself) MUST be simple, high-frequency beginner/elementary vocabulary (TOCFL Level 1-2 / A1-A2 level, e.g., I, you, today, tomorrow, go, eat, drink, buy, like, friend, home, work, coffee, time, very, want) of a similar or easier level than the target word.',
-    '   - Avoid complex nouns, idioms, rare words, names, or multi-clause sentences. The student is translating aloud from memory while hands-free, so only the target word should be the challenge!',
-    '   - Good examples: "I usually drink coffee in the morning.", "Let\'s go to that new restaurant tonight.", "Sorry, I won\'t make it in time."',
-    '   - If `previous_prompt` is non-empty, invent a DIFFERENT simple sentence from `previous_prompt`.',
-    '   - NEVER include the Mandarin characters or Pinyin inside `english_sentence`.',
-    '3. `sample_mandarin`: The natural, simple Taiwanese Mandarin translation (Traditional characters) of `english_sentence` using the target word.',
-    '4. `common_synonyms`: Comma-separated valid Taiwanese Mandarin synonyms the student might accidentally guess instead of the target word (e.g. if target is 餐館, synonym is 餐廳), or empty string if none.',
-    '',
-    'Return ONLY a JSON array of objects with keys: `traditional`, `english_gloss`, `english_sentence`, `sample_mandarin`, `common_synonyms`.',
+    'You are creating Taiwanese Mandarin speaking practice pairs for a learner.',
+    'Follow this EXACT generation order for every target word so the Mandarin is 100% natural:',
+    '1. `english_gloss`: Concise English meaning in Taiwanese Mandarin usage (keep existing if already clear).',
+    '2. `mandarin_sentence` (GENERATE THIS FIRST!): Write a SHORT, completely natural everyday Taiwanese Mandarin sentence in Traditional Chinese characters (6 to 14 Chinese characters) that naturally uses the exact target word (`traditional`).',
+    '   - Use authentic Taiwan phrasing (e.g., 餐廳, 計程車, 公車, 捷運, 早上, 平常, 順便).',
+    '   - LEVEL RULE: Every OTHER word in `mandarin_sentence` (outside the target word itself) MUST be simple, high-frequency everyday vocabulary (TOCFL Level 1-2 / beginner-elementary words of equal or easier level than the target word). Avoid idioms, literary Chinese, names, or complex multi-clause sentences.',
+    '   - If `previous_mandarin` is non-empty, write a DIFFERENT everyday sentence in a fresh context.',
+    '3. `english_sentence` (TRANSLATE FROM `mandarin_sentence` SECOND!): Translate `mandarin_sentence` into a natural, simple everyday English sentence (5 to 11 words) that accurately conveys the exact meaning of `mandarin_sentence`.',
+    '   - NEVER include Chinese characters or Pinyin inside `english_sentence`.',
+    '4. `common_synonyms`: Comma-separated close Taiwanese Mandarin synonyms the learner might say instead of `traditional` (or empty string if none).',
     '',
     'Target words JSON:',
     JSON.stringify(itemsPayload)
   ].join('\n');
 }
 
+function buildSentenceRequestPayload_(wordsChunk, useSchema) {
+  const genConfig = {
+    temperature: 0.45,
+    responseMimeType: 'application/json',
+    thinkingConfig: { thinkingBudget: 0 }
+  };
+  if (useSchema) {
+    genConfig.responseSchema = SENTENCE_BATCH_SCHEMA;
+  }
+  return JSON.stringify({
+    contents: [{ parts: [{ text: buildMandarinFirstPromptText_(wordsChunk) }] }],
+    generationConfig: genConfig
+  });
+}
+
+function parseSentenceBatchResponseText_(rawText) {
+  if (!rawText) return null;
+  let cleaned = String(rawText).trim();
+  if (cleaned.indexOf('```') === 0) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  }
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed)) return null;
+  const map = {};
+  parsed.forEach(function(item) {
+    if (!item || !item.traditional) return;
+    const zh = String(item.mandarin_sentence || item.sample_mandarin || '').trim();
+    const en = String(item.english_sentence || item.english_prompt || '').trim();
+    if (zh && en) {
+      map[String(item.traditional).trim()] = {
+        traditional: String(item.traditional).trim(),
+        english_gloss: String(item.english_gloss || '').trim(),
+        mandarin_sentence: zh,
+        sample_mandarin: zh,
+        english_sentence: en,
+        common_synonyms: String(item.common_synonyms || '').trim()
+      };
+    }
+  });
+  return map;
+}
+
 /**
- * Generates simple everyday English sentences in fast parallel waves (`UrlFetchApp.fetchAll`, 25 words/chunk)
- * with `thinkingBudget: 0` on `gemini-2.5-flash` so even hundreds of words finish in seconds.
+ * Fallback for a single chunk if the parallel wave hit HTTP 429 (Free Tier RPM quota) or transient error.
+ * Immediately tries `gemini-2.5-flash-lite` (separate, higher RPM quota bucket) before optional short backoff.
  */
-function generatePromptsInParallel_(words, settings) {
-  if (!words || words.length === 0) return {};
+function generateSingleChunkWithFallback_(wordsChunk, apiKey, primaryModel, allowSleepRetry) {
+  const altModel = primaryModel === 'gemini-2.5-flash-lite' ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite';
+  const attempts = [
+    { model: altModel, useSchema: true, sleepBeforeMs: 0 },
+    { model: primaryModel, useSchema: false, sleepBeforeMs: 0 },
+    { model: altModel, useSchema: false, sleepBeforeMs: allowSleepRetry ? 5000 : -1 }
+  ];
 
-  const apiKey = getGeminiApiKey_();
-  const preferredModel = (settings && settings.BATCH_GEN_MODEL) ? settings.BATCH_GEN_MODEL.replace(/^models\//, '') : 'gemini-2.5-flash';
-  const primaryModel = preferredModel.indexOf('3.') === 0 ? 'gemini-2.5-flash' : preferredModel;
-  const primaryUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
-
-  const CHUNK_SIZE = 25;
-  const WAVE_CONCURRENCY = 5;
-  const chunks = [];
-  for (let i = 0; i < words.length; i += CHUNK_SIZE) {
-    chunks.push(words.slice(i, i + CHUNK_SIZE));
+  let lastErr = '';
+  for (let i = 0; i < attempts.length; i++) {
+    const att = attempts[i];
+    if (att.sleepBeforeMs < 0) continue;
+    if (att.sleepBeforeMs > 0) {
+      Utilities.sleep(att.sleepBeforeMs);
+    }
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(att.model) + ':generateContent?key=' + encodeURIComponent(apiKey);
+    try {
+      const resp = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: buildSentenceRequestPayload_(wordsChunk, att.useSchema),
+        muteHttpExceptions: true
+      });
+      const code = resp.getResponseCode();
+      if (code === 200) {
+        const data = JSON.parse(resp.getContentText());
+        const text = data.candidates &&
+          data.candidates[0] &&
+          data.candidates[0].content &&
+          data.candidates[0].content.parts &&
+          data.candidates[0].content.parts[0] &&
+          data.candidates[0].content.parts[0].text;
+        const map = parseSentenceBatchResponseText_(text);
+        if (map && Object.keys(map).length > 0) {
+          return { map: map, error: '' };
+        }
+      } else {
+        lastErr = 'HTTP ' + code + ' on ' + att.model;
+      }
+    } catch (e) {
+      lastErr = e && e.message ? e.message : String(e);
+    }
   }
 
-  const combinedMap = {};
+  return { map: {}, error: lastErr || 'Chunk generation failed' };
+}
+
+/**
+ * Orders words so blank rows (`!mandarin_sentence || !english_prompt`) and due/active words are generated FIRST.
+ * That way even if a huge deck pauses at the time budget, every missing/upcoming word is already saved!
+ */
+function sortWordsForPromptGeneration_(words) {
+  const nowMs = new Date().getTime();
+  return words.slice().sort(function(a, b) {
+    const aMissing = (!String(a.english_prompt || '').trim() || !String(a.mandarin_sentence || '').trim()) ? 1 : 0;
+    const bMissing = (!String(b.english_prompt || '').trim() || !String(b.mandarin_sentence || '').trim()) ? 1 : 0;
+    if (aMissing !== bMissing) return bMissing - aMissing;
+
+    const aDue = (a.reps && Number(a.reps) > 0 && a.due_date && new Date(a.due_date).getTime() <= nowMs) ? 1 : 0;
+    const bDue = (b.reps && Number(b.reps) > 0 && b.due_date && new Date(b.due_date).getTime() <= nowMs) ? 1 : 0;
+    if (aDue !== bDue) return bDue - aDue;
+
+    return (a._rowIndex || 0) - (b._rowIndex || 0);
+  });
+}
+
+/**
+ * Generates Mandarin-first -> English translation pairs in fast parallel waves (3 x 30 = 90 words/wave)
+ * and INCREMENTALLY WRITES & FLUSHES TO THE SHEET AFTER EVERY SINGLE WAVE!
+ *
+ * Also enforces `maxExecutionMs` (default 240s for Sheets Menu, 45s for Web App HTTP calls)
+ * so Apps Script NEVER hits the 360-second execution timeout or loses generated sentences!
+ */
+function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
+  if (!wordsToUpdate || wordsToUpdate.length === 0) {
+    return { updatedCount: 0, totalRequested: 0, remainingCount: 0, generatedMap: {}, lastError: '' };
+  }
+
+  const opts = options || {};
+  const maxExecutionMs = Number(opts.maxExecutionMs || 240000);
+  const showSheetToast = Boolean(opts.showSheetToast);
+  const skipSort = Boolean(opts.skipSort);
+  const startMs = new Date().getTime();
+
+  const effectiveSettings = settings || getSettings_();
+  const apiKey = getGeminiApiKey_();
+  const primaryModel = resolveFastBatchModel_(effectiveSettings);
+  const primaryUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vocabSheet = ss.getSheetByName(TAB_VOCAB);
+  const lastRow = vocabSheet.getLastRow();
+  if (lastRow <= 1) {
+    return { updatedCount: 0, totalRequested: wordsToUpdate.length, remainingCount: 0, generatedMap: {}, lastError: '' };
+  }
+
+  const orderedWords = skipSort ? wordsToUpdate.slice() : sortWordsForPromptGeneration_(wordsToUpdate);
+  const numDataRows = lastRow - 1;
+  const glossValues = vocabSheet.getRange(2, 6, numDataRows, 1).getValues();
+  const promptValues = vocabSheet.getRange(2, 19, numDataRows, 1).getValues();
+  const extraValues = vocabSheet.getRange(2, 21, numDataRows, 2).getValues();
+
+  const CHUNK_SIZE = 30;
+  const WAVE_CONCURRENCY = 3;
+  const chunks = [];
+  for (let i = 0; i < orderedWords.length; i += CHUNK_SIZE) {
+    chunks.push(orderedWords.slice(i, i + CHUNK_SIZE));
+  }
+
+  const generatedMap = {};
+  let totalUpdated = 0;
+  let processedWords = 0;
+  let lastError = '';
+
+  if (showSheetToast) {
+    ss.toast(
+      'Generating natural Mandarin -> English sentences for ' + orderedWords.length + ' words (' + primaryModel + ')...',
+      'Mandarin Tutor',
+      6
+    );
+  }
 
   for (let w = 0; w < chunks.length; w += WAVE_CONCURRENCY) {
+    if (w > 0 && (new Date().getTime() - startMs) >= maxExecutionMs) {
+      break;
+    }
+
     const waveChunks = chunks.slice(w, w + WAVE_CONCURRENCY);
     const requests = waveChunks.map(function(chunk) {
-      const genConfig = {
-        temperature: 0.5,
-        responseMimeType: 'application/json'
-      };
-      if (primaryModel.indexOf('2.5') !== -1) {
-        genConfig.thinkingConfig = { thinkingBudget: 0 };
-      }
       return {
         url: primaryUrl,
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({
-          contents: [{ parts: [{ text: buildSimpleSentencePromptText_(chunk) }] }],
-          generationConfig: genConfig
-        }),
+        payload: buildSentenceRequestPayload_(chunk, true),
         muteHttpExceptions: true
       };
     });
@@ -590,10 +794,12 @@ function generatePromptsInParallel_(words, settings) {
       responses = UrlFetchApp.fetchAll(requests);
     } catch (e) {
       responses = [];
+      lastError = e && e.message ? e.message : String(e);
     }
 
+    const waveMap = {};
     for (let r = 0; r < waveChunks.length; r++) {
-      let parsedChunkOk = false;
+      let chunkMap = null;
       const resp = responses[r];
       if (resp && resp.getResponseCode() === 200) {
         try {
@@ -604,181 +810,167 @@ function generatePromptsInParallel_(words, settings) {
             data.candidates[0].content.parts &&
             data.candidates[0].content.parts[0] &&
             data.candidates[0].content.parts[0].text;
-          if (text) {
-            const parsed = JSON.parse(text);
-            if (Array.isArray(parsed)) {
-              parsed.forEach(function(item) {
-                if (item && item.traditional) {
-                  combinedMap[item.traditional] = item;
-                }
-              });
-              parsedChunkOk = true;
-            }
-          }
-        } catch (parseErr) {}
+          chunkMap = parseSentenceBatchResponseText_(text);
+        } catch (parseErr) {
+          lastError = parseErr && parseErr.message ? parseErr.message : String(parseErr);
+        }
+      } else if (resp) {
+        lastError = 'HTTP ' + resp.getResponseCode() + ' on ' + primaryModel;
       }
 
-      if (!parsedChunkOk) {
-        const fallbackMap = generateBatchEnglishPrompts_(waveChunks[r], settings);
-        Object.keys(fallbackMap).forEach(function(k) {
-          combinedMap[k] = fallbackMap[k];
-        });
-      }
-    }
-  }
-
-  return combinedMap;
-}
-
-/**
- * Single-chunk fallback generator across candidate Gemini Flash models.
- */
-function generateBatchEnglishPrompts_(words, settings) {
-  if (!words || words.length === 0) return {};
-
-  const apiKey = getGeminiApiKey_();
-  const preferredModel = (settings && settings.BATCH_GEN_MODEL) ? settings.BATCH_GEN_MODEL : 'gemini-2.5-flash';
-  const candidateModels = ['gemini-2.5-flash', preferredModel, 'gemini-2.0-flash'];
-  const modelsToTry = candidateModels.filter(function(m, idx) {
-    return m && candidateModels.indexOf(m) === idx;
-  });
-
-  const promptText = buildSimpleSentencePromptText_(words);
-
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const modelName = modelsToTry[i].replace(/^models\//, '');
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(modelName) + ':generateContent?key=' + encodeURIComponent(apiKey);
-    const genConfig = {
-      temperature: 0.5,
-      responseMimeType: 'application/json'
-    };
-    if (modelName.indexOf('2.5') !== -1) {
-      genConfig.thinkingConfig = { thinkingBudget: 0 };
-    }
-    try {
-      const resp = UrlFetchApp.fetch(url, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }] }],
-          generationConfig: genConfig
-        }),
-        muteHttpExceptions: true
-      });
-      if (resp.getResponseCode() === 200) {
-        const data = JSON.parse(resp.getContentText());
-        const text = data.candidates &&
-          data.candidates[0] &&
-          data.candidates[0].content &&
-          data.candidates[0].content.parts &&
-          data.candidates[0].content.parts[0] &&
-          data.candidates[0].content.parts[0].text;
-        if (text) {
-          const parsed = JSON.parse(text);
-          const map = {};
-          if (Array.isArray(parsed)) {
-            parsed.forEach(function(item) {
-              if (item && item.traditional) {
-                map[item.traditional] = item;
-              }
-            });
-            return map;
-          }
+      if (!chunkMap || Object.keys(chunkMap).length === 0) {
+        const allowSleep = (new Date().getTime() - startMs + 12000) < maxExecutionMs;
+        const fb = generateSingleChunkWithFallback_(waveChunks[r], apiKey, primaryModel, allowSleep);
+        chunkMap = fb.map;
+        if (fb.error && Object.keys(chunkMap).length === 0) {
+          lastError = fb.error;
         }
       }
-    } catch (e) {
-      // Try next fallback model
+
+      Object.keys(chunkMap || {}).forEach(function(tradKey) {
+        waveMap[tradKey] = chunkMap[tradKey];
+        generatedMap[tradKey] = chunkMap[tradKey];
+      });
+    }
+
+    // Apply this wave's generated sentences and FLUSH IMMEDIATELY to the Google Sheet!
+    let waveUpdated = 0;
+    let waveGlossModified = false;
+    waveChunks.forEach(function(chunk) {
+      processedWords += chunk.length;
+      chunk.forEach(function(wordObj) {
+        const gen = waveMap[wordObj.traditional];
+        if (!gen || !gen.english_sentence || !gen.mandarin_sentence) return;
+        const rIdx = (wordObj._rowIndex || 0) - 2;
+        if (rIdx < 0 || rIdx >= numDataRows) return;
+
+        if (!String(glossValues[rIdx][0] || '').trim() && gen.english_gloss) {
+          glossValues[rIdx][0] = String(gen.english_gloss).trim();
+          waveGlossModified = true;
+        }
+        promptValues[rIdx][0] = String(gen.english_sentence).trim();
+        extraValues[rIdx][0] = String(gen.mandarin_sentence).trim();
+        extraValues[rIdx][1] = String(gen.common_synonyms || '').trim();
+        waveUpdated++;
+      });
+    });
+
+    if (waveUpdated > 0) {
+      totalUpdated += waveUpdated;
+      if (waveGlossModified) {
+        vocabSheet.getRange(2, 6, numDataRows, 1).setValues(glossValues);
+      }
+      vocabSheet.getRange(2, 19, numDataRows, 1).setValues(promptValues);
+      vocabSheet.getRange(2, 21, numDataRows, 2).setValues(extraValues);
+      SpreadsheetApp.flush();
+
+      if (showSheetToast) {
+        ss.toast(
+          'Saved ' + totalUpdated + ' / ' + orderedWords.length + ' Mandarin -> English sentence pairs to Sheet...',
+          'Mandarin Tutor',
+          5
+        );
+      }
     }
   }
 
-  return {};
-}
-
-/**
- * Generates simple English sentences + sample Mandarin + synonyms for `wordsToUpdate`
- * and bulk-writes them back to the `Vocab` sheet in 3 fast range writes without touching FSRS columns.
- */
-function populateSheetPromptsForWords_(wordsToUpdate, settings) {
-  if (!wordsToUpdate || wordsToUpdate.length === 0) {
-    return { updatedCount: 0, generatedMap: {} };
-  }
-
-  const effectiveSettings = settings || getSettings_();
-  const generatedMap = generatePromptsInParallel_(wordsToUpdate, effectiveSettings);
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const vocabSheet = ss.getSheetByName(TAB_VOCAB);
-  const lastRow = vocabSheet.getLastRow();
-  if (lastRow <= 1) {
-    return { updatedCount: 0, generatedMap: generatedMap };
-  }
-
-  const numDataRows = lastRow - 1;
-  const glossValues = vocabSheet.getRange(2, 6, numDataRows, 1).getValues();
-  const promptValues = vocabSheet.getRange(2, 19, numDataRows, 1).getValues();
-  const extraValues = vocabSheet.getRange(2, 21, numDataRows, 2).getValues();
-
-  let updatedCount = 0;
-  let glossModified = false;
-
-  wordsToUpdate.forEach(function(w) {
-    const gen = generatedMap[w.traditional];
-    if (!gen || !gen.english_sentence) return;
-    const rIdx = (w._rowIndex || 0) - 2;
-    if (rIdx < 0 || rIdx >= numDataRows) return;
-
-    if (!String(glossValues[rIdx][0] || '').trim() && gen.english_gloss) {
-      glossValues[rIdx][0] = String(gen.english_gloss).trim();
-      glossModified = true;
-    }
-    promptValues[rIdx][0] = String(gen.english_sentence).trim();
-    extraValues[rIdx][0] = String(gen.sample_mandarin || '').trim();
-    extraValues[rIdx][1] = String(gen.common_synonyms || '').trim();
-    updatedCount++;
-  });
-
-  if (updatedCount > 0) {
-    if (glossModified) {
-      vocabSheet.getRange(2, 6, numDataRows, 1).setValues(glossValues);
-    }
-    vocabSheet.getRange(2, 19, numDataRows, 1).setValues(promptValues);
-    vocabSheet.getRange(2, 21, numDataRows, 2).setValues(extraValues);
-  }
-
+  const remainingCount = Math.max(0, orderedWords.length - processedWords);
   return {
-    updatedCount: updatedCount,
-    generatedMap: generatedMap
+    updatedCount: totalUpdated,
+    totalRequested: orderedWords.length,
+    remainingCount: remainingCount,
+    generatedMap: generatedMap,
+    lastError: lastError
   };
 }
 
 /**
- * RPC & Menu handler to pre-generate or refresh simple everyday English sentences across active words in `Vocab`.
+ * RPC & Menu handler to pre-generate or refresh Mandarin -> English sentence pairs across active words in `Vocab`.
+ * Supports chunked pagination (`offset`, `limit`) for fast live progress from the PWA!
  */
 function handlePregeneratePrompts_(body) {
-  const forceRefreshAll = body && body.forceRefreshAll !== undefined ? Boolean(body.forceRefreshAll) : true;
+  const opts = body || {};
+  const forceRefreshAll = opts.forceRefreshAll !== undefined ? Boolean(opts.forceRefreshAll) : false;
+  const maxExecutionMs = Number(opts.maxExecutionMs || 45000);
+  const showSheetToast = Boolean(opts.showSheetToast);
   const settings = getSettings_();
   const vocab = readAllVocab_();
 
-  const eligible = vocab.filter(function(w) {
+  const allEligible = vocab.filter(function(w) {
     const status = String(w.status || 'new').toLowerCase();
     if (status === 'flagged') return false;
     if (forceRefreshAll) return true;
-    return !String(w.last_prompt || '').trim();
+    return !String(w.english_prompt || '').trim() || !String(w.mandarin_sentence || '').trim();
   });
 
-  const res = populateSheetPromptsForWords_(eligible, settings);
+  const offset = Math.max(0, Number(opts.offset || 0));
+  const limit = opts.limit ? Math.max(1, Number(opts.limit)) : allEligible.length;
+  const sliceToProcess = allEligible.slice(offset, offset + limit);
+
+  const res = populateSheetPromptsForWords_(sliceToProcess, settings, {
+    maxExecutionMs: maxExecutionMs,
+    showSheetToast: showSheetToast,
+    skipSort: Boolean(opts.limit)
+  });
+
+  // Count how many words in the entire Sheet are still missing sentences (or remaining in slice)
+  const remainingAfterSlice = forceRefreshAll
+    ? Math.max(0, allEligible.length - (offset + sliceToProcess.length - res.remainingCount))
+    : Math.max(0, allEligible.length - res.updatedCount);
+
   return {
     ok: true,
-    totalEligible: eligible.length,
-    updatedCount: res.updatedCount
+    totalEligible: allEligible.length,
+    processedInCall: sliceToProcess.length - res.remainingCount,
+    updatedCount: res.updatedCount,
+    nextOffset: offset + (sliceToProcess.length - res.remainingCount),
+    remainingCount: remainingAfterSlice,
+    lastError: res.lastError || ''
   };
 }
 
-function menuPregeneratePrompts() {
-  const res = handlePregeneratePrompts_({ forceRefreshAll: true });
+/**
+ * Menu Item 1: Fast / Resume mode — generates Mandarin -> English pairs only for rows missing either sentence.
+ */
+function menuPregenerateMissingPrompts() {
+  setupSheet();
+  const res = handlePregeneratePrompts_({
+    forceRefreshAll: false,
+    maxExecutionMs: 245000,
+    showSheetToast: true
+  });
+  if (res.totalEligible === 0) {
+    SpreadsheetApp.getUi().alert('All active vocabulary words already have both Mandarin and English sentences!');
+    return;
+  }
+  const extraMsg = res.remainingCount > 0
+    ? '\n\n' + res.remainingCount + ' words still need sentences (paused safely before Apps Script time/quota limit — click "Generate Missing Mandarin -> English Sentences" once more to finish the rest!).'
+    : '\n\nAll words in your Sheet are now ready!';
+  const errNote = (res.updatedCount === 0 && res.lastError) ? ('\nLast API note: ' + res.lastError) : '';
   SpreadsheetApp.getUi().alert(
-    'Generated simple everyday English sentences for ' + res.updatedCount +
-    ' of ' + res.totalEligible + ' active vocabulary words in your Sheet.'
+    'Saved natural Mandarin -> English sentence pairs for ' + res.updatedCount +
+    ' of ' + res.totalEligible + ' words missing sentences.' + extraMsg + errNote
+  );
+}
+
+/**
+ * Menu Item 2: Refresh All mode — regenerates natural Mandarin -> English pairs across all active words,
+ * saving incrementally to the Sheet every ~90 words so zero work is ever lost!
+ */
+function menuPregeneratePrompts() {
+  setupSheet();
+  const res = handlePregeneratePrompts_({
+    forceRefreshAll: true,
+    maxExecutionMs: 245000,
+    showSheetToast: true
+  });
+  const extraMsg = res.remainingCount > 0
+    ? '\n\n' + res.remainingCount + ' words remaining (saved cleanly before Apps Script 6-min limit — run "Generate Missing..." or run again if needed).'
+    : '\n\n100% of your active vocabulary words now have natural Mandarin + English sentences saved in the Sheet!';
+  const errNote = (res.updatedCount === 0 && res.lastError) ? ('\nLast API note: ' + res.lastError) : '';
+  SpreadsheetApp.getUi().alert(
+    'Saved natural Mandarin -> English sentence pairs for ' + res.updatedCount +
+    ' of ' + res.totalEligible + ' active vocabulary words.' + extraMsg + errNote
   );
 }
 
@@ -798,13 +990,7 @@ function getLiveSessionAuth_(settings) {
 /**
  * Computes the deterministic 1-4 score from the structured telemetry reported by the Live tool call,
  * applies the FSRS v5 algorithm, updates the `Vocab` sheet row, appends a row to `ReviewLog`,
- * AND immediately pre-generates a fresh simple English sentence for the word's next SRS review!
- *
- * Hybrid Rubric (1 = Again, 2 = Hard, 3 = Good, 4 = Easy):
- * - 1 (Again): `target_word_recalled === false` OR `needed_hint === true`
- * - 2 (Hard): Recalled without full spoiler hint, but `pronunciation_attempts > 2` OR `grammar_errors >= 2` OR `conversation_fluency === 'struggled'`
- * - 3 (Good): Recalled target word, needed 1-2 attempts or 1 minor grammar/tone fix, good conversation
- * - 4 (Easy): Recalled target word on first try (`pronunciation_attempts <= 1`), `grammar_errors === 0`, and `conversation_fluency === 'natural'`
+ * AND immediately pre-generates a fresh Mandarin -> English sentence pair for the word's next SRS review!
  */
 function handleRecordReview_(body) {
   const wordId = body.word_id;
@@ -824,36 +1010,59 @@ function handleRecordReview_(body) {
     throw new Error('Vocab word not found in sheet: ' + (traditional || wordId));
   }
 
-  const practicedPrompt = String(body.english_prompt || targetRow.last_prompt || '').trim();
+  const practicedPrompt = String(body.english_prompt || targetRow.english_prompt || '').trim();
+  const practicedMandarin = String(body.mandarin_sentence || targetRow.mandarin_sentence || '').trim();
   const score = computeDeterministicScore_(telemetry);
   const settings = getSettings_();
   const desiredRetention = Number(settings.DESIRED_RETENTION || 0.90);
 
   const fsrsNext = computeFsrsV5_(targetRow, score, desiredRetention);
 
-  // Pre-generate a brand-new simple English sentence right now so the NEXT review starts with zero wait!
+  // Pre-generate a brand-new Mandarin sentence -> English translation right now so the NEXT review starts instantly!
   let nextPrompt = practicedPrompt;
-  let nextSampleMandarin = String(targetRow.sample_mandarin || '').trim();
+  let nextMandarin = practicedMandarin;
   let nextSynonyms = String(targetRow.common_synonyms || '').trim();
   let generatedGloss = '';
   try {
-    const genMap = generatePromptsInParallel_([{
+    const apiKey = getGeminiApiKey_();
+    const primaryModel = resolveFastBatchModel_(settings);
+    const singleWord = [{
       traditional: targetRow.traditional,
       pinyin: targetRow.pinyin || '',
-      zhuyin: targetRow.zhuyin || '',
       tocfl_level: targetRow.tocfl_level || 2,
       english_gloss: targetRow.english_gloss || '',
-      previous_prompt: practicedPrompt
-    }], settings);
-    const gen = genMap[targetRow.traditional];
-    if (gen && gen.english_sentence) {
+      previous_mandarin: practicedMandarin
+    }];
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: buildSentenceRequestPayload_(singleWord, true),
+      muteHttpExceptions: true
+    });
+    let genMap = null;
+    if (resp.getResponseCode() === 200) {
+      const data = JSON.parse(resp.getContentText());
+      const text = data.candidates &&
+        data.candidates[0] &&
+        data.candidates[0].content &&
+        data.candidates[0].content.parts &&
+        data.candidates[0].content.parts[0] &&
+        data.candidates[0].content.parts[0].text;
+      genMap = parseSentenceBatchResponseText_(text);
+    } else {
+      genMap = generateSingleChunkWithFallback_(singleWord, apiKey, primaryModel, false).map;
+    }
+    const gen = genMap && genMap[targetRow.traditional];
+    if (gen && gen.english_sentence && gen.mandarin_sentence) {
       nextPrompt = String(gen.english_sentence).trim();
-      nextSampleMandarin = String(gen.sample_mandarin || '').trim();
+      nextMandarin = String(gen.mandarin_sentence).trim();
       nextSynonyms = String(gen.common_synonyms || nextSynonyms).trim();
       generatedGloss = String(gen.english_gloss || '').trim();
     }
   } catch (e) {
-    // Non-fatal: keep previous prompt if background generation fails
+    // Non-fatal: keep previous sentence pair if background generation fails
   }
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -866,8 +1075,8 @@ function handleRecordReview_(body) {
 
   // Columns:
   // 11: status, 12: stability, 13: difficulty, 14: due_date, 15: last_review,
-  // 16: reps, 17: lapses, 18: last_score, 19: last_prompt (NEXT pre-generated prompt!),
-  // 20: last_notes, 21: sample_mandarin, 22: common_synonyms
+  // 16: reps, 17: lapses, 18: last_score, 19: english_prompt (NEXT pre-generated English!),
+  // 20: last_notes, 21: mandarin_sentence (NEXT pre-generated Mandarin!), 22: common_synonyms
   vocabSheet.getRange(rowIdx, 11, 1, 12).setValues([[
     fsrsNext.status,
     fsrsNext.stability,
@@ -879,7 +1088,7 @@ function handleRecordReview_(body) {
     score,
     nextPrompt,
     telemetry.notes || '',
-    nextSampleMandarin,
+    nextMandarin,
     nextSynonyms
   ]]);
 
@@ -900,7 +1109,8 @@ function handleRecordReview_(body) {
     fsrsNext.difficulty,
     fsrsNext.intervalDays,
     practicedPrompt,
-    telemetry.notes || ''
+    telemetry.notes || '',
+    practicedMandarin
   ]);
 
   return {
@@ -908,6 +1118,7 @@ function handleRecordReview_(body) {
     traditional: targetRow.traditional,
     score: score,
     nextPrompt: nextPrompt,
+    nextMandarin: nextMandarin,
     fsrs: fsrsNext
   };
 }
@@ -1168,18 +1379,21 @@ function handleImportHanping_(body) {
 
   if (newRows.length > 0) {
     sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, VOCAB_HEADERS.length).setValues(newRows);
+    SpreadsheetApp.flush();
   }
 
-  // Pre-generate simple English sentences right during import for all new words
-  // (plus any existing active words in the Sheet that don't have a pre-generated sentence yet)
+  // Pre-generate natural Mandarin -> English sentence pairs during import (with safe 40s HTTP budget
+  // so large imports never time out; any remaining rows are immediately filled by the PWA's follow-up waves)
   const settings = getSettings_();
   const updatedVocab = readAllVocab_();
   const wordsNeedingPrompts = updatedVocab.filter(function(w) {
     const status = String(w.status || 'new').toLowerCase();
     if (status === 'flagged') return false;
-    return !String(w.last_prompt || '').trim();
+    return !String(w.english_prompt || '').trim() || !String(w.mandarin_sentence || '').trim();
   });
-  const promptRes = populateSheetPromptsForWords_(wordsNeedingPrompts, settings);
+  const promptRes = populateSheetPromptsForWords_(wordsNeedingPrompts, settings, {
+    maxExecutionMs: 40000
+  });
 
   return {
     ok: true,
@@ -1187,6 +1401,7 @@ function handleImportHanping_(body) {
     skippedDuplicate: skippedDuplicate,
     prunedCount: prunedCount,
     promptsGenerated: promptRes.updatedCount,
+    remainingPrompts: promptRes.remainingCount,
     totalParsed: parsedEntries.length,
     tagFilter: tagFilter
   };
@@ -1418,12 +1633,14 @@ function parseCsvLine_(line) {
  * Menu helper to pull 50 words from PSeitz/tocfl into the Vocab sheet.
  */
 function menuPullTocflWords() {
+  setupSheet();
   const settings = getSettings_();
   const level = Number(settings.TOCFL_LEVEL || 2);
-  const res = supplementFromTocflInternal_(level, 50);
+  const res = supplementFromTocflInternal_(level, 50, { maxExecutionMs: 220000, showSheetToast: true });
   SpreadsheetApp.getUi().alert(
     'Added ' + res.addedCount + ' new TOCFL Level ' + level +
-    ' words from PSeitz/tocfl (sorted by highest spoken frequency).'
+    ' words from PSeitz/tocfl (sorted by highest spoken frequency) and generated ' +
+    (res.promptsGenerated || 0) + ' Mandarin -> English sentence pairs.'
   );
 }
 
@@ -1431,7 +1648,7 @@ function handleSupplementTocfl_(body) {
   const settings = getSettings_();
   const level = Number(body.tocflLevel || settings.TOCFL_LEVEL || 2);
   const count = Number(body.count || 30);
-  return supplementFromTocflInternal_(level, count);
+  return supplementFromTocflInternal_(level, count, { maxExecutionMs: 42000, showSheetToast: false });
 }
 
 /**
@@ -1439,7 +1656,8 @@ function handleSupplementTocfl_(body) {
  * filters to `tocfl_level === level`, sorts by `spoken_per_million` descending,
  * and adds up to `limit` unseen words into the `Vocab` sheet.
  */
-function supplementFromTocflInternal_(level, limit) {
+function supplementFromTocflInternal_(level, limit, options) {
+  const opts = options || {};
   const existing = readAllVocab_();
   const seen = {};
   existing.forEach(function(w) {
@@ -1510,9 +1728,11 @@ function supplementFromTocflInternal_(level, limit) {
   });
 
   let promptsGenerated = 0;
+  let remainingPrompts = 0;
   if (newRows.length > 0) {
     const startRow = sheet.getLastRow() + 1;
     sheet.getRange(startRow, 1, newRows.length, VOCAB_HEADERS.length).setValues(newRows);
+    SpreadsheetApp.flush();
 
     const addedWordsForPrompts = selected.map(function(entry, idx) {
       return {
@@ -1522,10 +1742,16 @@ function supplementFromTocflInternal_(level, limit) {
         zhuyin: entry.zhuyin || '',
         tocfl_level: entry.tocfl_level || level,
         english_gloss: '',
-        last_prompt: ''
+        english_prompt: '',
+        mandarin_sentence: ''
       };
     });
-    promptsGenerated = populateSheetPromptsForWords_(addedWordsForPrompts, getSettings_()).updatedCount;
+    const pRes = populateSheetPromptsForWords_(addedWordsForPrompts, getSettings_(), {
+      maxExecutionMs: Number(opts.maxExecutionMs || 42000),
+      showSheetToast: Boolean(opts.showSheetToast)
+    });
+    promptsGenerated = pRes.updatedCount;
+    remainingPrompts = pRes.remainingCount;
   }
 
   return {
@@ -1533,6 +1759,7 @@ function supplementFromTocflInternal_(level, limit) {
     tocflLevel: level,
     addedCount: newRows.length,
     promptsGenerated: promptsGenerated,
+    remainingPrompts: remainingPrompts,
     remainingInLevel: Math.max(0, candidates.length - selected.length)
   };
 }

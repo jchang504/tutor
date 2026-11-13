@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=9" />
+  <link rel="stylesheet" href="./index.css?v=10" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -291,7 +291,7 @@
 
         <div class="info-callout">
           <strong>2. Supplement from Official Taiwan NAER / TOCFL Dataset (<code>PSeitz/tocfl</code>):</strong><br />
-          Whenever a 20-word session needs more new words than you have queued from AnkiDroid, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending and pre-generates simple sentences for them. You can also pre-populate a batch right now:
+          Whenever a 20-word session needs more new words than you have queued from AnkiDroid, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending and pre-generates natural Mandarin &rarr; English sentences for them. You can also pre-populate a batch right now:
         </div>
 
         <div class="form-row-2col">
@@ -320,12 +320,12 @@
         <div class="divider-line"></div>
 
         <div class="field-group">
-          <label>3. Pre-Generate / Refresh Simple Sentences for Existing Sheet Words</label>
+          <label>3. Pre-Generate / Refresh Mandarin &rarr; English Sentences in Sheet</label>
           <span class="field-hint">
-            English sentences are automatically generated in Apps Script whenever words are imported or finish an SRS review, so sessions start immediately. Tap below to pre-generate or refresh simple everyday sentences for words already in your Sheet:
+            Apps Script composes a natural Taiwanese Mandarin sentence first and translates it into simple everyday English whenever words are imported or reviewed, saving incrementally every ~90 words so sessions start immediately. Tap below to pre-generate or refresh all Sheet sentences:
           </span>
           <button id="btn-pregenerate-prompts" class="btn-secondary" type="button" style="margin-top:6px;">
-            Generate / Refresh Simple Sentences in Sheet
+            Generate / Refresh Mandarin &rarr; English Sentences
           </button>
         </div>
 
@@ -334,7 +334,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=9"></script>
+  <script type="module" src="./app.js?v=10"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -345,7 +345,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=9').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=10').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

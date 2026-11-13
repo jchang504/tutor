@@ -20,6 +20,7 @@ export const SAMPLE_TAIWAN_BATCH = [
     reps: 3,
     lapses: 0,
     english_prompt: 'That small restaurant has very good food.',
+    mandarin_sentence: '那家小餐館的菜非常好吃。',
     sample_mandarin: '那家小餐館的菜非常好吃。',
     common_synonyms: '餐廳, 飯店, 小吃店'
   },
@@ -39,6 +40,7 @@ export const SAMPLE_TAIWAN_BATCH = [
     reps: 4,
     lapses: 0,
     english_prompt: 'Can you buy me a coffee while you are at it?',
+    mandarin_sentence: '你可以順便幫我買一杯咖啡嗎？',
     sample_mandarin: '你可以順便幫我買一杯咖啡嗎？',
     common_synonyms: '順道'
   },
@@ -58,6 +60,7 @@ export const SAMPLE_TAIWAN_BATCH = [
     reps: 1,
     lapses: 1,
     english_prompt: 'It is too late to eat breakfast now.',
+    mandarin_sentence: '現在吃早餐已經來不及了。',
     sample_mandarin: '現在吃早餐已經來不及了。',
     common_synonyms: '趕不上'
   },
@@ -77,6 +80,7 @@ export const SAMPLE_TAIWAN_BATCH = [
     reps: 0,
     lapses: 0,
     english_prompt: 'No wonder you are so tired today.',
+    mandarin_sentence: '難怪你今天這麼累。',
     sample_mandarin: '難怪你今天這麼累。',
     common_synonyms: '怪不得'
   },
@@ -96,6 +100,7 @@ export const SAMPLE_TAIWAN_BATCH = [
     reps: 5,
     lapses: 0,
     english_prompt: 'Excuse me, I would like to pay the bill.',
+    mandarin_sentence: '不好意思，我要結帳。',
     sample_mandarin: '不好意思，我要結帳。',
     common_synonyms: '買單, 付錢'
   }
