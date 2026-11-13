@@ -25,7 +25,8 @@ const STORAGE_KEYS = {
   TOCFL_LEVEL: 'tw_tutor_tocfl_level',
   BATCH_SIZE: 'tw_tutor_batch_size',
   NEW_RATIO: 'tw_tutor_new_ratio',
-  VOICE_NAME: 'tw_tutor_voice_name'
+  VOICE_NAME: 'tw_tutor_voice_name',
+  MANDARIN_SPEED: 'tw_tutor_mandarin_speed'
 };
 
 class MandarinTutorApp {
@@ -38,8 +39,8 @@ class MandarinTutorApp {
 
     this.liveAuth = {
       apiKey: localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) || '',
-      liveModel: 'models/gemini-3.8-live',
-      fallbackLiveModel: 'models/gemini-3.1-flash-live-preview',
+      liveModel: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+      fallbackLiveModel: 'models/gemini-2.5-flash-native-audio-latest',
       voiceName: localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede'
     };
 
@@ -47,7 +48,9 @@ class MandarinTutorApp {
     this.transcriptHistory = [];
     this.sessionScores = [];
 
+    const savedMandarinSpeed = Number(localStorage.getItem(STORAGE_KEYS.MANDARIN_SPEED) || 0.68);
     this.pipeline = new GeminiLiveVoicePipeline({
+      mandarinSpeed: savedMandarinSpeed,
       onStateChange: (state, statusText) => this.handlePipelineState(state, statusText),
       onTranscript: (role, text) => this.handleTranscript(role, text),
       onCompleteWord: (telemetry) => this.handleWordCompleted(telemetry),
@@ -95,6 +98,7 @@ class MandarinTutorApp {
       lastScoreBanner: document.getElementById('last-score-banner'),
 
       btnStartDriving: document.getElementById('btn-start-driving'),
+      btnDoneSpeaking: document.getElementById('btn-done-speaking'),
       btnPauseResume: document.getElementById('btn-pause-resume'),
       btnRepeatPrompt: document.getElementById('btn-repeat-prompt'),
       btnHint: document.getElementById('btn-ask-hint'),
@@ -116,6 +120,7 @@ class MandarinTutorApp {
       inputNewRatio: document.getElementById('input-new-ratio'),
       inputTocflLevel: document.getElementById('input-tocfl-level'),
       inputVoiceName: document.getElementById('input-voice-name'),
+      inputMandarinSpeed: document.getElementById('input-mandarin-speed'),
       btnSaveSettings: document.getElementById('btn-save-settings'),
       btnTestConnection: document.getElementById('btn-test-connection'),
 
@@ -138,12 +143,17 @@ class MandarinTutorApp {
     this.rawAnkiFileText = '';
 
     this.els.btnStartDriving.addEventListener('click', () => this.startDrivingSession());
+    if (this.els.btnDoneSpeaking) {
+      this.els.btnDoneSpeaking.addEventListener('click', () => {
+        this.pipeline.finishUserTurnNow();
+      });
+    }
     this.els.btnPauseResume.addEventListener('click', () => this.togglePauseSession());
     this.els.btnRepeatPrompt.addEventListener('click', () => {
-      this.pipeline.sendTextCommand('請再清楚唸一次這題的英文句子。');
+      this.pipeline.sendTextCommand('請再用正常語速清楚唸一次這題的英文句子。', true);
     });
     this.els.btnHint.addEventListener('click', () => {
-      this.pipeline.sendTextCommand('請給我一點提示，但先不要直接講出整句答案。');
+      this.pipeline.sendTextCommand('請用簡單、慢速的台灣中文給我一點提示，但先不要直接講出整句答案。');
     });
     this.els.btnSkipWord.addEventListener('click', () => this.skipCurrentWord('manual_skip'));
     this.els.btnEndSession.addEventListener('click', () => this.stopDrivingSession());
@@ -154,10 +164,14 @@ class MandarinTutorApp {
       this.renderCurrentWordCard();
     });
 
-    // Giant eyes-free tap zone on the main orb toggles Pause/Resume during active driving
+    // Giant eyes-free tap zone on the main orb:
+    // - If waiting for user speech, tapping the orb immediately commits the user's turn ("Done Speaking")
+    // - Otherwise starts or pauses/resumes the session
     this.els.voiceOrb.addEventListener('click', () => {
       if (!this.sessionActive) {
         this.startDrivingSession();
+      } else if (!this.sessionPaused && this.pipeline.isWaitingForUser()) {
+        this.pipeline.finishUserTurnNow();
       } else {
         this.togglePauseSession();
       }
@@ -219,6 +233,9 @@ class MandarinTutorApp {
     this.els.inputNewRatio.value = localStorage.getItem(STORAGE_KEYS.NEW_RATIO) || '10';
     this.els.inputTocflLevel.value = localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || '2';
     this.els.inputVoiceName.value = localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede';
+    if (this.els.inputMandarinSpeed) {
+      this.els.inputMandarinSpeed.value = localStorage.getItem(STORAGE_KEYS.MANDARIN_SPEED) || '0.68';
+    }
     this.els.selectSupplementLevel.value = localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || '2';
   }
 
@@ -230,6 +247,9 @@ class MandarinTutorApp {
     const newRatioPct = this.els.inputNewRatio.value.trim() || '10';
     const tocflLevel = this.els.inputTocflLevel.value.trim() || '2';
     const voiceName = this.els.inputVoiceName.value.trim() || 'Aoede';
+    const mandarinSpeed = this.els.inputMandarinSpeed
+      ? this.els.inputMandarinSpeed.value.trim() || '0.68'
+      : '0.68';
 
     localStorage.setItem(STORAGE_KEYS.GAS_URL, gasUrl);
     localStorage.setItem(STORAGE_KEYS.SECRET, secret);
@@ -238,7 +258,9 @@ class MandarinTutorApp {
     localStorage.setItem(STORAGE_KEYS.NEW_RATIO, newRatioPct);
     localStorage.setItem(STORAGE_KEYS.TOCFL_LEVEL, tocflLevel);
     localStorage.setItem(STORAGE_KEYS.VOICE_NAME, voiceName);
+    localStorage.setItem(STORAGE_KEYS.MANDARIN_SPEED, mandarinSpeed);
 
+    this.pipeline.setMandarinSpeed(Number(mandarinSpeed));
     this.liveAuth.voiceName = voiceName;
     if (directKey) {
       this.liveAuth.apiKey = directKey;
@@ -338,7 +360,7 @@ class MandarinTutorApp {
   /**
    * Starts the hands-free, eyes-free driving loop:
    * 1. Acquires Screen Wake Lock + WebAudio microphone pipeline.
-   * 2. Fetches a 20-word batch from Google Sheets (with `gemini-3.8-flash` pre-generated English sentences),
+   * 2. Fetches a 20-word batch from Google Sheets (with simple everyday English sentences),
    *    or loads the built-in Taiwanese Mandarin sample batch if testing in Direct API Key mode.
    * 3. Starts Word #1 in a clean Gemini Live WebSocket.
    */
@@ -361,6 +383,9 @@ class MandarinTutorApp {
       this.currentIndex = 0;
 
       this.els.btnStartDriving.classList.add('hidden');
+      if (this.els.btnDoneSpeaking) {
+        this.els.btnDoneSpeaking.classList.remove('hidden');
+      }
       this.els.btnPauseResume.classList.remove('hidden');
       this.els.btnRepeatPrompt.disabled = false;
       this.els.btnHint.disabled = false;
@@ -385,7 +410,7 @@ class MandarinTutorApp {
       const newRatio = Number(localStorage.getItem(STORAGE_KEYS.NEW_RATIO) || 10) / 100;
       const tocflLevel = Number(localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || 2);
 
-      this.handlePipelineState('connecting', `Generating ${batchSize} English sentences with Gemini 3.8 Flash...`);
+      this.handlePipelineState('connecting', `Loading ${batchSize} words & simple everyday sentences...`);
       const res = await this.callBackend('get_batch', {
         batchSize,
         newWordRatio: newRatio,
@@ -400,6 +425,10 @@ class MandarinTutorApp {
         this.liveAuth.apiKey = directKey;
       }
 
+      // Ensure all English sentences in the batch are short, simple, everyday sentences
+      // with beginner-level vocabulary matching the target word (even if Apps Script hasn't been redeployed yet)
+      await this.ensureSimpleBatchPrompts();
+
       const sum = res.batchSummary || {};
       this.showToast(
         `Loaded ${sum.total || this.batch.length} words (${sum.dueReviews || 0} due, ${sum.newWords || 0} new)`,
@@ -412,6 +441,84 @@ class MandarinTutorApp {
     } else {
       this.els.drawerSettings.classList.remove('hidden');
       throw new Error('Please configure your Google Apps Script URL + Secret (or a Gemini API Key) in Settings first.');
+    }
+  }
+
+  /**
+   * Ensures every word in `this.batch` has a short, simple, everyday English sentence (6-10 words max)
+   * where all surrounding words are basic beginner/elementary vocabulary (TOCFL Level 1-2 / A1-A2)
+   * matching the target word's level. Runs client-side via `gemini-2.5-flash` whenever any sentence in the
+   * batch looks complex (>10 words or fallback template), so it works immediately even before redeploying Apps Script.
+   */
+  async ensureSimpleBatchPrompts() {
+    if (!this.batch || this.batch.length === 0) return;
+    const apiKey = (this.liveAuth && this.liveAuth.apiKey) || '';
+    if (!apiKey) return;
+
+    const needsSimplification = this.batch.some((w) => {
+      const p = String(w.english_prompt || '').trim();
+      const wordCount = p.split(/\s+/).filter(Boolean).length;
+      return !p || wordCount > 10 || p.includes('Can you tell me where the');
+    });
+
+    if (!needsSimplification) return;
+
+    try {
+      this.handlePipelineState('connecting', 'Simplifying English sentences to everyday beginner level...');
+      const items = this.batch.map((w, idx) => ({
+        idx,
+        traditional: w.traditional,
+        pinyin: w.pinyin || '',
+        english_gloss: w.english_gloss || '',
+        tocfl_level: w.tocfl_level || 2
+      }));
+
+      const prompt = [
+        'You are a Taiwanese Mandarin (繁體中文) curriculum designer creating speaking prompts for an English-speaking learner.',
+        'For each target word below, write ONE short, simple, everyday English sentence (6 to 10 words maximum) that naturally requires the learner to use the target Mandarin word when translating.',
+        'STRICT LEVEL & SIMPLICITY RULES:',
+        '1. Keep the sentence VERY SIMPLE and conversational (6 to 10 English words max, single clause).',
+        '2. Every other word in the sentence MUST be basic, everyday beginner/elementary vocabulary (CEFR A1-A2 / TOCFL Level 1-2, such as I, you, today, want, go, eat, buy, work, home, friend, very, etc.) at the SAME or SIMPLER level than the target word.',
+        '3. NEVER use idioms, literary phrasing, complex clauses, or advanced surrounding vocabulary.',
+        '4. Set the sentence in normal everyday life in Taiwan.',
+        '5. Also provide `sample_mandarin` in Traditional Chinese using natural Taiwanese Mandarin (台灣日常口語) with equally simple everyday words.',
+        'Return ONLY a JSON array of objects with keys: `idx` (number), `english_prompt` (string), `sample_mandarin` (string).',
+        '',
+        JSON.stringify(items)
+      ].join('\n');
+
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.4,
+            responseMimeType: 'application/json'
+          }
+        })
+      });
+
+      if (!resp.ok) return;
+      const json = await resp.json();
+      const rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!rawText) return;
+
+      const parsed = JSON.parse(rawText);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          const target = this.batch[item.idx];
+          if (target && item.english_prompt) {
+            target.english_prompt = String(item.english_prompt).trim();
+            if (item.sample_mandarin) {
+              target.sample_mandarin = String(item.sample_mandarin).trim();
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Client-side prompt simplification skipped:', err);
     }
   }
 
@@ -587,6 +694,9 @@ class MandarinTutorApp {
 
     this.els.btnStartDriving.disabled = false;
     this.els.btnStartDriving.classList.remove('hidden');
+    if (this.els.btnDoneSpeaking) {
+      this.els.btnDoneSpeaking.classList.add('hidden');
+    }
     this.els.btnPauseResume.classList.add('hidden');
     this.els.btnRepeatPrompt.disabled = true;
     this.els.btnHint.disabled = true;

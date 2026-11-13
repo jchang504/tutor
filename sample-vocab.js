@@ -19,8 +19,8 @@ export const SAMPLE_TAIWAN_BATCH = [
     difficulty: 5.1,
     reps: 3,
     lapses: 0,
-    english_prompt: 'I tried a new Chinese restaurant in Taipei last night.',
-    sample_mandarin: '我昨天晚上在台北試了一家新的中式餐館。',
+    english_prompt: 'That small restaurant has very good food.',
+    sample_mandarin: '那家小餐館的菜非常好吃。',
     common_synonyms: '餐廳, 飯店, 小吃店'
   },
   {
@@ -31,15 +31,15 @@ export const SAMPLE_TAIWAN_BATCH = [
     zhuyin: 'ㄕㄨㄣˋ ㄅㄧㄢˋ',
     english_gloss: 'conveniently; in passing; while you are at it',
     source: 'tocfl',
-    tocfl_level: 3,
+    tocfl_level: 2,
     spoken_freq: 185,
     status: 'review',
     stability: 6.8,
     difficulty: 4.5,
     reps: 4,
     lapses: 0,
-    english_prompt: 'Since you are going to the convenience store, could you grab me a cup of iced coffee while you are at it?',
-    sample_mandarin: '既然你要去便利商店，可以順便幫我買一杯冰咖啡嗎？',
+    english_prompt: 'Can you buy me a coffee while you are at it?',
+    sample_mandarin: '你可以順便幫我買一杯咖啡嗎？',
     common_synonyms: '順道'
   },
   {
@@ -57,8 +57,8 @@ export const SAMPLE_TAIWAN_BATCH = [
     difficulty: 6.2,
     reps: 1,
     lapses: 1,
-    english_prompt: 'Traffic is really heavy this morning, so we might not make it in time for the nine o\'clock high-speed rail.',
-    sample_mandarin: '今天早上塞車很嚴重，我們可能會來不及搭九點的高鐵。',
+    english_prompt: 'It is too late to eat breakfast now.',
+    sample_mandarin: '現在吃早餐已經來不及了。',
     common_synonyms: '趕不上'
   },
   {
@@ -69,15 +69,15 @@ export const SAMPLE_TAIWAN_BATCH = [
     zhuyin: 'ㄋㄢˊ ㄍㄨㄞˋ',
     english_gloss: 'no wonder; not surprising that',
     source: 'tocfl',
-    tocfl_level: 3,
+    tocfl_level: 2,
     spoken_freq: 164,
     status: 'new',
     stability: 0,
     difficulty: 0,
     reps: 0,
     lapses: 0,
-    english_prompt: 'No wonder this night market stall always has such a long line; their soup dumplings are super fresh.',
-    sample_mandarin: '難怪這家夜市攤位總是排那麼長，他們的湯包超級新鮮。',
+    english_prompt: 'No wonder you are so tired today.',
+    sample_mandarin: '難怪你今天這麼累。',
     common_synonyms: '怪不得'
   },
   {
@@ -95,8 +95,8 @@ export const SAMPLE_TAIWAN_BATCH = [
     difficulty: 3.9,
     reps: 5,
     lapses: 0,
-    english_prompt: 'Excuse me, do you take credit cards at checkout, or is it cash only?',
-    sample_mandarin: '不好意思，請問結帳可以刷卡嗎，還是只收現金？',
+    english_prompt: 'Excuse me, I would like to pay the bill.',
+    sample_mandarin: '不好意思，我要結帳。',
     common_synonyms: '買單, 付錢'
   }
 ];

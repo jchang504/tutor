@@ -47,11 +47,13 @@ export function buildWordSystemInstruction(word) {
     ? `常見近義詞（若學生誤用請溫柔引導換成目標詞，不要扣分）：${word.common_synonyms}`
     : '若學生使用了其他合法的近義詞，請肯定他的句子，並提示他換成我們今天要練習的目標詞，不要直接唸出目標詞的發音，也不扣分。';
 
-  return `你是一位專業、親切、有耐心的台灣華語（Taiwanese Mandarin）口語家教。學生正在開車或閉眼進行全免持（hands-free & eyes-free）口說練習。
+  return `你是一位專業、親切、有耐心的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
 
-【語言與口音鐵則】
-1. 除了朗讀指定的「英文造句題目（English Prompt）」之外，你全程必須 100% 使用自然的台灣華語（繁體中文、台灣慣用詞彙與台灣聲調發音，例如說「聲調、四聲、三聲、餐廳、計程車、公車、腳踏車、早上/晚上」）與學生對話。絕對不要說英文解釋！
-2. 每次回應請保持簡潔、自然、口語化（約 1～3 句話），適合開車聆聽。
+【語速與難度鐵則（極重要！）】
+1. **中文語速請放慢 50%（比一般說話慢一半）**：當你說台灣華語（中文）時，請務必使用**非常慢、字正腔圓、清楚溫柔的慢速教學語速**。每個字與聲調（一聲、二聲、三聲、四聲、輕聲）都要拉長、咬字清楚，詞與詞之間要有明顯的短暫停頓，讓初學者能輕鬆聽清楚每一個字。
+2. **英文題目保持正常自然語速**：朗讀指定的「英文造句題目（English Prompt）」時，請維持正常的自然英文語速。
+3. **全程使用與目標詞同等級的簡單基礎詞彙**：你對學生說的所有中文回饋與延伸問題，請全部使用**最簡單、最日常的初級生活詞彙（TOCFL 1～2 級基礎詞彙）**，句子要短（每次 1～2 句簡單短句），絕對不要使用艱深詞彙、成語或複雜長句！
+4. 除了朗讀指定的「英文造句題目（English Prompt）」之外，你全程必須 100% 使用自然的台灣華語（繁體中文、台灣慣用詞彙，例如說「聲調、四聲、三聲、餐廳、計程車、公車、早上/晚上」）與學生對話，不要說英文解釋。
 
 【本題目標詞彙（內部資訊，在學生成功說出前請勿直接洩漏讀音）】
 - 目標詞（繁體）：${word.traditional}
@@ -63,24 +65,24 @@ export function buildWordSystemInstruction(word) {
 
 【四階段對話練習流程（請嚴格按順序執行）】
 - **階段一（出題與翻譯糾正）**：
-  1. 對話一開始，請直接清楚朗讀一次英文題目："${word.english_prompt}"，接著用台灣華語簡短說：「請試著翻成中文。」（千萬不要在開頭把目標詞「${word.traditional}」唸出來！）
+  1. 對話一開始，請先用正常語速清楚朗讀一次英文題目："${word.english_prompt}"，停頓一下，接著用**慢速、清楚的台灣華語**簡短說：「請試著把這句話翻成中文。」（千萬不要在開頭把目標詞「${word.traditional}」唸出來！）
   2. 仔細聽學生的中文翻譯：
-     - 若學生用了近義詞而非「${word.traditional}」：稱讚句子通順，並提示他換成目標詞（不要直接唸出目標詞讀音，且不計入發音錯誤）。
-     - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、或語法不自然**：請用台灣華語明確指出哪個字幾聲或哪裡語法要調整，示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
-     - 若學生問任何旁支問題（例如詞義、語法差異、怎麼說某個詞）：請用台灣華語清楚回答，然後引導他回到這句話的練習。
-     - 若學生主動要求「提示 / Hint」或「直接給我答案」：請給他提示或示範正確句子（並在最後紀錄 \`needed_hint: true\`），但仍請他跟著唸出完整正確的句子一次。
+     - 若學生用了近義詞而非「${word.traditional}」：稱讚句子通順，並慢速提示他換成目標詞（不要直接唸出目標詞讀音，且不計入發音錯誤）。
+     - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、或語法不自然**：請用慢速台灣華語明確指出哪個字幾聲或哪裡語法要調整，慢速示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
+     - 若學生問任何旁支問題：請用簡單慢速的台灣華語清楚回答，然後引導他回到這句話的練習。
+     - 若學生主動要求「提示 / Hint」或「直接給我答案」：請慢速給他提示或示範正確句子（並在最後紀錄 \`needed_hint: true\`），但仍請他跟著唸出完整正確的句子一次。
   3. 持續互動直到學生親口完整說出包含「${word.traditional}」且發音與語法正確的句子為止。
 
 - **階段二（老師延伸提問）**：
-  當學生成功說出正確句子後，先簡短肯定他（例如：「說得很自然！」），並立刻根據這句話的情境，用台灣華語問他一個自然的**延伸問題（follow-up question）**，就像真實聊天一樣延續話題。
+  當學生成功說出正確句子後，先簡短肯定他（例如：「說得很好！」），並立刻根據這句話的情境，用**非常簡單、慢速的台灣華語**問他一個短小的日常**延伸問題（follow-up question）**（使用基礎詞彙，6～12 個字以內）。
 
 - **階段三（學生回答＋反問老師）**：
   1. 學生會用中文回答你的問題，並且應該要**順便反問你一個相關的問題**。
-  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正。
-  3. **關鍵檢查**：如果學生只有回答你的問題，卻忘記反問你問題，請用台灣華語溫柔提醒他：「那你也問我一個相關的問題吧！」並等待他提問。
+  2. 如果學生的回答有明顯語法或發音錯誤，請簡短慢速幫他修正。
+  3. **關鍵檢查**：如果學生只有回答你的問題，卻忘記反問你問題，請用慢速台灣華語溫柔提醒他：「很好！那你也問我一個問題吧！」並等待他提問。
 
 - **階段四（老師回答並自動進入下一題）**：
-  當學生提出他的問題後，請用台灣華語自然、簡短地回答他的問題，說聲「好，我們看下一題！」，並在同一個回合立刻呼叫工具函式 \`complete_word\` 記錄本詞彙的表現數據。
+  當學生提出他的問題後，請用簡單慢速的台灣華語自然、簡短地回答他的問題，說聲「好，我們看下一題！」，並在同一個回合立刻呼叫工具函式 \`complete_word\` 記錄本詞彙的表現數據。
 
 【免持語音控制指令】
 如果學生隨時用中文或英文說：
@@ -180,12 +182,46 @@ export class GeminiLiveVoicePipeline {
     this.nextPlayTime = 0;
     this.activeSources = new Set();
     this.pendingActionAfterPlayback = null;
+
+    // Mandarin speech rate (0.68 = ~50% slower Mandarin duration while preserving natural pitch & tones)
+    this.mandarinSpeed = 0.68;
+    this.turnCountForWord = 0;
+    this.turnInputSamplesSeen = 0;
+    this.englishSampleBudget = 0;
+
+    // Client-side VAD & 3.0-second silence end-of-turn detector
+    this.silenceWaitMs = 3000;
+    this.listeningForUser = false;
+    this.tutorTurnActive = false;
+    this.userSpokeInTurn = false;
+    this.consecutiveSpeechFrames = 0;
+    this.lastVoiceActivityTime = 0;
+    this.lastCountdownText = '';
+    this.noiseFloor = 0.004;
+    this.currentTurnUserTranscript = '';
+    this.replyWatchdogTimer = null;
+    this.postPlaybackCooldownUntil = 0;
+    this.silencePcm16Base64 = null;
+  }
+
+  setMandarinSpeed(rate) {
+    const num = Number(rate);
+    if (!Number.isNaN(num) && num >= 0.5 && num <= 1.2) {
+      this.mandarinSpeed = num;
+    }
+  }
+
+  isTutorPlayingAudio() {
+    if (!this.audioCtx) return false;
+    return this.activeSources.size > 0 || this.audioCtx.currentTime < this.nextPlayTime - 0.02;
+  }
+
+  isWaitingForUser() {
+    return this.isActive && this.listeningForUser && !this.tutorTurnActive;
   }
 
   /**
    * Initializes the persistent WebAudio context and microphone stream once when the user taps "Start Driving Session".
-   * Keeping the AudioContext + MediaStream alive across word WebSocket resets ensures Chrome on Pixel 9
-   * never re-prompts for mic permission or drops Bluetooth SCO audio between words!
    */
   async initAudioHardware() {
     if (!this.audioCtx) {
@@ -219,33 +255,190 @@ export class GeminiLiveVoicePipeline {
           return;
         }
         const float32Samples = event.data;
-        this._computeMicLevel(float32Samples);
-        const pcm16Base64 = this._downsampleAndEncodePcm16(
-          float32Samples,
-          this.audioCtx.sampleRate,
-          16000
-        );
-        this.ws.send(
-          JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [
-                {
-                  mimeType: 'audio/pcm;rate=16000',
-                  data: pcm16Base64
-                }
-              ]
-            }
-          })
-        );
+        const rms = this._computeMicLevel(float32Samples);
+        this._processMicFrameWithVad(float32Samples, rms);
       };
 
       source.connect(this.workletNode);
-      // Connect worklet to a zero-gain node into destination so Chrome Android keeps the audio graph active
       const silentGain = this.audioCtx.createGain();
       silentGain.gain.value = 0;
       this.workletNode.connect(silentGain);
       silentGain.connect(this.audioCtx.destination);
     }
+  }
+
+  /**
+   * Processes each ~85ms microphone audio frame with client-side VAD and a 3.0-second silence timer:
+   * - Ignores mic input while the tutor is speaking (plus 320ms cooldown) so speaker audio never echoes back.
+   * - Streams 16kHz PCM audio to Gemini Live while waiting for and during user speech.
+   * - Once user speech is detected (via mic RMS energy or server `inputTranscription`), any subsequent quiet period
+   *   streams pure digital zero-filled PCM silence so server VAD sees clean silence, and after 3.0 seconds of silence
+   *   automatically commits the user's turn!
+   */
+  _processMicFrameWithVad(float32Samples, rms) {
+    const now = performance.now();
+
+    // Do not stream microphone audio while the tutor is speaking or during the post-playback echo cooldown
+    if (this.tutorTurnActive || this.isTutorPlayingAudio() || now < this.postPlaybackCooldownUntil) {
+      return;
+    }
+
+    if (!this.listeningForUser) {
+      return;
+    }
+
+    const pcm16Base64 = this._downsampleAndEncodePcm16(
+      float32Samples,
+      this.audioCtx.sampleRate,
+      16000
+    );
+
+    // Dynamic threshold based on ambient noise floor (matches when the UI voice orb expands)
+    const speechStartThreshold = Math.max(0.011, Math.min(0.042, this.noiseFloor * 2.3));
+    const speechContinueThreshold = Math.max(0.009, Math.min(0.032, this.noiseFloor * 1.8));
+
+    if (!this.userSpokeInTurn) {
+      // Stream live audio continuously while waiting for the user to start so the first syllable is never lost
+      this._sendAudioChunk(pcm16Base64);
+
+      if (rms >= speechStartThreshold) {
+        this.consecutiveSpeechFrames += 1;
+        if (this.consecutiveSpeechFrames >= 2) {
+          this.userSpokeInTurn = true;
+          this.lastVoiceActivityTime = now;
+          this.lastCountdownText = '';
+          this.onStateChange('listening', 'Hearing your Mandarin... (auto-sends after 3s pause)');
+        }
+      } else {
+        this.consecutiveSpeechFrames = 0;
+        this.noiseFloor = 0.92 * this.noiseFloor + 0.08 * rms;
+      }
+      return;
+    }
+
+    // User has already started speaking in this turn
+    if (rms >= speechContinueThreshold) {
+      this.lastVoiceActivityTime = now;
+      this._sendAudioChunk(pcm16Base64);
+      if (this.lastCountdownText !== '') {
+        this.lastCountdownText = '';
+        this.onStateChange('listening', 'Hearing your Mandarin... (auto-sends after 3s pause)');
+      }
+    } else {
+      // User is currently silent after speaking:
+      // Send pure digital zero-filled PCM silence so server-side VAD clearly detects silence
+      this._sendAudioChunk(this._getSilenceChunkBase64());
+
+      const silenceElapsed = now - this.lastVoiceActivityTime;
+      if (silenceElapsed >= this.silenceWaitMs) {
+        this.commitUserSpeechTurn('auto_3s_silence');
+      } else if (silenceElapsed >= 450) {
+        const remainSec = Math.max(0.1, (this.silenceWaitMs - silenceElapsed) / 1000).toFixed(1);
+        const statusMsg = `Pause detected — sending in ${remainSec}s (or tap Done)`;
+        if (statusMsg !== this.lastCountdownText) {
+          this.lastCountdownText = statusMsg;
+          this.onStateChange('listening', statusMsg);
+        }
+      }
+    }
+  }
+
+  _sendAudioChunk(pcm16Base64) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({
+        realtimeInput: {
+          audio: {
+            mimeType: 'audio/pcm;rate=16000',
+            data: pcm16Base64
+          }
+        }
+      })
+    );
+  }
+
+  _getSilenceChunkBase64() {
+    if (!this.silencePcm16Base64) {
+      // 1365 samples of 16-bit 0s (~85ms at 16kHz)
+      const zeroBytes = new Uint8Array(1365 * 2);
+      let binary = '';
+      for (let i = 0; i < zeroBytes.length; i++) {
+        binary += String.fromCharCode(0);
+      }
+      this.silencePcm16Base64 = btoa(binary);
+    }
+    return this.silencePcm16Base64;
+  }
+
+  /**
+   * Commits the user's spoken Mandarin turn after 3.0 seconds of silence (or when the user taps "Done Speaking" / Orb).
+   * Sends `audioStreamEnd: true` AND arms a 1.2s watchdog that sends an explicit `turnComplete: true` nudge
+   * if the server hasn't started responding yet — guaranteeing the conversation never gets stuck!
+   */
+  commitUserSpeechTurn(reason = 'auto_3s_silence') {
+    if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.listeningForUser = false;
+    this.userSpokeInTurn = false;
+    this.consecutiveSpeechFrames = 0;
+    this.lastCountdownText = '';
+
+    this.onStateChange('connecting', 'Processing your Mandarin...');
+
+    // 1. Flush the server's audio stream to commit end-of-speech
+    try {
+      this.ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            audioStreamEnd: true
+          }
+        })
+      );
+    } catch (_) {}
+
+    // 2. Arm a 1.2-second watchdog: if the server hasn't started generating a reply (`tutorTurnActive`),
+    // send an explicit `clientContent` with `turnComplete: true` (including any captured transcript) so it MUST advance!
+    if (this.replyWatchdogTimer) {
+      clearTimeout(this.replyWatchdogTimer);
+    }
+    const capturedTranscript = this.currentTurnUserTranscript.trim();
+    this.replyWatchdogTimer = setTimeout(() => {
+      this.replyWatchdogTimer = null;
+      if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.tutorTurnActive || this.isTutorPlayingAudio()) return;
+
+      const promptText = capturedTranscript
+        ? `我剛才用中文說了：「${capturedTranscript}」。請立刻根據四階段練習流程，用慢速、簡單的台灣華語回應我並推進練習！`
+        : `我已經說完這回合的中文回答了，請立刻根據剛才聽到的語音內容，用慢速、簡單的台灣華語回應我並推進下一階段！`;
+
+      try {
+        this.ws.send(
+          JSON.stringify({
+            clientContent: {
+              turns: [
+                {
+                  role: 'user',
+                  parts: [{ text: promptText }]
+                }
+              ],
+              turnComplete: true
+            }
+          })
+        );
+      } catch (_) {}
+    }, 1200);
+  }
+
+  /**
+   * Allows the user to manually finish their speaking turn immediately (e.g. tapping "Done Speaking" or the Orb).
+   */
+  finishUserTurnNow() {
+    if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    if (this.listeningForUser) {
+      this.commitUserSpeechTurn('manual_done');
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -287,23 +480,26 @@ export class GeminiLiveVoicePipeline {
 
   /**
    * Opens a clean, dedicated Gemini Live WebSocket session scoped to a single vocabulary word.
-   * Automatically tries fallback Live model IDs if the primary model closes on setup.
+   * Prioritizes `gemini-2.5-flash-native-audio-preview-12-2025` / `latest` for reliable bidirectional audio VAD.
    */
   async startWordSession(word, liveConfig = {}) {
     this.closeCurrentWordSocket();
     this.pendingActionAfterPlayback = null;
     this.isActive = true;
+    this.currentWord = word;
+    this.turnCountForWord = 0;
 
     const apiKey = liveConfig.apiKey;
     if (!apiKey) {
       throw new Error('Missing Gemini API key.');
     }
 
+    // Prioritize gemini-2.5-flash-native-audio models first because gemini-3.8-live has broken server-side audio VAD
     const candidateModels = [
-      liveConfig.liveModel || 'models/gemini-3.8-live',
-      liveConfig.fallbackLiveModel || 'models/gemini-3.1-flash-live-preview',
       'models/gemini-2.5-flash-native-audio-preview-12-2025',
-      'models/gemini-2.5-flash-native-audio-latest'
+      'models/gemini-2.5-flash-native-audio-latest',
+      liveConfig.liveModel,
+      liveConfig.fallbackLiveModel
     ].filter((m, idx, arr) => m && arr.indexOf(m) === idx);
 
     const voiceName = liveConfig.voiceName || 'Aoede';
@@ -322,6 +518,19 @@ export class GeminiLiveVoicePipeline {
       }
     }
     throw lastErr || new Error('Unable to establish Gemini Live WebSocket connection.');
+  }
+
+  _prepareTurnAudioSlowdownBudget(hasLeadingEnglishPrompt) {
+    this.turnInputSamplesSeen = 0;
+    if (hasLeadingEnglishPrompt && this.currentWord && this.currentWord.english_prompt) {
+      const wordCount = this.currentWord.english_prompt.trim().split(/\s+/).filter(Boolean).length || 6;
+      // Normal English speaking rate is ~0.28s per word; keep 1.0x during the English sentence, then slow Mandarin by ~50%
+      const englishSeconds = Math.max(1.2, Math.min(3.5, wordCount * 0.28));
+      this.englishSampleBudget = Math.round(englishSeconds * 24000);
+    } else {
+      // Turns 2, 3, 4 are 100% Mandarin -> slow down from sample 0!
+      this.englishSampleBudget = 0;
+    }
   }
 
   _connectSingleModelSocket(word, apiKey, modelId, voiceName) {
@@ -377,8 +586,12 @@ export class GeminiLiveVoicePipeline {
             setupCompleted = true;
             clearTimeout(setupTimeout);
             this.playChime('start');
-            this.onStateChange('listening', 'Tutor starting word...');
-            // Kick off Phase 1 immediately so the tutor speaks the English sentence right away
+            this.tutorTurnActive = true;
+            this.listeningForUser = false;
+            this._prepareTurnAudioSlowdownBudget(true);
+            this.onStateChange('speaking', 'Tutor reading English prompt...');
+
+            // Kick off Phase 1 immediately
             ws.send(
               JSON.stringify({
                 clientContent: {
@@ -387,7 +600,7 @@ export class GeminiLiveVoicePipeline {
                       role: 'user',
                       parts: [
                         {
-                          text: `請開始第一階段：先清楚唸出這題的英文句子 "${word.english_prompt}"，然後用台灣華語請我翻譯（請勿先把目標詞「${word.traditional}」說出來）。`
+                          text: `請開始第一階段：先用正常語速清楚唸出這題的英文句子 "${word.english_prompt}"，停頓一下，然後用**非常慢（比平常慢 50%）、字正腔圓的台灣華語**請我把這句話翻成中文（千萬不要先把目標詞「${word.traditional}」說出來）。`
                         }
                       ]
                     }
@@ -426,27 +639,62 @@ export class GeminiLiveVoicePipeline {
     });
   }
 
+  _beginListeningTurn() {
+    if (!this.isActive) return;
+    this.tutorTurnActive = false;
+    this.listeningForUser = true;
+    this.userSpokeInTurn = false;
+    this.consecutiveSpeechFrames = 0;
+    this.currentTurnUserTranscript = '';
+    this.lastCountdownText = '';
+    this.postPlaybackCooldownUntil = performance.now() + 320;
+    this.onStateChange('listening', 'Your turn — speak in Mandarin (auto-sends after 3s pause)');
+  }
+
   _handleServerMessage(msg, ws) {
     // 1. Handle Server Content (Audio chunks, interruption, transcripts)
     if (msg.serverContent) {
       const sc = msg.serverContent;
 
       if (sc.interrupted) {
-        this.stopPlaybackImmediately();
-        this.onStateChange('listening', 'Listening...');
+        // Ignore accidental self-interruption while tutor is speaking unless user was actively speaking
+        if (this.userSpokeInTurn) {
+          this.stopPlaybackImmediately();
+          this._beginListeningTurn();
+        }
       }
 
       if (sc.inputTranscription && sc.inputTranscription.text) {
-        this.onTranscript('user', sc.inputTranscription.text);
+        const text = sc.inputTranscription.text;
+        this.currentTurnUserTranscript += text;
+        this.onTranscript('user', text);
+        if (this.listeningForUser) {
+          this.userSpokeInTurn = true;
+          this.lastVoiceActivityTime = performance.now();
+        }
       }
+
       if (sc.outputTranscription && sc.outputTranscription.text) {
         this.onTranscript('tutor', sc.outputTranscription.text);
       }
 
       if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
+        if (this.replyWatchdogTimer) {
+          clearTimeout(this.replyWatchdogTimer);
+          this.replyWatchdogTimer = null;
+        }
+        if (!this.tutorTurnActive) {
+          this.tutorTurnActive = true;
+          this.listeningForUser = false;
+          // Any subsequent turn after Turn 1 is 100% Mandarin -> slow down all audio!
+          if (this.turnCountForWord > 0) {
+            this._prepareTurnAudioSlowdownBudget(false);
+          }
+        }
+
         for (const part of sc.modelTurn.parts) {
           if (part.inlineData && part.inlineData.data) {
-            this.onStateChange('speaking', 'Tutor speaking...');
+            this.onStateChange('speaking', 'Tutor speaking (slow Mandarin)...');
             this._enqueuePcm24kAudio(part.inlineData.data);
           }
           if (part.text) {
@@ -456,14 +704,14 @@ export class GeminiLiveVoicePipeline {
       }
 
       if (sc.turnComplete) {
-        // When tutor finishes a turn and no more audio is playing, switch state to listening
+        this.turnCountForWord += 1;
         this._schedulePostPlaybackCallback(() => {
           if (this.pendingActionAfterPlayback) {
             const fn = this.pendingActionAfterPlayback;
             this.pendingActionAfterPlayback = null;
             fn();
           } else if (this.isActive) {
-            this.onStateChange('listening', 'Your turn — speak in Mandarin');
+            this._beginListeningTurn();
           }
         });
       }
@@ -471,6 +719,10 @@ export class GeminiLiveVoicePipeline {
 
     // 2. Handle Tool Calls (`complete_word` or `session_control`)
     if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
+      if (this.replyWatchdogTimer) {
+        clearTimeout(this.replyWatchdogTimer);
+        this.replyWatchdogTimer = null;
+      }
       const responses = [];
       for (const fc of msg.toolCall.functionCalls) {
         const args = fc.args || {};
@@ -522,8 +774,11 @@ export class GeminiLiveVoicePipeline {
   /**
    * Sends a text nudge into the active Live session (e.g., if the user taps "Repeat English" or "Hint").
    */
-  sendTextCommand(text) {
+  sendTextCommand(text, hasEnglishSentence = false) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.listeningForUser = false;
+    this.tutorTurnActive = true;
+    this._prepareTurnAudioSlowdownBudget(hasEnglishSentence);
     this.ws.send(
       JSON.stringify({
         clientContent: {
@@ -534,6 +789,78 @@ export class GeminiLiveVoicePipeline {
     );
   }
 
+  /**
+   * Pitch-Preserving WSOLA (Waveform Similarity Overlap-Add) time-stretcher for 24kHz mono speech.
+   * Stretches Mandarin speech duration by `1 / speedFactor` (e.g. `speedFactor = 0.68` -> ~50% slower)
+   * without lowering the speaker's pitch or distorting Mandarin tone contours!
+   */
+  _timeStretchWsola(input, speedFactor) {
+    if (!speedFactor || speedFactor >= 0.97 || input.length < 1200) {
+      return input;
+    }
+
+    const W = 600; // 25ms window at 24kHz
+    const Hs = 300; // 12.5ms synthesis hop (50% overlap)
+    const Ha = Math.max(60, Math.round(Hs * speedFactor)); // analysis hop
+    const searchDelta = 132; // +/- 5.5ms pitch period search window
+
+    const outLen = Math.ceil((input.length - W) / Ha) * Hs + W;
+    if (outLen <= W) return input;
+
+    const output = new Float32Array(outLen);
+    if (!this._hannWindow || this._hannWindow.length !== W) {
+      this._hannWindow = new Float32Array(W);
+      for (let i = 0; i < W; i++) {
+        this._hannWindow[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / W));
+      }
+    }
+    const win = this._hannWindow;
+
+    let aTarget = 0;
+    let prevChosen = 0;
+    let sPos = 0;
+    let firstFrame = true;
+
+    while (aTarget + W <= input.length && sPos + W <= output.length) {
+      let chosen = Math.round(aTarget);
+
+      if (!firstFrame) {
+        // Expected natural continuation from the previous chosen frame is `prevChosen + Hs`
+        const naturalNext = prevChosen + Hs;
+        if (naturalNext + Hs <= input.length) {
+          const minOff = Math.max(0, Math.round(aTarget) - searchDelta);
+          const maxOff = Math.min(input.length - W, Math.round(aTarget) + searchDelta);
+          let bestCorr = -Infinity;
+          let bestIdx = chosen;
+
+          // Step by 2 samples for fast cross-correlation over the 300-sample overlap region
+          for (let cand = minOff; cand <= maxOff; cand += 2) {
+            let corr = 0;
+            for (let k = 0; k < Hs; k += 4) {
+              corr += input[cand + k] * input[naturalNext + k];
+            }
+            if (corr > bestCorr) {
+              bestCorr = corr;
+              bestIdx = cand;
+            }
+          }
+          chosen = bestIdx;
+        }
+      }
+
+      for (let i = 0; i < W; i++) {
+        output[sPos + i] += input[chosen + i] * win[i];
+      }
+
+      prevChosen = chosen;
+      aTarget += Ha;
+      sPos += Hs;
+      firstFrame = false;
+    }
+
+    return sPos > 0 ? output.subarray(0, sPos + Hs) : input;
+  }
+
   _enqueuePcm24kAudio(base64Data) {
     if (!this.audioCtx) return;
     const binary = atob(base64Data);
@@ -541,17 +868,26 @@ export class GeminiLiveVoicePipeline {
     const samples = byteLen >> 1;
     if (samples === 0) return;
 
-    const float32 = new Float32Array(samples);
+    const rawFloat32 = new Float32Array(samples);
     for (let i = 0; i < samples; i++) {
       const lo = binary.charCodeAt(i * 2);
       const hi = binary.charCodeAt(i * 2 + 1);
       let int16 = (hi << 8) | lo;
       if (int16 >= 0x8000) int16 -= 0x10000;
-      float32[i] = int16 / 32768.0;
+      rawFloat32[i] = int16 / 32768.0;
     }
 
-    const audioBuffer = this.audioCtx.createBuffer(1, samples, 24000);
-    audioBuffer.copyToChannel(float32, 0);
+    // Keep English prompt at 1.0x speed, and slow down Mandarin speech using pitch-preserving WSOLA
+    let processedSamples = rawFloat32;
+    const prevSeen = this.turnInputSamplesSeen;
+    this.turnInputSamplesSeen += samples;
+
+    if (prevSeen >= this.englishSampleBudget && this.mandarinSpeed < 0.97) {
+      processedSamples = this._timeStretchWsola(rawFloat32, this.mandarinSpeed);
+    }
+
+    const audioBuffer = this.audioCtx.createBuffer(1, processedSamples.length, 24000);
+    audioBuffer.copyToChannel(processedSamples, 0);
 
     const src = this.audioCtx.createBufferSource();
     src.buffer = audioBuffer;
@@ -592,6 +928,13 @@ export class GeminiLiveVoicePipeline {
 
   closeCurrentWordSocket() {
     this.isActive = false;
+    this.listeningForUser = false;
+    this.tutorTurnActive = false;
+    this.userSpokeInTurn = false;
+    if (this.replyWatchdogTimer) {
+      clearTimeout(this.replyWatchdogTimer);
+      this.replyWatchdogTimer = null;
+    }
     this.stopPlaybackImmediately();
     if (this.ws) {
       try {
@@ -624,6 +967,7 @@ export class GeminiLiveVoicePipeline {
     }
     const rms = Math.sqrt(sum / (float32Samples.length / 4));
     this.onAudioLevel(Math.min(1, rms * 5));
+    return rms;
   }
 
   _downsampleAndEncodePcm16(buffer, inputRate, outputRate) {

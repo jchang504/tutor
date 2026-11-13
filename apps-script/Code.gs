@@ -71,9 +71,9 @@ const DEFAULT_SETTINGS = {
   BATCH_SIZE: '20',
   NEW_WORD_RATIO: '0.10',
   TOCFL_LEVEL: '2',
-  LIVE_MODEL: 'models/gemini-3.8-live',
-  LIVE_FALLBACK_MODEL: 'models/gemini-3.1-flash-live-preview',
-  BATCH_GEN_MODEL: 'gemini-3.8-flash',
+  LIVE_MODEL: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+  LIVE_FALLBACK_MODEL: 'models/gemini-2.5-flash-native-audio-latest',
+  BATCH_GEN_MODEL: 'gemini-2.5-flash',
   VOICE_NAME: 'Aoede',
   DESIRED_RETENTION: '0.90'
 };
@@ -511,8 +511,8 @@ function generateBatchEnglishPrompts_(words, settings) {
   if (!words || words.length === 0) return {};
 
   const apiKey = getGeminiApiKey_();
-  const preferredModel = (settings && settings.BATCH_GEN_MODEL) ? settings.BATCH_GEN_MODEL : 'gemini-3.8-flash';
-  const candidateModels = [preferredModel, 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+  const preferredModel = (settings && settings.BATCH_GEN_MODEL) ? settings.BATCH_GEN_MODEL : 'gemini-2.5-flash';
+  const candidateModels = ['gemini-2.5-flash', preferredModel, 'gemini-2.0-flash'];
   // Deduplicate model list
   const modelsToTry = candidateModels.filter(function(m, idx) {
     return m && candidateModels.indexOf(m) === idx;
@@ -523,20 +523,23 @@ function generateBatchEnglishPrompts_(words, settings) {
       traditional: w.traditional,
       pinyin: w.pinyin || '',
       zhuyin: w.zhuyin || '',
+      tocfl_level: w.tocfl_level || 2,
       english_gloss: w.english_gloss || '',
       previous_prompt: w.last_prompt || ''
     };
   });
 
   const promptText = [
-    'You are designing translation prompts for an interactive Taiwanese Mandarin speaking tutor.',
+    'You are designing translation prompts for a beginner/intermediate Taiwanese Mandarin speaking student.',
     'For each target Traditional Chinese vocabulary word below, generate:',
-    '1. `english_gloss`: A concise, accurate English definition (in Taiwanese Mandarin usage). If one is already provided, refine or keep it concise.',
-    '2. `english_sentence`: A natural, everyday conversational English sentence (10-18 words) that a speaker in Taiwan would say in real life, which naturally translates into Taiwanese Mandarin using the target word.',
-    '   - Make sure the scenario is concrete and conversational (great for follow-up questions!).',
-    '   - If `previous_prompt` is non-empty, invent a DIFFERENT scenario and sentence from `previous_prompt`.',
+    '1. `english_gloss`: A concise, accurate English definition (in Taiwanese Mandarin usage). If one is already provided, keep it concise.',
+    '2. `english_sentence`: A SHORT, SIMPLE, everyday conversational English sentence (6 to 10 words maximum!) that naturally translates into Taiwanese Mandarin using the target word.',
+    '   - CRITICAL DIFFICULTY RULE: Every other word in the sentence (outside the target word itself) MUST be simple, high-frequency beginner/elementary vocabulary (TOCFL Level 1-2 / A1-A2 level, e.g., I, you, today, tomorrow, go, eat, drink, buy, like, friend, home, work, coffee, time, very, want) of a similar or easier level than the target word.',
+    '   - Avoid complex nouns, idioms, rare words, names, or multi-clause sentences. The student is translating aloud from memory while hands-free, so only the target word should be the challenge!',
+    '   - Good examples: "I usually drink coffee in the morning.", "Let\'s go to that new restaurant tonight.", "Sorry, I won\'t make it in time."',
+    '   - If `previous_prompt` is non-empty, invent a DIFFERENT simple sentence from `previous_prompt`.',
     '   - NEVER include the Mandarin characters or Pinyin inside `english_sentence`.',
-    '3. `sample_mandarin`: The natural Taiwanese Mandarin translation (Traditional characters) of `english_sentence` using the target word.',
+    '3. `sample_mandarin`: The natural, simple Taiwanese Mandarin translation (Traditional characters) of `english_sentence` using the target word.',
     '4. `common_synonyms`: Comma-separated valid Taiwanese Mandarin synonyms the student might accidentally guess instead of the target word (e.g. if target is 餐館, synonym is 餐廳), or empty string if none.',
     '',
     'Return ONLY a JSON array of objects with keys: `traditional`, `english_gloss`, `english_sentence`, `sample_mandarin`, `common_synonyms`.',
@@ -548,7 +551,7 @@ function generateBatchEnglishPrompts_(words, settings) {
   const requestBody = {
     contents: [{ parts: [{ text: promptText }] }],
     generationConfig: {
-      temperature: 0.7,
+      temperature: 0.6,
       responseMimeType: 'application/json'
     }
   };
