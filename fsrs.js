@@ -45,10 +45,10 @@ export function computeDeterministicScore(telemetry = {}) {
 
 export function scoreLabel(score) {
   switch (Number(score)) {
-    case 1: return '1 · 再來 (Again)';
-    case 2: return '2 · 困難 (Hard)';
-    case 3: return '3 · 良好 (Good)';
-    case 4: return '4 · 輕鬆 (Easy)';
+    case 1: return '1 · Again';
+    case 2: return '2 · Hard';
+    case 3: return '3 · Good';
+    case 4: return '4 · Easy';
     default: return `${score}`;
   }
 }

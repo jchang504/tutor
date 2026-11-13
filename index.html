@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-Hant-TW">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
@@ -7,7 +7,7 @@
   <meta name="description" content="Hands-free, eyes-free Taiwanese Mandarin vocabulary & conversational sentence tutor powered by Gemini Live and FSRS v5 spaced repetition." />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>台灣華語口說家教 · Hands-Free Mandarin Tutor</title>
+  <title>Mandarin Driving Tutor · Hands-Free FSRS v5</title>
 
   <link rel="manifest" href="./manifest.json" />
   <link rel="icon" type="image/svg+xml" href="./icons/icon.svg" />
@@ -23,19 +23,19 @@
     <!-- Top Header -->
     <header class="top-header">
       <div class="brand-group">
-        <div class="brand-seal" aria-hidden="true">臺</div>
+        <div class="brand-seal" aria-hidden="true">TW</div>
         <div class="brand-titles">
-          <h1>台灣華語口說家教</h1>
-          <div class="brand-subtitle">Hands-Free Driving Tutor · FSRS v5</div>
+          <h1>Mandarin Driving Tutor</h1>
+          <div class="brand-subtitle">Hands-Free Taiwanese Mandarin · FSRS v5</div>
         </div>
       </div>
 
       <div class="header-actions">
         <button id="btn-open-import" class="icon-btn" type="button" aria-label="Import Hanping or TOCFL Vocab">
-          <span>詞庫同步</span>
+          <span>Sync Vocab</span>
         </button>
         <button id="btn-open-settings" class="icon-btn" type="button" aria-label="Open Backend Settings">
-          <span>設定</span>
+          <span>Settings</span>
         </button>
       </div>
     </header>
@@ -45,15 +45,15 @@
       <div class="stats-Inline">
         <div class="stat-chip">
           <strong id="stat-due">0</strong>
-          <span>待複習 Due</span>
+          <span>Due</span>
         </div>
         <div class="stat-chip">
           <strong id="stat-new">0</strong>
-          <span>新詞 New</span>
+          <span>New</span>
         </div>
         <div class="stat-chip">
           <strong id="stat-learned">0</strong>
-          <span>已學 Learned</span>
+          <span>Learned</span>
         </div>
       </div>
       <div style="display:flex; align-items:center; gap:8px;">
@@ -78,10 +78,10 @@
 
       <!-- 4-Step Deterministic Conversation Loop Stepper -->
       <div class="phase-stepper" aria-label="4-Phase Practice Loop">
-        <div id="phase-step-1" class="phase-step active">1. 英文造句翻譯</div>
-        <div id="phase-step-2" class="phase-step">2. 家教延伸提問</div>
-        <div id="phase-step-3" class="phase-step">3. 回答＋反問家教</div>
-        <div id="phase-step-4" class="phase-step">4. FSRS 評分下一題</div>
+        <div id="phase-step-1" class="phase-step active">1. Translate Sentence</div>
+        <div id="phase-step-2" class="phase-step">2. Tutor Follow-Up</div>
+        <div id="phase-step-3" class="phase-step">3. Reply &amp; Ask Back</div>
+        <div id="phase-step-4" class="phase-step">4. Score &amp; Next</div>
       </div>
 
       <!-- Spoken English Prompt & Target Word Card -->
@@ -108,7 +108,7 @@
       <!-- Giant Eyes-Free Tap Orb -->
       <div class="orb-zone">
         <button id="voice-orb" class="voice-orb" type="button" data-state="idle" aria-label="Toggle Voice Session">
-          <span class="orb-hanzi">語音</span>
+          <span class="orb-hanzi">VOICE</span>
           <span id="voice-orb-label" class="orb-sublabel">Tap to Start</span>
         </button>
       </div>
@@ -119,34 +119,34 @@
       <!-- Live Voice Transcript Feed -->
       <div id="live-transcript-feed" class="transcript-feed" aria-live="polite">
         <p class="transcript-placeholder">
-          Hands-free voice transcript will appear here. Say "跳過 (Skip)", "提示 (Hint)", or "再說一次英文 (Repeat)" anytime.
+          Hands-free voice transcript will appear here. Say "Skip word", "Give me a hint", or "Repeat the English sentence" anytime.
         </p>
       </div>
 
       <!-- Oversized Driving Controls -->
       <div class="driving-controls">
         <button id="btn-start-driving" class="primary-drive-btn" type="button">
-          開始免持口說練習 · Start Driving Session (20 Words)
+          Start Driving Session (20 Words)
         </button>
         <button id="btn-pause-resume" class="primary-drive-btn hidden" type="button" style="background: var(--accent-amber);">
-          暫停練習 · Pause Driving Session
+          Pause Driving Session
         </button>
 
         <div class="secondary-drive-grid">
           <button id="btn-repeat-prompt" class="drive-tile-btn" type="button" disabled>
-            <span class="tile-zh">重聽英文</span>
-            <span class="tile-en">Repeat Prompt</span>
+            <span class="tile-zh">Repeat</span>
+            <span class="tile-en">English Prompt</span>
           </button>
           <button id="btn-ask-hint" class="drive-tile-btn" type="button" disabled>
-            <span class="tile-zh">給我提示</span>
-            <span class="tile-en">Hint</span>
+            <span class="tile-zh">Hint</span>
+            <span class="tile-en">Give a Clue</span>
           </button>
           <button id="btn-skip-word" class="drive-tile-btn" type="button" disabled>
-            <span class="tile-zh">跳過這題</span>
-            <span class="tile-en">Skip Word</span>
+            <span class="tile-zh">Skip</span>
+            <span class="tile-en">Next Word</span>
           </button>
           <button id="btn-end-session" class="drive-tile-btn" type="button" disabled>
-            <span class="tile-zh">結束練習</span>
+            <span class="tile-zh">Stop</span>
             <span class="tile-en">End Session</span>
           </button>
         </div>
@@ -158,8 +158,8 @@
   <div id="drawer-settings" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-sheet">
       <div class="modal-header">
-        <h2 id="settings-title">連線與練習設定 · Backend & Tutor Settings</h2>
-        <button id="btn-close-settings" class="btn-secondary" type="button">關閉</button>
+        <h2 id="settings-title">Backend &amp; Tutor Settings</h2>
+        <button id="btn-close-settings" class="btn-secondary" type="button">Close</button>
       </div>
 
       <div class="info-callout">
@@ -197,11 +197,11 @@
           <div class="field-group">
             <label for="input-tocfl-level">Default TOCFL Level (PSeitz/tocfl)</label>
             <select id="input-tocfl-level">
-              <option value="1">TOCFL Level 1 (入門級 · Beginner)</option>
-              <option value="2" selected>TOCFL Level 2 (基礎級 · Basic)</option>
-              <option value="3">TOCFL Level 3 (進階級 · Intermediate)</option>
-              <option value="4">TOCFL Level 4 (高階級 · Advanced)</option>
-              <option value="5">TOCFL Level 5 (流利級 · Fluent)</option>
+              <option value="1">TOCFL Level 1 (Beginner)</option>
+              <option value="2" selected>TOCFL Level 2 (Basic)</option>
+              <option value="3">TOCFL Level 3 (Intermediate)</option>
+              <option value="4">TOCFL Level 4 (Advanced)</option>
+              <option value="5">TOCFL Level 5 (Fluent)</option>
               <option value="6">TOCFL Level 6</option>
               <option value="7">TOCFL Level 7</option>
             </select>
@@ -209,10 +209,10 @@
           <div class="field-group">
             <label for="input-voice-name">Gemini Live Tutor Voice</label>
             <select id="input-voice-name">
-              <option value="Aoede" selected>Aoede (Clear & Warm)</option>
-              <option value="Kore">Kore (Bright & Articulate)</option>
+              <option value="Aoede" selected>Aoede (Clear &amp; Warm)</option>
+              <option value="Kore">Kore (Bright &amp; Articulate)</option>
               <option value="Puck">Puck (Conversational)</option>
-              <option value="Charon">Charon (Deep & Calm)</option>
+              <option value="Charon">Charon (Deep &amp; Calm)</option>
               <option value="Fenrir">Fenrir (Energetic)</option>
             </select>
           </div>
@@ -228,8 +228,8 @@
       </div>
 
       <div class="modal-actions">
-        <button id="btn-test-connection" class="btn-secondary" type="button">測試連線 · Test Sheet</button>
-        <button id="btn-save-settings" class="btn-primary" type="button">儲存設定 · Save</button>
+        <button id="btn-test-connection" class="btn-secondary" type="button">Test Sheet Connection</button>
+        <button id="btn-save-settings" class="btn-primary" type="button">Save Settings</button>
       </div>
     </div>
   </div>
@@ -238,15 +238,15 @@
   <div id="drawer-import" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="import-title">
     <div class="modal-sheet">
       <div class="modal-header">
-        <h2 id="import-title">詞庫匯入與 TOCFL 補充 · Sync Vocab</h2>
-        <button id="btn-close-import" class="btn-secondary" type="button">關閉</button>
+        <h2 id="import-title">Sync Vocab (Hanping &amp; TOCFL)</h2>
+        <button id="btn-close-import" class="btn-secondary" type="button">Close</button>
       </div>
 
       <div class="form-grid">
         <div class="field-group">
           <label for="file-hanping-csv">1. Import from Hanping Chinese Dictionary Export (CSV / TXT)</label>
           <input id="file-hanping-csv" type="file" accept=".csv,.txt,.tsv" />
-          <span class="field-hint">Supports Hanping CSV/TSV exports, CEDICT-style <code>傳統[传统] chuán tǒng /tradition/</code> exports, and Anki plain-text exports. Automatically cross-references <code>PSeitz/tocfl</code> to attach Zhuyin and spoken frequency!</span>
+          <span class="field-hint">Supports Hanping CSV/TSV exports, CEDICT-style exports, and Anki plain-text exports. Automatically cross-references <code>PSeitz/tocfl</code> to attach Zhuyin and spoken frequency!</span>
         </div>
 
         <div class="field-group">
@@ -255,25 +255,25 @@
         </div>
 
         <button id="btn-upload-hanping" class="btn-primary" type="button">
-          匯入 Hanping 詞彙至 Google Sheet · Import Hanping CSV to Sheet
+          Import Hanping CSV to Sheet
         </button>
 
         <div class="divider-line"></div>
 
         <div class="info-callout">
           <strong>2. Supplement from Official Taiwan NAER / TOCFL Dataset (<code>PSeitz/tocfl</code>):</strong><br />
-          Note: Whenever a 20-word session needs more new words than you have queued from Hanping, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending. You can also pre-populate a batch of TOCFL words into your Sheet right now:
+          Whenever a 20-word session needs more new words than you have queued from Hanping, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending. You can also pre-populate a batch of TOCFL words into your Sheet right now:
         </div>
 
         <div class="form-row-2col">
           <div class="field-group">
             <label for="select-supplement-level">TOCFL Level</label>
             <select id="select-supplement-level">
-              <option value="1">Level 1 (入門級)</option>
-              <option value="2" selected>Level 2 (基礎級)</option>
-              <option value="3">Level 3 (進階級)</option>
-              <option value="4">Level 4 (高階級)</option>
-              <option value="5">Level 5 (流利級)</option>
+              <option value="1">Level 1 (Beginner)</option>
+              <option value="2" selected>Level 2 (Basic)</option>
+              <option value="3">Level 3 (Intermediate)</option>
+              <option value="4">Level 4 (Advanced)</option>
+              <option value="5">Level 5 (Fluent)</option>
               <option value="6">Level 6</option>
               <option value="7">Level 7</option>
             </select>
@@ -285,7 +285,7 @@
         </div>
 
         <button id="btn-pull-tocfl" class="btn-secondary" type="button">
-          從 PSeitz/tocfl 補充高頻口語詞 · Supplement from PSeitz/tocfl
+          Supplement from PSeitz/tocfl
         </button>
 
         <div id="import-result-box" class="info-callout hidden"></div>

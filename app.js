@@ -401,8 +401,8 @@ class MandarinTutorApp {
     const word = this.batch[this.currentIndex];
     if (!word) {
       this.els.englishPromptText.textContent = 'Ready for hands-free Taiwanese Mandarin practice.';
-      this.els.targetHanzi.textContent = '準備開始';
-      this.els.targetPhonetics.textContent = 'zhǔn bèi kāi shǐ · ㄓㄨㄣˇ ㄅㄟˋ ㄎㄞ ㄕˇ';
+      this.els.targetHanzi.textContent = 'Ready';
+      this.els.targetPhonetics.textContent = 'Target word hidden until revealed';
       this.els.targetGloss.textContent = 'Tap Start Driving Session below';
       this.els.stageProgressText.textContent = 'Batch: 20 words (90% Due / 10% New)';
       this.els.stageProgressBar.style.width = '0%';
@@ -595,7 +595,7 @@ class MandarinTutorApp {
     }
     this.els.liveTranscriptFeed.innerHTML = this.transcriptHistory
       .map((item) => {
-        const tag = item.role === 'user' ? '你' : '家教';
+        const tag = item.role === 'user' ? 'You' : 'Tutor';
         const cls = item.role === 'user' ? 'turn-user' : 'turn-tutor';
         return `<div class="transcript-turn ${cls}"><span class="turn-tag">${tag}</span><span class="turn-text">${this.escapeHtml(item.text)}</span></div>`;
       })
@@ -671,7 +671,7 @@ class MandarinTutorApp {
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: word.english_prompt,
-        artist: '台灣華語口說家教 (Taiwanese Mandarin Tutor)',
+        artist: 'Mandarin Driving Tutor',
         album: `Word ${this.currentIndex + 1} of ${this.batch.length}`
       });
     } catch (_) {}

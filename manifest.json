@@ -1,6 +1,6 @@
 {
-  "name": "台灣華語口說家教 · Mandarin Driving Tutor",
-  "short_name": "華語家教",
+  "name": "Mandarin Driving Tutor",
+  "short_name": "Mandarin Tutor",
   "description": "Hands-free, eyes-free Taiwanese Mandarin vocabulary & sentence tutor powered by Gemini Live and FSRS v5.",
   "start_url": "./index.html",
   "display": "standalone",
