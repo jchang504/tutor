@@ -120,6 +120,11 @@ class MandarinTutorApp {
       btnTestConnection: document.getElementById('btn-test-connection'),
 
       fileHanpingCsv: document.getElementById('file-hanping-csv'),
+      selectAnkiTag: document.getElementById('select-anki-tag'),
+      inputAnkiTag: document.getElementById('input-anki-tag'),
+      ankiTagSummary: document.getElementById('anki-tag-summary'),
+      labelPreviewCount: document.getElementById('label-preview-count'),
+      chkPruneNonmatching: document.getElementById('chk-prune-nonmatching'),
       textareaHanpingCsv: document.getElementById('textarea-hanping-csv'),
       btnUploadHanping: document.getElementById('btn-upload-hanping'),
       selectSupplementLevel: document.getElementById('select-supplement-level'),
@@ -129,6 +134,8 @@ class MandarinTutorApp {
 
       toastContainer: document.getElementById('toast-container')
     };
+
+    this.rawAnkiFileText = '';
 
     this.els.btnStartDriving.addEventListener('click', () => this.startDrivingSession());
     this.els.btnPauseResume.addEventListener('click', () => this.togglePauseSession());
@@ -165,6 +172,41 @@ class MandarinTutorApp {
     this.els.btnTestConnection.addEventListener('click', () => this.refreshBackendStatus(true));
 
     this.els.fileHanpingCsv.addEventListener('change', (e) => this.handleFilePicked(e));
+    if (this.els.selectAnkiTag) {
+      this.els.selectAnkiTag.addEventListener('change', () => {
+        if (this.els.inputAnkiTag) {
+          this.els.inputAnkiTag.value = this.els.selectAnkiTag.value;
+        }
+        this.applyAnkiTagFilterPreview();
+      });
+    }
+    if (this.els.inputAnkiTag) {
+      this.els.inputAnkiTag.addEventListener('input', () => {
+        const typed = this.els.inputAnkiTag.value.trim().toLowerCase();
+        if (this.els.selectAnkiTag) {
+          let matchedOpt = false;
+          for (const opt of this.els.selectAnkiTag.options) {
+            if (opt.value.toLowerCase() === typed) {
+              opt.selected = true;
+              matchedOpt = true;
+              break;
+            }
+          }
+          if (!matchedOpt && !typed) {
+            this.els.selectAnkiTag.value = '';
+          }
+        }
+        this.applyAnkiTagFilterPreview();
+      });
+    }
+    this.els.textareaHanpingCsv.addEventListener('input', () => {
+      // If the user pastes a raw AnkiDroid file with #tags column into the textarea, capture it
+      const val = this.els.textareaHanpingCsv.value;
+      if (val.includes('#tags column:') || !this.rawAnkiFileText) {
+        this.rawAnkiFileText = val;
+        this.populateAnkiTagOptions(this.rawAnkiFileText, false);
+      }
+    });
     this.els.btnUploadHanping.addEventListener('click', () => this.uploadHanpingCsv());
     this.els.btnPullTocfl.addEventListener('click', () => this.pullTocflSupplemental());
   }
@@ -679,7 +721,8 @@ class MandarinTutorApp {
 
   /**
    * File picker for AnkiDroid Plain Text (.txt) exports.
-   * Detects empty Filtered Deck exports and auto-discovers all Anki tags in the file.
+   * Detects empty Filtered Deck exports, parses `#separator:tab` and `#tags column:12`,
+   * auto-discovers all Anki tags in the file, and updates the live filtered preview.
    */
   async handleFilePicked(event) {
     const file = event.target.files && event.target.files[0];
@@ -687,22 +730,23 @@ class MandarinTutorApp {
 
     try {
       const text = await file.text();
-      this.els.textareaHanpingCsv.value = text;
+      this.rawAnkiFileText = text;
       const dataLines = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
 
       if (dataLines.length === 0) {
+        this.els.textareaHanpingCsv.value = text;
         this.els.importResultBox.classList.remove('hidden');
         this.els.importResultBox.textContent =
           `Note: "${file.name}" contains 0 notes (only Anki header lines). This happens when exporting an empty Filtered Deck in AnkiDroid. Instead, export your main parent deck (e.g. "Everyday" or "All decks") as "Notes in Plain Text (.txt)" with "Include tags" checked, then choose your tag in the filter above!`;
         this.showToast(`"${file.name}" has 0 notes (empty Filtered Deck). Export your main deck instead!`, 'error');
-        this.populateAnkiTagOptions('');
+        this.populateAnkiTagOptions('', true);
         return;
       }
 
-      const tagCount = this.populateAnkiTagOptions(text);
+      const tagCount = this.populateAnkiTagOptions(text, true);
       this.els.importResultBox.classList.add('hidden');
       this.showToast(
-        `Loaded ${file.name}: ${dataLines.length} notes (${tagCount} tags detected).`,
+        `Loaded ${file.name}: ${dataLines.length} total notes (${tagCount} tags detected).`,
         'info'
       );
     } catch (err) {
@@ -711,49 +755,100 @@ class MandarinTutorApp {
   }
 
   /**
-   * Scans an AnkiDroid "Notes in Plain Text (.txt)" file for `#tags column:N` (or the last tab column)
-   * and populates the tag filter dropdown with all discovered tags and their note counts.
+   * Parses AnkiDroid `#separator:...` and `#tags column:N` metadata headers (e.g. `#tags column:12`)
+   * without stripping leading/trailing tabs from data lines.
    */
-  populateAnkiTagOptions(rawText) {
-    if (!this.els.selectAnkiTag) return 0;
+  parseAnkiMetadataAndRows(rawText) {
     const lines = String(rawText || '').split(/\r?\n/);
-    let tagsColIndex = -1;
-    const tagCounts = new Map();
-    let totalNotes = 0;
+    let separator = '\t';
+    let tagsCol1Based = -1;
+    const headerLines = [];
+    const rows = [];
 
     for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      if (line.startsWith('#')) {
-        const m = line.match(/^#tags\s+column:(\d+)/i);
-        if (m) tagsColIndex = Number(m[1]) - 1;
+      const cleanLine = rawLine.replace(/\r$/, '');
+      if (!cleanLine.trim()) continue;
+
+      if (cleanLine.trim().startsWith('#')) {
+        const directive = cleanLine.trim();
+        headerLines.push(directive);
+        const sepMatch = directive.match(/^#separator\s*:\s*(.+)$/i);
+        if (sepMatch) {
+          const val = sepMatch[1].trim().toLowerCase();
+          if (val === 'tab' || val === '\\t') separator = '\t';
+          else if (val === 'comma' || val === ',') separator = ',';
+          else if (val === 'semicolon' || val === ';') separator = ';';
+        }
+        const tagColMatch = directive.match(/^#tags\s+column\s*:\s*(\d+)/i);
+        if (tagColMatch) {
+          tagsCol1Based = Number(tagColMatch[1]);
+        }
         continue;
       }
-      if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(line)) continue;
-      const cols = line.split('\t');
+
+      if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(cleanLine)) continue;
+      // Split by separator WITHOUT calling .trim() first so leading/trailing empty tab columns are preserved!
+      const cols = cleanLine.split(separator);
       if (cols.length < 2) continue;
-      totalNotes++;
 
-      const colIdx = tagsColIndex >= 0 && tagsColIndex < cols.length ? tagsColIndex : cols.length - 1;
-      const rawTagsCell = (cols[colIdx] || '').trim();
-      if (!rawTagsCell || /[\u4e00-\u9fff]/.test(rawTagsCell)) continue;
+      const tagsColIndex = tagsCol1Based >= 1 ? tagsCol1Based - 1 : cols.length - 1;
+      const rawTagsCell = (tagsColIndex >= 0 && tagsColIndex < cols.length ? cols[tagsColIndex] : '').trim();
+      const tags = rawTagsCell && !/[\u4e00-\u9fff]/.test(rawTagsCell)
+        ? rawTagsCell.split(/\s+/).filter(Boolean)
+        : [];
 
-      const tokens = rawTagsCell.split(/\s+/).filter(Boolean);
-      for (const tok of tokens) {
-        // Ignore plain English definitions that happen to be in the last column when tags aren't exported
-        if (tagsColIndex === -1 && tokens.length > 4) continue;
+      rows.push({
+        rawLine: cleanLine,
+        cols,
+        tags,
+        tagsColIndex
+      });
+    }
+
+    return {
+      separator,
+      tagsCol1Based,
+      headerLines,
+      rows
+    };
+  }
+
+  /**
+   * Scans an AnkiDroid "Notes in Plain Text (.txt)" file for `#tags column:N` (e.g. column 12)
+   * and populates `#select-anki-tag`, auto-selecting `"everyday"` if present when a new file is picked.
+   */
+  populateAnkiTagOptions(rawText, autoSelectEveryday = false) {
+    const selectEl = this.els.selectAnkiTag || document.getElementById('select-anki-tag');
+    const inputEl = this.els.inputAnkiTag || document.getElementById('input-anki-tag');
+    if (!selectEl) return 0;
+
+    const parsed = this.parseAnkiMetadataAndRows(rawText);
+    const tagCounts = new Map();
+
+    for (const row of parsed.rows) {
+      for (const tok of row.tags) {
+        if (parsed.tagsCol1Based === -1 && row.tags.length > 4) continue;
         tagCounts.set(tok, (tagCounts.get(tok) || 0) + 1);
       }
     }
 
-    const currentVal = this.els.inputAnkiTag.value.trim();
     const sortedTags = [...tagCounts.entries()].sort((a, b) => b[1] - a[1]);
+    let currentVal = (inputEl ? inputEl.value : '').trim();
 
-    this.els.selectAnkiTag.innerHTML = '';
+    // If a file was just loaded and no tag filter was manually typed yet, auto-select "everyday" if present!
+    if (autoSelectEveryday && !currentVal) {
+      const hasEveryday = sortedTags.find(([t]) => t.toLowerCase() === 'everyday');
+      if (hasEveryday) {
+        currentVal = hasEveryday[0];
+        if (inputEl) inputEl.value = currentVal;
+      }
+    }
+
+    selectEl.innerHTML = '';
     const allOpt = document.createElement('option');
     allOpt.value = '';
-    allOpt.textContent = `All Notes in File (${totalNotes} notes)`;
-    this.els.selectAnkiTag.appendChild(allOpt);
+    allOpt.textContent = `All Notes in File (${parsed.rows.length} notes)`;
+    selectEl.appendChild(allOpt);
 
     for (const [tag, count] of sortedTags) {
       const opt = document.createElement('option');
@@ -762,62 +857,132 @@ class MandarinTutorApp {
       if (currentVal && tag.toLowerCase() === currentVal.toLowerCase()) {
         opt.selected = true;
       }
-      this.els.selectAnkiTag.appendChild(opt);
+      selectEl.appendChild(opt);
     }
 
+    this.applyAnkiTagFilterPreview();
     return sortedTags.length;
   }
 
   /**
-   * Filters AnkiDroid plain-text lines client-side by `tagFilter` (case-insensitive)
-   * using `#tags column:N` (or the last tab column). Preserves `#...` header lines.
-   * Doing this client-side ensures tag filtering works even before redeploying Apps Script,
-   * and reduces payload size to Google Sheets.
+   * Filters `this.rawAnkiFileText` in real time whenever the selected/typed tag changes,
+   * updates `#textarea-hanping-csv` so the user can verify the exact filtered lines,
+   * and updates `#anki-tag-summary` with the detected metadata and match count.
    */
-  filterAnkiTextByTag(rawText, tagFilter) {
-    const target = String(tagFilter || '').trim().toLowerCase();
-    if (!target) return rawText;
+  applyAnkiTagFilterPreview() {
+    const sourceText = this.rawAnkiFileText || (this.els.textareaHanpingCsv ? this.els.textareaHanpingCsv.value : '');
+    if (!sourceText) return;
 
-    const lines = String(rawText || '').split(/\r?\n/);
-    let tagsColIndex = -1;
-    const headerLines = [];
-    const matchedLines = [];
+    const selectEl = this.els.selectAnkiTag || document.getElementById('select-anki-tag');
+    const inputEl = this.els.inputAnkiTag || document.getElementById('input-anki-tag');
+    const summaryEl = this.els.ankiTagSummary || document.getElementById('anki-tag-summary');
+    const labelEl = this.els.labelPreviewCount || document.getElementById('label-preview-count');
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      if (line.startsWith('#')) {
-        headerLines.push(line);
-        const m = line.match(/^#tags\s+column:(\d+)/i);
-        if (m) tagsColIndex = Number(m[1]) - 1;
-        continue;
-      }
-      const cols = rawLine.split('\t');
-      const colIdx = tagsColIndex >= 0 && tagsColIndex < cols.length ? tagsColIndex : cols.length - 1;
-      const rawTagsCell = (cols[colIdx] || '').trim();
-      if (!rawTagsCell) continue;
-      const tags = rawTagsCell.split(/\s+/).filter(Boolean);
-      const isMatch = tags.some((t) => {
-        const tl = t.toLowerCase();
-        return tl === target || tl.endsWith('::' + target);
-      });
-      if (isMatch) {
-        matchedLines.push(rawLine);
+    const activeTag = ((inputEl && inputEl.value) || (selectEl && selectEl.value) || '').trim();
+    const targetLower = activeTag.toLowerCase();
+
+    const parsed = this.parseAnkiMetadataAndRows(sourceText);
+    const tagCounts = new Map();
+    for (const row of parsed.rows) {
+      for (const tok of row.tags) {
+        tagCounts.set(tok, (tagCounts.get(tok) || 0) + 1);
       }
     }
 
-    if (matchedLines.length === 0) return '';
-    return [...headerLines, ...matchedLines].join('\n');
+    const matchedRows = targetLower
+      ? parsed.rows.filter((r) =>
+          r.tags.some((t) => {
+            const tl = t.toLowerCase();
+            return tl === targetLower || tl.endsWith('::' + targetLower);
+          })
+        )
+      : parsed.rows;
+
+    if (this.els.textareaHanpingCsv) {
+      const outLines = [...parsed.headerLines, ...matchedRows.map((r) => r.rawLine)];
+      this.els.textareaHanpingCsv.value = outLines.join('\n');
+    }
+
+    if (labelEl) {
+      labelEl.textContent = activeTag
+        ? `Filtered Preview (${matchedRows.length} of ${parsed.rows.length} notes matching tag "${activeTag}")`
+        : `Filtered Preview (All ${parsed.rows.length} notes)`;
+    }
+
+    if (summaryEl) {
+      if (parsed.rows.length === 0) {
+        summaryEl.classList.add('hidden');
+      } else {
+        const tagListStr = [...tagCounts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([t, c]) => `${t} (${c})`)
+          .join(', ');
+        const colInfo = parsed.tagsCol1Based > 0 ? `column ${parsed.tagsCol1Based}` : 'last column';
+        const filterInfo = activeTag
+          ? `Filtering by tag "${activeTag}": ${matchedRows.length} of ${parsed.rows.length} notes matched.`
+          : `Showing all ${parsed.rows.length} notes (select or type a tag above to filter).`;
+        summaryEl.textContent = `Detected #separator:tab, tags in ${colInfo} · Tags in file: ${tagListStr || 'none'} · ${filterInfo}`;
+        summaryEl.classList.remove('hidden');
+      }
+    }
+  }
+
+  /**
+   * Normalizes filtered AnkiDroid rows into clean 5-column TSV (`Traditional\tSimplified\tPinyin\tGloss\tTags`)
+   * so that any version of the Apps Script backend imports ONLY the filtered notes with clean fields.
+   */
+  buildCleanFilteredTsv(sourceText, tagFilter) {
+    const parsed = this.parseAnkiMetadataAndRows(sourceText);
+    const targetLower = String(tagFilter || '').trim().toLowerCase();
+
+    const matchedRows = targetLower
+      ? parsed.rows.filter((r) =>
+          r.tags.some((t) => {
+            const tl = t.toLowerCase();
+            return tl === targetLower || tl.endsWith('::' + targetLower);
+          })
+        )
+      : parsed.rows;
+
+    if (matchedRows.length === 0) return { csvText: '', matchedCount: 0, totalCount: parsed.rows.length };
+
+    const cleanLines = ['#separator:tab', '#html:false', '#tags column:5'];
+    for (const row of matchedRows) {
+      const cols = row.cols;
+      // For standard 12-col Hanping->AnkiDroid export: col 0 = Trad, col 1 = Simp, col 2 = Pinyin, col 4 = Gloss
+      if (cols.length >= 5 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test((cols[0] || '').trim())) {
+        const trad = (cols[0] || '').trim();
+        const simp = /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test((cols[1] || '').trim()) ? (cols[1] || '').trim() : '';
+        const pinyin = (cols[2] || '').trim();
+        const gloss = ((cols[4] || cols[3] || '').replace(/%27/gi, "'")).trim();
+        const tagsStr = row.tags.join(' ');
+        cleanLines.push([trad, simp, pinyin, gloss, tagsStr].join('\t'));
+      } else {
+        cleanLines.push(row.rawLine);
+      }
+    }
+
+    return {
+      csvText: cleanLines.join('\n'),
+      matchedCount: matchedRows.length,
+      totalCount: parsed.rows.length
+    };
   }
 
   async uploadHanpingCsv() {
-    const rawCsvText = this.els.textareaHanpingCsv.value.trim();
-    const tagFilter = (this.els.inputAnkiTag ? this.els.inputAnkiTag.value : '').trim();
-    if (!rawCsvText) {
+    const sourceText = (this.rawAnkiFileText || (this.els.textareaHanpingCsv ? this.els.textareaHanpingCsv.value : '')).trim();
+    const inputEl = this.els.inputAnkiTag || document.getElementById('input-anki-tag');
+    const selectEl = this.els.selectAnkiTag || document.getElementById('select-anki-tag');
+    const pruneEl = this.els.chkPruneNonmatching || document.getElementById('chk-prune-nonmatching');
+
+    const tagFilter = ((inputEl && inputEl.value) || (selectEl && selectEl.value) || '').trim();
+    const pruneNonMatching = pruneEl ? Boolean(pruneEl.checked) : true;
+
+    if (!sourceText) {
       this.showToast('Please select an AnkiDroid .txt export file or paste rows first.', 'error');
       return;
     }
-    const dataLines = rawCsvText.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
+    const dataLines = sourceText.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
     if (dataLines.length === 0) {
       this.showToast(
         'This file has 0 notes (only # header lines from an empty Filtered Deck). Export your main parent deck with "Include tags" checked instead.',
@@ -826,27 +991,35 @@ class MandarinTutorApp {
       return;
     }
 
-    const csvText = tagFilter ? this.filterAnkiTextByTag(rawCsvText, tagFilter) : rawCsvText;
-    if (!csvText) {
-      this.showToast(`No notes found with tag "${tagFilter}" in the loaded text.`, 'error');
+    const { csvText, matchedCount, totalCount } = this.buildCleanFilteredTsv(sourceText, tagFilter);
+    if (!csvText || matchedCount === 0) {
+      this.showToast(`No notes found with tag "${tagFilter}" out of ${totalCount} notes.`, 'error');
       return;
     }
 
     try {
       this.els.btnUploadHanping.disabled = true;
-      this.els.btnUploadHanping.textContent = 'Importing & Cross-Referencing TOCFL...';
-      const res = await this.callBackend('import_hanping', { csvText, tagFilter });
+      this.els.btnUploadHanping.textContent = `Importing ${matchedCount} Notes & Cross-Referencing TOCFL...`;
+      const res = await this.callBackend('import_hanping', {
+        csvText,
+        tagFilter,
+        pruneNonMatching
+      });
       this.els.importResultBox.classList.remove('hidden');
-      const tagSummary = tagFilter ? ` matching tag "${tagFilter}"` : '';
+      const tagSummary = tagFilter ? ` with tag "${tagFilter}"` : '';
+      const prunedSummary = res.prunedCount ? `, removed ${res.prunedCount} non-matching unstudied words` : '';
       this.els.importResultBox.textContent =
-        `Imported ${res.addedCount} new words${tagSummary} into Google Sheet (${res.skippedDuplicate} existing duplicates preserved).`;
-      this.showToast(`Added ${res.addedCount} words${tagSummary} to Sheet!`, 'success');
+        `Matched ${matchedCount} notes${tagSummary} (out of ${totalCount} in file): ${res.addedCount} newly added to Sheet, ${res.skippedDuplicate} already in Sheet${prunedSummary}.`;
+      this.showToast(
+        `Synced ${matchedCount} notes${tagSummary} (${res.addedCount} new, ${res.skippedDuplicate} existing${prunedSummary})!`,
+        'success'
+      );
       await this.refreshBackendStatus(false);
     } catch (err) {
       this.showToast(err.message, 'error');
     } finally {
       this.els.btnUploadHanping.disabled = false;
-      this.els.btnUploadHanping.textContent = 'Import AnkiDroid Notes to Sheet';
+      this.els.btnUploadHanping.textContent = 'Import Filtered Notes to Sheet';
     }
   }
 

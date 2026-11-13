@@ -257,22 +257,29 @@
             <select id="select-anki-tag">
               <option value="">All Notes in File (No Tag Filter)</option>
             </select>
-            <span class="field-hint">Auto-populated from <code>#tags column</code> when you pick a file.</span>
+            <span class="field-hint">Auto-populated from <code>#tags column:12</code> when you pick a file.</span>
           </div>
           <div class="field-group">
             <label for="input-anki-tag">Or Type Tag Name Manually</label>
-            <input id="input-anki-tag" type="text" placeholder="e.g. Hanping::Starred" autocomplete="off" />
-            <span class="field-hint">Only notes carrying this tag will be imported.</span>
+            <input id="input-anki-tag" type="text" placeholder="e.g. everyday" autocomplete="off" />
+            <span class="field-hint">Filters preview &amp; import to notes with this tag.</span>
           </div>
         </div>
 
+        <div id="anki-tag-summary" class="info-callout hidden"></div>
+
         <div class="field-group">
-          <label for="textarea-hanping-csv">Preview / Paste AnkiDroid Notes (Tab-Separated)</label>
-          <textarea id="textarea-hanping-csv" placeholder="#separator:tab&#10;#html:false&#10;#tags column:4&#10;餐館&#9;cān guǎn&#9;restaurant&#9;my_tag"></textarea>
+          <label for="textarea-hanping-csv" id="label-preview-count">Filtered Preview (Tab-Separated Notes to Import)</label>
+          <textarea id="textarea-hanping-csv" placeholder="#separator:tab&#10;#html:false&#10;#tags column:12&#10;平常&#9;平常&#9;ping2 chang2&#9;&#9;ordinary • common&#9;&#9;&#9;&#9;x&#9;&#9;&#9;everyday"></textarea>
         </div>
 
+        <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; color:var(--text-secondary); cursor:pointer;">
+          <input id="chk-prune-nonmatching" type="checkbox" checked />
+          <span>Remove unstudied Anki words in Sheet that are not in this filtered list</span>
+        </label>
+
         <button id="btn-upload-hanping" class="btn-primary" type="button">
-          Import AnkiDroid Notes to Sheet
+          Import Filtered Notes to Sheet
         </button>
 
         <div class="divider-line"></div>
@@ -310,11 +317,20 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=6"></script>
   <script>
     if ('serviceWorker' in navigator) {
+      let refreshing = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!refreshing) {
+          refreshing = true;
+          window.location.reload();
+        }
+      });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js').catch(() => {});
+        navigator.serviceWorker.register('./sw.js?v=6').then((reg) => {
+          reg.update().catch(() => {});
+        }).catch(() => {});
       });
     }
   </script>

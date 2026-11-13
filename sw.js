@@ -1,9 +1,9 @@
-const CACHE_NAME = 'tw-mandarin-tutor-v5';
+const CACHE_NAME = 'tw-mandarin-tutor-v6';
 const ASSETS = [
   './',
   './index.html',
-  './index.css',
-  './app.js',
+  './index.css?v=6',
+  './app.js?v=6',
   './live-audio.js',
   './fsrs.js',
   './sample-vocab.js',
@@ -13,24 +13,42 @@ const ASSETS = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+    caches.open(CACHE_NAME).then((cache) =>
+      Promise.all(
+        ASSETS.map((url) =>
+          fetch(new Request(url, { cache: 'reload' }))
+            .then((res) => (res && res.ok ? cache.put(url, res) : null))
+            .catch(() => null)
+        )
+      )
+    )
   );
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    )
+    (async () => {
+      const keys = await caches.keys();
+      const oldKeys = keys.filter((k) => k !== CACHE_NAME);
+      await Promise.all(oldKeys.map((k) => caches.delete(k)));
+      await self.clients.claim();
+      if (oldKeys.length > 0) {
+        const windowClients = await self.clients.matchAll({ type: 'window' });
+        for (const client of windowClients) {
+          try {
+            await client.navigate(client.url);
+          } catch (_) {}
+        }
+      }
+    })()
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   event.respondWith(
-    fetch(event.request)
+    fetch(event.request, { cache: 'no-cache' })
       .then((networkResp) => {
         if (networkResp && networkResp.ok && event.request.url.startsWith(self.location.origin)) {
           const clone = networkResp.clone();

@@ -297,8 +297,9 @@ function handlePing_() {
   vocab.forEach(function(w) {
     const status = String(w.status || 'new').toLowerCase();
     if (status === 'flagged') return;
-    if (String(w.source).toLowerCase() === 'hanping') hanpingCount++;
-    if (String(w.source).toLowerCase() === 'tocfl') tocflCount++;
+    const src = String(w.source).toLowerCase();
+    if (src === 'hanping' || src === 'ankidroid') hanpingCount++;
+    if (src === 'tocfl') tocflCount++;
 
     if (status === 'new' || !w.reps || Number(w.reps) === 0) {
       newCount++;
@@ -352,7 +353,8 @@ function handleGetBatch_(body) {
 
     const isNew = (status === 'new' || !w.reps || Number(w.reps) === 0);
     if (isNew) {
-      if (String(w.source).toLowerCase() === 'hanping') {
+      const src = String(w.source).toLowerCase();
+      if (src === 'hanping' || src === 'ankidroid') {
         newHanpingPool.push(w);
       } else {
         newTocflPool.push(w);
@@ -401,8 +403,10 @@ function handleGetBatch_(body) {
       }
     });
     combinedNewPool.sort(function(a, b) {
-      const sa = String(a.source).toLowerCase() === 'hanping' ? 1 : 0;
-      const sb = String(b.source).toLowerCase() === 'hanping' ? 1 : 0;
+      const srcA = String(a.source).toLowerCase();
+      const srcB = String(b.source).toLowerCase();
+      const sa = (srcA === 'hanping' || srcA === 'ankidroid') ? 1 : 0;
+      const sb = (srcB === 'hanping' || srcB === 'ankidroid') ? 1 : 0;
       if (sa !== sb) return sb - sa;
       return (Number(b.spoken_freq) || 0) - (Number(a.spoken_freq) || 0);
     });
@@ -842,6 +846,7 @@ function handleWordAction_(body) {
 function handleImportHanping_(body) {
   const csvText = String(body.csvText || '').trim();
   const tagFilter = String(body.tagFilter || '').trim();
+  const pruneNonMatching = body.pruneNonMatching !== undefined ? Boolean(body.pruneNonMatching) : Boolean(tagFilter);
   if (!csvText) {
     throw new Error('Empty AnkiDroid export text.');
   }
@@ -862,14 +867,41 @@ function handleImportHanping_(body) {
     throw new Error('No Chinese vocabulary notes found in the file. (If you exported an empty Filtered Deck, export your main parent deck or "All decks" as "Notes in Plain Text (.txt)" with "Include tags" checked instead.)');
   }
 
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(TAB_VOCAB);
+
+  // Build set of Traditional headwords in this filtered import
+  const importedTradSet = {};
+  parsedEntries.forEach(function(entry) {
+    const trad = String(entry.traditional || '').trim();
+    if (trad) importedTradSet[trad] = true;
+  });
+
+  // Optionally prune unstudied AnkiDroid/Hanping rows in the Sheet that do NOT match the filtered import
+  // (e.g., cleaning up non-"everyday" tags from an earlier unfiltered import)
+  let prunedCount = 0;
+  if (pruneNonMatching) {
+    const existingForPrune = readAllVocab_();
+    // Delete from bottom row to top row so row indices don't shift
+    for (let i = existingForPrune.length - 1; i >= 0; i--) {
+      const w = existingForPrune[i];
+      const trad = String(w.traditional || '').trim();
+      const src = String(w.source || '').toLowerCase();
+      const isAnkiSource = (src === 'ankidroid' || src === 'hanping');
+      const isUnstudied = (!w.reps || Number(w.reps) === 0);
+      if (isAnkiSource && isUnstudied && !importedTradSet[trad]) {
+        sheet.deleteRow(w._rowNumber);
+        prunedCount++;
+      }
+    }
+  }
+
   const existing = readAllVocab_();
   const existingMap = {};
   existing.forEach(function(w) {
     existingMap[String(w.traditional).trim()] = w;
   });
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(TAB_VOCAB);
   const newRows = [];
   let skippedDuplicate = 0;
 
@@ -917,6 +949,7 @@ function handleImportHanping_(body) {
     ok: true,
     addedCount: newRows.length,
     skippedDuplicate: skippedDuplicate,
+    prunedCount: prunedCount,
     totalParsed: parsedEntries.length,
     tagFilter: tagFilter
   };
@@ -924,26 +957,36 @@ function handleImportHanping_(body) {
 
 /**
  * Parser for AnkiDroid "Notes in Plain Text (.txt)" / "Cards in Plain Text (.txt)" exports
- * (including `Hanping Chinese Type` notes, `#tags column:N` headers, optional tag filtering,
- * HTML spans, and `[sound:...]` tags).
+ * (including `Hanping Chinese Type` notes, `#separator:tab`, `#tags column:N` headers,
+ * optional tag filtering, HTML spans, and `[sound:...]` tags).
  */
 function parseHanpingText_(rawText, tocflMap, tagFilter) {
-  const trimmed = String(rawText || '').trim();
-  if (!trimmed) return [];
+  const rawStr = String(rawText || '');
+  if (!rawStr.trim()) return [];
   const lookup = tocflMap || {};
   const targetTagLower = String(tagFilter || '').trim().toLowerCase();
 
-  const lines = trimmed.split(/\r?\n/);
+  const lines = rawStr.split(/\r?\n/);
   const results = [];
   let tagsColIndex = -1;
+  let separator = '\t';
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line || line.startsWith('//')) continue;
+    // IMPORTANT: Do NOT call .trim() before splitting by tab, or empty trailing tab columns will be stripped!
+    const rawLine = lines[i].replace(/\r$/, '');
+    const trimmedLine = rawLine.trim();
+    if (!trimmedLine || trimmedLine.startsWith('//')) continue;
 
     // Parse Anki 2.1.54+ / AnkiDroid plain-text export header directives
-    if (line.startsWith('#')) {
-      const tagColMatch = line.match(/^#tags\s+column:(\d+)/i);
+    if (trimmedLine.startsWith('#')) {
+      const sepMatch = trimmedLine.match(/^#separator\s*:\s*(.+)$/i);
+      if (sepMatch) {
+        const sepVal = sepMatch[1].trim().toLowerCase();
+        if (sepVal === 'tab' || sepVal === '\\t') separator = '\t';
+        else if (sepVal === 'comma') separator = ',';
+        else if (sepVal === 'semicolon') separator = ';';
+      }
+      const tagColMatch = trimmedLine.match(/^#tags\s+column\s*:\s*(\d+)/i);
       if (tagColMatch) {
         tagsColIndex = Number(tagColMatch[1]) - 1;
       }
@@ -951,7 +994,7 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
     }
 
     // 1. Check CEDICT / bracket format: `餐館[餐馆] cān guǎn /restaurant/`
-    const cedictMatch = line.match(/^([^\s\[\],;]+)(?:\[([^\]]+)\])?\s+([a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\s:·]+?)\s+\/(.+)\/$/);
+    const cedictMatch = trimmedLine.match(/^([^\s\[\],;]+)(?:\[([^\]]+)\])?\s+([a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\s:·]+?)\s+\/(.+)\/$/);
     if (cedictMatch && /[\u4e00-\u9fff\u3400-\u4dbf]/.test(cedictMatch[1]) && !targetTagLower) {
       results.push({
         traditional: cedictMatch[1].trim(),
@@ -963,7 +1006,9 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
     }
 
     // 2. Parse delimiter (Tab for AnkiDroid .txt / TSV, or Comma for CSV)
-    const rawFields = line.indexOf('\t') !== -1 ? line.split('\t') : parseCsvLine_(line);
+    const rawFields = (separator === '\t' || rawLine.indexOf('\t') !== -1)
+      ? rawLine.split('\t')
+      : parseCsvLine_(trimmedLine);
     if (rawFields.length === 0) continue;
 
     // Skip obvious header row
@@ -1022,7 +1067,7 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
         continue;
       }
 
-      if (/^[\u4e00-\u9fff\u3400-\u4dbf]{1,12}$/.test(val)) {
+      if (/^[\u4e00-\u9fff\u3400-\u4dbf\uff0c\u3001\u2026\u00b7\u30fb]{1,15}$/.test(val) && /[\u4e00-\u9fff\u3400-\u4dbf]/.test(val)) {
         cjkCols.push(val);
         continue;
       }
@@ -1036,7 +1081,7 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
         continue;
       }
 
-      // Skip the fallback last column if it exactly matches the tag filter or looks like single-token tags
+      // Skip the fallback last column if it matches the tag filter
       if (c === fields.length - 1 && tagsColIndex === -1 && targetTagLower && val.toLowerCase().indexOf(targetTagLower) !== -1) {
         continue;
       }
