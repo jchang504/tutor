@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=7" />
+  <link rel="stylesheet" href="./index.css?v=8" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -223,18 +223,6 @@
           </div>
         </div>
 
-        <div class="field-group">
-          <label for="input-mandarin-speed">Mandarin Speech Speed (Pitch-Preserving)</label>
-          <select id="input-mandarin-speed">
-            <option value="0.60">0.60x (~65% Slower — Extra Slow)</option>
-            <option value="0.68" selected>0.68x (~50% Slower — Recommended)</option>
-            <option value="0.78">0.78x (~30% Slower — Moderate)</option>
-            <option value="0.88">0.88x (~15% Slower)</option>
-            <option value="1.00">1.00x (Normal Native Speed)</option>
-          </select>
-          <span class="field-hint">Slows down Mandarin speech while keeping English sentences at normal speed and preserving natural tone pitch.</span>
-        </div>
-
         <div class="divider-line"></div>
 
         <div class="field-group">
@@ -296,14 +284,14 @@
         </label>
 
         <button id="btn-upload-hanping" class="btn-primary" type="button">
-          Import Filtered Notes to Sheet
+          Import Filtered Notes &amp; Pre-Generate Sentences
         </button>
 
         <div class="divider-line"></div>
 
         <div class="info-callout">
           <strong>2. Supplement from Official Taiwan NAER / TOCFL Dataset (<code>PSeitz/tocfl</code>):</strong><br />
-          Whenever a 20-word session needs more new words than you have queued from AnkiDroid, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending. You can also pre-populate a batch of TOCFL words into your Sheet right now:
+          Whenever a 20-word session needs more new words than you have queued from AnkiDroid, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending and pre-generates simple sentences for them. You can also pre-populate a batch right now:
         </div>
 
         <div class="form-row-2col">
@@ -329,12 +317,24 @@
           Supplement from PSeitz/tocfl
         </button>
 
+        <div class="divider-line"></div>
+
+        <div class="field-group">
+          <label>3. Pre-Generate / Refresh Simple Sentences for Existing Sheet Words</label>
+          <span class="field-hint">
+            English sentences are automatically generated in Apps Script whenever words are imported or finish an SRS review, so sessions start immediately. Tap below to pre-generate or refresh simple everyday sentences for words already in your Sheet:
+          </span>
+          <button id="btn-pregenerate-prompts" class="btn-secondary" type="button" style="margin-top:6px;">
+            Generate / Refresh Simple Sentences in Sheet
+          </button>
+        </div>
+
         <div id="import-result-box" class="info-callout hidden"></div>
       </div>
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=7"></script>
+  <script type="module" src="./app.js?v=8"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -345,7 +345,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=7').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=8').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

@@ -49,11 +49,11 @@ export function buildWordSystemInstruction(word) {
 
   return `你是一位專業、親切、有耐心的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
 
-【語速與難度鐵則（極重要！）】
-1. **中文語速請放慢 50%（比一般說話慢一半）**：當你說台灣華語（中文）時，請務必使用**非常慢、字正腔圓、清楚溫柔的慢速教學語速**。每個字與聲調（一聲、二聲、三聲、四聲、輕聲）都要拉長、咬字清楚，詞與詞之間要有明顯的短暫停頓，讓初學者能輕鬆聽清楚每一個字。
-2. **英文題目保持正常自然語速**：朗讀指定的「英文造句題目（English Prompt）」時，請維持正常的自然英文語速。
-3. **全程使用與目標詞同等級的簡單基礎詞彙**：你對學生說的所有中文回饋與延伸問題，請全部使用**最簡單、最日常的初級生活詞彙（TOCFL 1～2 級基礎詞彙）**，句子要短（每次 1～2 句簡單短句），絕對不要使用艱深詞彙、成語或複雜長句！
-4. 除了朗讀指定的「英文造句題目（English Prompt）」之外，你全程必須 100% 使用自然的台灣華語（繁體中文、台灣慣用詞彙，例如說「聲調、四聲、三聲、餐廳、計程車、公車、早上/晚上」）與學生對話，不要說英文解釋。
+【語速與難度原則（極重要）】
+1. **中文請用對學習者說話的自然慢速**：當你說台灣華語（中文）時，請放慢語速，就像面對華語學習者說話一樣，發音清楚、語調自然流暢。請保持正常的句子連貫感，不要刻意一字一頓或在詞與詞之間做不自然的停頓。
+2. **英文題目保持正常語速**：朗讀指定的「英文造句題目（English Prompt）」時，請維持正常的自然英文語速。
+3. **全程使用與目標詞同等級的簡單日常詞彙**：你對學生說的所有中文回饋與延伸問題，請使用簡單、日常的基礎生活詞彙（TOCFL 1～2 級初級詞彙），句子簡短自然（每次 1～2 句短句），避免艱深詞彙、成語或複雜長句。
+4. 除了朗讀指定的「英文造句題目（English Prompt）」之外，全程請 100% 使用自然的台灣華語（繁體中文、台灣日常用語，例如「聲調、四聲、三聲、餐廳、計程車、公車、早上/晚上」）與學生對話，不要用英文解釋。
 
 【本題目標詞彙（內部資訊，在學生成功說出前請勿直接洩漏讀音）】
 - 目標詞（繁體）：${word.traditional}
@@ -65,24 +65,24 @@ export function buildWordSystemInstruction(word) {
 
 【四階段對話練習流程（請嚴格按順序執行）】
 - **階段一（出題與翻譯糾正）**：
-  1. 對話一開始，請先用正常語速清楚朗讀一次英文題目："${word.english_prompt}"，停頓一下，接著用**慢速、清楚的台灣華語**簡短說：「請試著把這句話翻成中文。」（千萬不要在開頭把目標詞「${word.traditional}」唸出來！）
+  1. 對話一開始，請直接朗讀預先準備好的英文題目："${word.english_prompt}"，接著用對學習者說話的自然慢速台灣華語簡短說：「請試著把這句話翻成中文。」（千萬不要在開頭把目標詞「${word.traditional}」唸出來！）
   2. 仔細聽學生的中文翻譯：
-     - 若學生用了近義詞而非「${word.traditional}」：稱讚句子通順，並慢速提示他換成目標詞（不要直接唸出目標詞讀音，且不計入發音錯誤）。
-     - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、或語法不自然**：請用慢速台灣華語明確指出哪個字幾聲或哪裡語法要調整，慢速示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
+     - 若學生用了近義詞而非「${word.traditional}」：稱讚句子通順，並溫柔提示他換成目標詞（不要直接唸出目標詞讀音，且不計入發音錯誤）。
+     - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、或語法不自然**：請用自然慢速的台灣華語明確指出哪個字幾聲或哪裡語法要調整，清楚示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
      - 若學生問任何旁支問題：請用簡單慢速的台灣華語清楚回答，然後引導他回到這句話的練習。
-     - 若學生主動要求「提示 / Hint」或「直接給我答案」：請慢速給他提示或示範正確句子（並在最後紀錄 \`needed_hint: true\`），但仍請他跟著唸出完整正確的句子一次。
+     - 若學生主動要求「提示 / Hint」或「直接給我答案」：請給他提示或示範正確句子（並在最後紀錄 \`needed_hint: true\`），但仍請他跟著唸出完整正確的句子一次。
   3. 持續互動直到學生親口完整說出包含「${word.traditional}」且發音與語法正確的句子為止。
 
 - **階段二（老師延伸提問）**：
-  當學生成功說出正確句子後，先簡短肯定他（例如：「說得很好！」），並立刻根據這句話的情境，用**非常簡單、慢速的台灣華語**問他一個短小的日常**延伸問題（follow-up question）**（使用基礎詞彙，6～12 個字以內）。
+  當學生成功說出正確句子後，先簡短肯定他（例如：「說得很好！」），並立刻根據這句話的情境，用**簡單、自然慢速的台灣華語**問他一個簡短的日常**延伸問題（follow-up question）**（使用基礎詞彙，6～12 個字以內）。
 
 - **階段三（學生回答＋反問老師）**：
   1. 學生會用中文回答你的問題，並且應該要**順便反問你一個相關的問題**。
-  2. 如果學生的回答有明顯語法或發音錯誤，請簡短慢速幫他修正。
-  3. **關鍵檢查**：如果學生只有回答你的問題，卻忘記反問你問題，請用慢速台灣華語溫柔提醒他：「很好！那你也問我一個問題吧！」並等待他提問。
+  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正。
+  3. **關鍵檢查**：如果學生只有回答你的問題，卻忘記反問你問題，請溫柔提醒他：「很好！那你也問我一個問題吧！」並等待他提問。
 
 - **階段四（老師回答並自動進入下一題）**：
-  當學生提出他的問題後，請用簡單慢速的台灣華語自然、簡短地回答他的問題，說聲「好，我們看下一題！」，並在同一個回合立刻呼叫工具函式 \`complete_word\` 記錄本詞彙的表現數據。
+  當學生提出他的問題後，請用簡單、自然慢速的台灣華語簡短回答他的問題，說聲「好，我們看下一題！」，並在同一個回合立刻呼叫工具函式 \`complete_word\` 記錄本詞彙的表現數據。
 
 【免持語音控制指令】
 如果學生隨時用中文或英文說：
@@ -183,12 +183,6 @@ export class GeminiLiveVoicePipeline {
     this.activeSources = new Set();
     this.pendingActionAfterPlayback = null;
 
-    // Mandarin speech rate (0.68 = ~50% slower Mandarin duration while preserving natural pitch & tones)
-    this.mandarinSpeed = 0.68;
-    this.turnCountForWord = 0;
-    this.turnInputSamplesSeen = 0;
-    this.englishSampleBudget = 0;
-
     // Client-side VAD & 3.0-second silence end-of-turn detector
     this.silenceWaitMs = 3000;
     this.listeningForUser = false;
@@ -202,13 +196,6 @@ export class GeminiLiveVoicePipeline {
     this.replyWatchdogTimer = null;
     this.postPlaybackCooldownUntil = 0;
     this.silencePcm16Base64 = null;
-  }
-
-  setMandarinSpeed(rate) {
-    const num = Number(rate);
-    if (!Number.isNaN(num) && num >= 0.5 && num <= 1.2) {
-      this.mandarinSpeed = num;
-    }
   }
 
   isTutorPlayingAudio() {
@@ -487,7 +474,6 @@ export class GeminiLiveVoicePipeline {
     this.pendingActionAfterPlayback = null;
     this.isActive = true;
     this.currentWord = word;
-    this.turnCountForWord = 0;
 
     const apiKey = liveConfig.apiKey;
     if (!apiKey) {
@@ -518,19 +504,6 @@ export class GeminiLiveVoicePipeline {
       }
     }
     throw lastErr || new Error('Unable to establish Gemini Live WebSocket connection.');
-  }
-
-  _prepareTurnAudioSlowdownBudget(hasLeadingEnglishPrompt) {
-    this.turnInputSamplesSeen = 0;
-    if (hasLeadingEnglishPrompt && this.currentWord && this.currentWord.english_prompt) {
-      const wordCount = this.currentWord.english_prompt.trim().split(/\s+/).filter(Boolean).length || 6;
-      // Normal English speaking rate is ~0.28s per word; keep 1.0x during the English sentence, then slow Mandarin by ~50%
-      const englishSeconds = Math.max(1.2, Math.min(3.5, wordCount * 0.28));
-      this.englishSampleBudget = Math.round(englishSeconds * 24000);
-    } else {
-      // Turns 2, 3, 4 are 100% Mandarin -> slow down from sample 0!
-      this.englishSampleBudget = 0;
-    }
   }
 
   _connectSingleModelSocket(word, apiKey, modelId, voiceName) {
@@ -588,7 +561,6 @@ export class GeminiLiveVoicePipeline {
             this.playChime('start');
             this.tutorTurnActive = true;
             this.listeningForUser = false;
-            this._prepareTurnAudioSlowdownBudget(true);
             this.onStateChange('speaking', 'Tutor reading English prompt...');
 
             // Kick off Phase 1 immediately
@@ -600,7 +572,7 @@ export class GeminiLiveVoicePipeline {
                       role: 'user',
                       parts: [
                         {
-                          text: `請開始第一階段：先用正常語速清楚唸出這題的英文句子 "${word.english_prompt}"，停頓一下，然後用**非常慢（比平常慢 50%）、字正腔圓的台灣華語**請我把這句話翻成中文（千萬不要先把目標詞「${word.traditional}」說出來）。`
+                          text: `請開始第一階段：先用正常語速清楚唸出這題的英文句子 "${word.english_prompt}"，接著用對華語學習者說話的自然慢速台灣華語（語調自然連貫，不要刻意在詞與詞之間停頓）請我把這句話翻成中文（千萬不要先把目標詞「${word.traditional}」說出來）。`
                         }
                       ]
                     }
@@ -652,7 +624,7 @@ export class GeminiLiveVoicePipeline {
   }
 
   _handleServerMessage(msg, ws) {
-    // 1. Handle Server Content (Audio chunks, interruption, transcripts)
+    // 1. Handle Server Content (Audio chunks, interruption, spoken transcripts)
     if (msg.serverContent) {
       const sc = msg.serverContent;
 
@@ -674,6 +646,8 @@ export class GeminiLiveVoicePipeline {
         }
       }
 
+      // Only show `outputTranscription.text` (the actual audio spoken to the user),
+      // never internal `modelTurn.parts[].text` / `part.thought` reasoning traces!
       if (sc.outputTranscription && sc.outputTranscription.text) {
         this.onTranscript('tutor', sc.outputTranscription.text);
       }
@@ -686,25 +660,18 @@ export class GeminiLiveVoicePipeline {
         if (!this.tutorTurnActive) {
           this.tutorTurnActive = true;
           this.listeningForUser = false;
-          // Any subsequent turn after Turn 1 is 100% Mandarin -> slow down all audio!
-          if (this.turnCountForWord > 0) {
-            this._prepareTurnAudioSlowdownBudget(false);
-          }
         }
 
         for (const part of sc.modelTurn.parts) {
           if (part.inlineData && part.inlineData.data) {
-            this.onStateChange('speaking', 'Tutor speaking (slow Mandarin)...');
+            this.onStateChange('speaking', 'Tutor speaking...');
             this._enqueuePcm24kAudio(part.inlineData.data);
-          }
-          if (part.text) {
-            this.onTranscript('tutor_thought', part.text);
           }
         }
       }
 
       if (sc.turnComplete) {
-        this.turnCountForWord += 1;
+        this.onTranscript('turn_end', '');
         this._schedulePostPlaybackCallback(() => {
           if (this.pendingActionAfterPlayback) {
             const fn = this.pendingActionAfterPlayback;
@@ -774,11 +741,10 @@ export class GeminiLiveVoicePipeline {
   /**
    * Sends a text nudge into the active Live session (e.g., if the user taps "Repeat English" or "Hint").
    */
-  sendTextCommand(text, hasEnglishSentence = false) {
+  sendTextCommand(text) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.listeningForUser = false;
     this.tutorTurnActive = true;
-    this._prepareTurnAudioSlowdownBudget(hasEnglishSentence);
     this.ws.send(
       JSON.stringify({
         clientContent: {
@@ -789,78 +755,6 @@ export class GeminiLiveVoicePipeline {
     );
   }
 
-  /**
-   * Pitch-Preserving WSOLA (Waveform Similarity Overlap-Add) time-stretcher for 24kHz mono speech.
-   * Stretches Mandarin speech duration by `1 / speedFactor` (e.g. `speedFactor = 0.68` -> ~50% slower)
-   * without lowering the speaker's pitch or distorting Mandarin tone contours!
-   */
-  _timeStretchWsola(input, speedFactor) {
-    if (!speedFactor || speedFactor >= 0.97 || input.length < 1200) {
-      return input;
-    }
-
-    const W = 600; // 25ms window at 24kHz
-    const Hs = 300; // 12.5ms synthesis hop (50% overlap)
-    const Ha = Math.max(60, Math.round(Hs * speedFactor)); // analysis hop
-    const searchDelta = 132; // +/- 5.5ms pitch period search window
-
-    const outLen = Math.ceil((input.length - W) / Ha) * Hs + W;
-    if (outLen <= W) return input;
-
-    const output = new Float32Array(outLen);
-    if (!this._hannWindow || this._hannWindow.length !== W) {
-      this._hannWindow = new Float32Array(W);
-      for (let i = 0; i < W; i++) {
-        this._hannWindow[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / W));
-      }
-    }
-    const win = this._hannWindow;
-
-    let aTarget = 0;
-    let prevChosen = 0;
-    let sPos = 0;
-    let firstFrame = true;
-
-    while (aTarget + W <= input.length && sPos + W <= output.length) {
-      let chosen = Math.round(aTarget);
-
-      if (!firstFrame) {
-        // Expected natural continuation from the previous chosen frame is `prevChosen + Hs`
-        const naturalNext = prevChosen + Hs;
-        if (naturalNext + Hs <= input.length) {
-          const minOff = Math.max(0, Math.round(aTarget) - searchDelta);
-          const maxOff = Math.min(input.length - W, Math.round(aTarget) + searchDelta);
-          let bestCorr = -Infinity;
-          let bestIdx = chosen;
-
-          // Step by 2 samples for fast cross-correlation over the 300-sample overlap region
-          for (let cand = minOff; cand <= maxOff; cand += 2) {
-            let corr = 0;
-            for (let k = 0; k < Hs; k += 4) {
-              corr += input[cand + k] * input[naturalNext + k];
-            }
-            if (corr > bestCorr) {
-              bestCorr = corr;
-              bestIdx = cand;
-            }
-          }
-          chosen = bestIdx;
-        }
-      }
-
-      for (let i = 0; i < W; i++) {
-        output[sPos + i] += input[chosen + i] * win[i];
-      }
-
-      prevChosen = chosen;
-      aTarget += Ha;
-      sPos += Hs;
-      firstFrame = false;
-    }
-
-    return sPos > 0 ? output.subarray(0, sPos + Hs) : input;
-  }
-
   _enqueuePcm24kAudio(base64Data) {
     if (!this.audioCtx) return;
     const binary = atob(base64Data);
@@ -868,26 +762,17 @@ export class GeminiLiveVoicePipeline {
     const samples = byteLen >> 1;
     if (samples === 0) return;
 
-    const rawFloat32 = new Float32Array(samples);
+    const float32 = new Float32Array(samples);
     for (let i = 0; i < samples; i++) {
       const lo = binary.charCodeAt(i * 2);
       const hi = binary.charCodeAt(i * 2 + 1);
       let int16 = (hi << 8) | lo;
       if (int16 >= 0x8000) int16 -= 0x10000;
-      rawFloat32[i] = int16 / 32768.0;
+      float32[i] = int16 / 32768.0;
     }
 
-    // Keep English prompt at 1.0x speed, and slow down Mandarin speech using pitch-preserving WSOLA
-    let processedSamples = rawFloat32;
-    const prevSeen = this.turnInputSamplesSeen;
-    this.turnInputSamplesSeen += samples;
-
-    if (prevSeen >= this.englishSampleBudget && this.mandarinSpeed < 0.97) {
-      processedSamples = this._timeStretchWsola(rawFloat32, this.mandarinSpeed);
-    }
-
-    const audioBuffer = this.audioCtx.createBuffer(1, processedSamples.length, 24000);
-    audioBuffer.copyToChannel(processedSamples, 0);
+    const audioBuffer = this.audioCtx.createBuffer(1, float32.length, 24000);
+    audioBuffer.copyToChannel(float32, 0);
 
     const src = this.audioCtx.createBufferSource();
     src.buffer = audioBuffer;
