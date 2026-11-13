@@ -334,7 +334,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=10"></script>
+  <script type="module" src="./app.js?v=11"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -345,7 +345,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=10').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=11').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

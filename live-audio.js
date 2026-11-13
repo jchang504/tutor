@@ -581,6 +581,8 @@ export class GeminiLiveVoicePipeline {
 
     const candidateModels = [
       'models/gemini-2.5-flash-native-audio-preview-12-2025',
+      'models/gemini-3.8-live',
+      'models/gemini-3.1-flash-live-preview',
       'models/gemini-2.5-flash-native-audio-latest',
       liveConfig.liveModel,
       liveConfig.fallbackLiveModel

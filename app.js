@@ -14,7 +14,7 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=10';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=11';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 const STORAGE_KEYS = {
@@ -39,7 +39,7 @@ class MandarinTutorApp {
     this.liveAuth = {
       apiKey: localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) || '',
       liveModel: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-      fallbackLiveModel: 'models/gemini-2.5-flash-native-audio-latest',
+      fallbackLiveModel: 'models/gemini-3.8-live',
       voiceName: localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede'
     };
 
@@ -1068,7 +1068,7 @@ class MandarinTutorApp {
           `Saved ${totalPromptsGenerated} Mandarin -> English pairs (${remaining} left)...`;
         const waveRes = await this.callBackend('pregenerate_prompts', {
           forceRefreshAll: false,
-          limit: 90
+          limit: 345
         });
         const newlyUpdated = Number(waveRes.updatedCount || 0);
         totalPromptsGenerated += newlyUpdated;
@@ -1121,7 +1121,7 @@ class MandarinTutorApp {
     try {
       this.els.btnPregeneratePrompts.disabled = true;
       let offset = 0;
-      const limit = 90;
+      const limit = 345;
       let totalUpdated = 0;
       let totalEligible = 0;
       let guard = 0;
@@ -1130,7 +1130,7 @@ class MandarinTutorApp {
         guard++;
         this.els.btnPregeneratePrompts.textContent = totalEligible > 0
           ? `Saved ${totalUpdated} / ${totalEligible} Mandarin -> English pairs...`
-          : 'Generating Mandarin -> English Sentences (Wave 1)...';
+          : 'Generating Mandarin -> English Sentences in Parallel...';
 
         const res = await this.callBackend('pregenerate_prompts', {
           forceRefreshAll: true,
@@ -1142,7 +1142,6 @@ class MandarinTutorApp {
         totalUpdated += Number(res.updatedCount || 0);
 
         if (res.nextOffset === undefined) {
-          // Backward compatibility if Sheet hasn't been redeployed with offset/limit yet
           break;
         }
         offset = Number(res.nextOffset);

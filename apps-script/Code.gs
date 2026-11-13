@@ -75,8 +75,8 @@ const DEFAULT_SETTINGS = {
   NEW_WORD_RATIO: '0.10',
   TOCFL_LEVEL: '2',
   LIVE_MODEL: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-  LIVE_FALLBACK_MODEL: 'models/gemini-2.5-flash-native-audio-latest',
-  BATCH_GEN_MODEL: 'gemini-2.5-flash',
+  LIVE_FALLBACK_MODEL: 'models/gemini-3.8-live',
+  BATCH_GEN_MODEL: 'gemini-3.5-flash-lite',
   VOICE_NAME: 'Aoede',
   DESIRED_RETENTION: '0.90'
 };
@@ -97,7 +97,7 @@ function onOpen() {
 /**
  * Initializes the 3 tabs (`Vocab`, `ReviewLog`, `Settings`) if they don't exist,
  * upgrades `Vocab` headers in-place (`english_prompt`, `mandarin_sentence`),
- * and migrates legacy `BATCH_GEN_MODEL` values to `gemini-2.5-flash`.
+ * and migrates retired Gemini 2.5 batch model IDs to `gemini-3.5-flash-lite`.
  */
 function setupSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -140,8 +140,8 @@ function setupSheet() {
       NEW_WORD_RATIO: 'Target fraction of new words per batch (0.10 = 10%, fills up with new words if fewer reviews are due)',
       TOCFL_LEVEL: 'TOCFL level (1 to 7) to pull supplemental words from PSeitz/tocfl',
       LIVE_MODEL: 'Primary Gemini Live native audio WebSocket model ID',
-      LIVE_FALLBACK_MODEL: 'Fallback Gemini Live model ID if primary model hits quota or is unavailable',
-      BATCH_GEN_MODEL: 'Gemini model used to pre-generate Mandarin -> English sentences (gemini-2.5-flash or gemini-2.5-flash-lite)',
+      LIVE_FALLBACK_MODEL: 'Fallback Gemini Live model ID (e.g. models/gemini-3.8-live)',
+      BATCH_GEN_MODEL: 'Fast Gemini text model for Mandarin -> English sentences (auto-discovers gemini-3.5-flash-lite / gemini-3.8-flash)',
       VOICE_NAME: 'Gemini Live voice (Aoede, Kore, Puck, Charon, Fenrir)',
       DESIRED_RETENTION: 'Target FSRS memory retention probability (default 0.90)'
     };
@@ -150,13 +150,16 @@ function setupSheet() {
     });
     settingsSheet.setFrozenRows(1);
   } else {
-    // Auto-migrate legacy invalid/slow BATCH_GEN_MODEL values (e.g. gemini-3.8-flash) to gemini-2.5-flash
+    // Auto-migrate retired Gemini 2.0 / 2.5 batch models (which return HTTP 404 since Oct 2026) to gemini-3.5-flash-lite
     const sRows = settingsSheet.getDataRange().getValues();
     for (let i = 1; i < sRows.length; i++) {
       const k = String(sRows[i][0] || '').trim();
-      const v = String(sRows[i][1] || '').trim();
-      if (k === 'BATCH_GEN_MODEL' && v && v !== 'gemini-2.5-flash' && v !== 'gemini-2.5-flash-lite') {
-        settingsSheet.getRange(i + 1, 2).setValue('gemini-2.5-flash');
+      const v = String(sRows[i][1] || '').replace(/^models\//, '').trim();
+      if (k === 'BATCH_GEN_MODEL' && (!v || v.indexOf('gemini-2.') === 0 || v.indexOf('gemini-1.') === 0)) {
+        settingsSheet.getRange(i + 1, 2).setValue('gemini-3.5-flash-lite');
+      }
+      if (k === 'LIVE_FALLBACK_MODEL' && v.indexOf('gemini-2.5-flash-native-audio-latest') === 0) {
+        settingsSheet.getRange(i + 1, 2).setValue('models/gemini-3.8-live');
       }
     }
   }
@@ -539,167 +542,331 @@ function interleaveDueAndNew_(dueList, newList) {
 }
 
 /**
- * Enforces strict causal field order (`mandarin_sentence` FIRST, `english_sentence` SECOND)
- * so Gemini always composes an idiomatic Taiwanese Mandarin sentence first and then translates it into English.
+ * Preferred fast text-generation Gemini models (ordered fastest/lowest-latency first).
+ * Note: `gemini-2.5-flash` and `gemini-2.5-flash-lite` were retired in Oct 2026 (HTTP 404).
  */
-const SENTENCE_BATCH_SCHEMA = {
-  type: 'ARRAY',
-  items: {
-    type: 'OBJECT',
-    properties: {
-      traditional: { type: 'STRING' },
-      english_gloss: { type: 'STRING' },
-      mandarin_sentence: { type: 'STRING' },
-      english_sentence: { type: 'STRING' },
-      common_synonyms: { type: 'STRING' }
-    },
-    required: ['traditional', 'english_gloss', 'mandarin_sentence', 'english_sentence', 'common_synonyms'],
-    propertyOrdering: ['traditional', 'english_gloss', 'mandarin_sentence', 'english_sentence', 'common_synonyms']
-  }
-};
+const PREFERRED_FAST_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-3.8-flash',
+  'gemini-flash-latest',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.1-flash-lite'
+];
 
 /**
- * Resolves a verified, fast structured-output Gemini model (`gemini-2.5-flash` or `gemini-2.5-flash-lite`),
- * ignoring legacy/invalid values such as `gemini-3.8-flash` from older Settings sheets.
+ * Dynamically discovers active text-generation Gemini models available on this API key via
+ * `GET /v1beta/models` (cached for 6 hours in `CacheService`), so model retirements never cause 404s.
  */
-function resolveFastBatchModel_(settings) {
-  const raw = String((settings && settings.BATCH_GEN_MODEL) || '')
+function discoverFastGeminiModels_(apiKey, settings) {
+  const configured = String((settings && settings.BATCH_GEN_MODEL) || '')
     .replace(/^models\//, '')
     .trim();
-  if (raw === 'gemini-2.5-flash' || raw === 'gemini-2.5-flash-lite') {
-    return raw;
+  const configuredValid = configured &&
+    configured.indexOf('gemini-2.') !== 0 &&
+    configured.indexOf('gemini-1.') !== 0;
+
+  let availableSet = null;
+  let discoveredFlashList = [];
+
+  try {
+    const cache = (typeof CacheService !== 'undefined' && CacheService.getScriptCache)
+      ? CacheService.getScriptCache()
+      : null;
+    let rawJson = cache ? cache.get('GEMINI_FAST_MODELS_V3') : null;
+
+    if (!rawJson) {
+      const listUrl = 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=' +
+        encodeURIComponent(apiKey);
+      const resp = UrlFetchApp.fetch(listUrl, { method: 'get', muteHttpExceptions: true });
+      if (resp && resp.getResponseCode() === 200) {
+        rawJson = resp.getContentText();
+        if (cache && rawJson && rawJson.length < 95000) {
+          cache.put('GEMINI_FAST_MODELS_V3', rawJson, 21600); // cache for 6 hours
+        }
+      }
+    }
+
+    if (rawJson) {
+      const parsed = JSON.parse(rawJson);
+      const models = (parsed && parsed.models) || [];
+      availableSet = {};
+      models.forEach(function(m) {
+        if (!m || !m.name) return;
+        const id = String(m.name).replace(/^models\//, '');
+        const methods = m.supportedGenerationMethods || [];
+        if (methods.indexOf('generateContent') === -1) return;
+
+        // Exclude non-text / specialized endpoints and retired 1.x / 2.x models
+        if (/(-tts|-image|-live|-audio|embedding|aqa|imagen|veo|robotics|learnlm|gemma|computer-use)/i.test(id)) {
+          return;
+        }
+        if (/^gemini-[12]\./i.test(id)) {
+          return;
+        }
+        availableSet[id] = true;
+        if (/^gemini-.*flash/i.test(id)) {
+          discoveredFlashList.push(id);
+        }
+      });
+    }
+  } catch (e) {
+    // Non-fatal: fall through to PREFERRED_FAST_MODELS
   }
-  return 'gemini-2.5-flash';
+
+  const ordered = [];
+  function addCandidate(id) {
+    if (!id || ordered.indexOf(id) !== -1) return;
+    if (availableSet && Object.keys(availableSet).length > 0 && !availableSet[id]) return;
+    ordered.push(id);
+  }
+
+  if (configuredValid) {
+    addCandidate(configured);
+  }
+  PREFERRED_FAST_MODELS.forEach(addCandidate);
+
+  // Also include any newer `gemini-*-flash-lite` then `gemini-*-flash` models discovered from `/v1beta/models`
+  discoveredFlashList
+    .slice()
+    .sort(function(a, b) {
+      const aLite = a.indexOf('lite') !== -1 ? 1 : 0;
+      const bLite = b.indexOf('lite') !== -1 ? 1 : 0;
+      if (aLite !== bLite) return bLite - aLite;
+      return b.localeCompare(a);
+    })
+    .forEach(addCandidate);
+
+  if (ordered.length === 0) {
+    if (configuredValid) ordered.push(configured);
+    PREFERRED_FAST_MODELS.forEach(function(m) {
+      if (ordered.indexOf(m) === -1) ordered.push(m);
+    });
+  }
+
+  return ordered;
 }
 
 /**
- * Builds the Mandarin-first -> English translation prompt for a chunk of vocabulary words.
+ * Builds a compact Tab-Separated (TSV) Mandarin-first -> English prompt.
+ *
+ * Why TSV instead of JSON + `responseSchema`:
+ * - Cuts output token volume by ~3x and eliminates JSON-schema FSM compilation overhead on the server.
+ * - Putting `mandarin_sentence` in Column 2 and `english_sentence` in Column 3 forces strict left-to-right
+ *   causal generation: Gemini writes the idiomatic Taiwanese Mandarin sentence FIRST, then translates it
+ *   into simple English SECOND.
+ * - Allows 115+ words per request so a 332-word deck finishes in ONE parallel `UrlFetchApp.fetchAll` wave (~5-8s)!
  */
 function buildMandarinFirstPromptText_(wordsChunk) {
-  const itemsPayload = wordsChunk.map(function(w) {
-    return {
-      traditional: w.traditional,
-      pinyin: w.pinyin || '',
-      tocfl_level: w.tocfl_level || 2,
-      english_gloss: w.english_gloss || '',
-      previous_mandarin: w.previous_mandarin || w.mandarin_sentence || ''
-    };
+  const inputLines = wordsChunk.map(function(w) {
+    const trad = String(w.traditional || '').replace(/[\t\r\n]/g, ' ').trim();
+    const pinyin = String(w.pinyin || '').replace(/[\t\r\n]/g, ' ').trim();
+    const lvl = String(w.tocfl_level || 2).trim();
+    const gloss = String(w.english_gloss || '').replace(/[\t\r\n]/g, ' ').trim();
+    const prevZh = String(w.previous_mandarin || w.mandarin_sentence || '').replace(/[\t\r\n]/g, ' ').trim();
+    return [trad, pinyin, 'L' + lvl, gloss, prevZh].join('\t');
   });
 
   return [
-    'You are creating Taiwanese Mandarin speaking practice pairs for a learner.',
-    'Follow this EXACT generation order for every target word so the Mandarin is 100% natural:',
-    '1. `english_gloss`: Concise English meaning in Taiwanese Mandarin usage (keep existing if already clear).',
-    '2. `mandarin_sentence` (GENERATE THIS FIRST!): Write a SHORT, completely natural everyday Taiwanese Mandarin sentence in Traditional Chinese characters (6 to 14 Chinese characters) that naturally uses the exact target word (`traditional`).',
-    '   - Use authentic Taiwan phrasing (e.g., 餐廳, 計程車, 公車, 捷運, 早上, 平常, 順便).',
-    '   - LEVEL RULE: Every OTHER word in `mandarin_sentence` (outside the target word itself) MUST be simple, high-frequency everyday vocabulary (TOCFL Level 1-2 / beginner-elementary words of equal or easier level than the target word). Avoid idioms, literary Chinese, names, or complex multi-clause sentences.',
-    '   - If `previous_mandarin` is non-empty, write a DIFFERENT everyday sentence in a fresh context.',
-    '3. `english_sentence` (TRANSLATE FROM `mandarin_sentence` SECOND!): Translate `mandarin_sentence` into a natural, simple everyday English sentence (5 to 11 words) that accurately conveys the exact meaning of `mandarin_sentence`.',
-    '   - NEVER include Chinese characters or Pinyin inside `english_sentence`.',
-    '4. `common_synonyms`: Comma-separated close Taiwanese Mandarin synonyms the learner might say instead of `traditional` (or empty string if none).',
+    'Generate Taiwanese Mandarin speaking practice pairs for ALL ' + wordsChunk.length + ' target words below.',
+    'Output ONLY plain Tab-Separated Values (TSV), exactly ONE line per input word, with NO header row and NO markdown code fences.',
     '',
-    'Target words JSON:',
-    JSON.stringify(itemsPayload)
+    'Exact 5 columns per line (separated by a single TAB character `\\t` — generate left-to-right in this exact order):',
+    'Col 1: traditional — Exact Traditional Chinese headword from input.',
+    'Col 2: mandarin_sentence — Write this FIRST: a short, natural everyday Taiwanese Mandarin sentence in Traditional Chinese (6 to 14 characters) using the exact Col 1 word. Use Taiwan usage (e.g. 餐廳, 計程車, 公車, 捷運, 早上, 平常, 順便). Every OTHER word in the sentence must be simple beginner/elementary everyday vocabulary (TOCFL 1-2). If input Col 5 has a previous sentence, write a DIFFERENT sentence.',
+    'Col 3: english_sentence — Translate Col 2 SECOND into a simple, natural everyday English sentence (5 to 11 words) with the exact meaning of Col 2. Never put Chinese characters or Pinyin in Col 3.',
+    'Col 4: english_gloss — Concise English meaning of the word (keep input Col 4 if already clear).',
+    'Col 5: common_synonyms — Comma-separated close Taiwanese Mandarin synonyms (or leave empty after tab if none).',
+    '',
+    'Example output line:',
+    '順便\t你可以順便幫我買一杯咖啡嗎？\tCan you buy me a coffee while you are at it?\twhile you are at it\t順道',
+    '',
+    'Input words (traditional \\t pinyin \\t level \\t gloss \\t previous_mandarin_to_avoid):',
+    inputLines.join('\n')
   ].join('\n');
 }
 
-function buildSentenceRequestPayload_(wordsChunk, useSchema) {
-  const genConfig = {
-    temperature: 0.45,
-    responseMimeType: 'application/json',
-    thinkingConfig: { thinkingBudget: 0 }
+/**
+ * Builds the `generateContent` JSON request body using clean Gemini 3.x config:
+ * - Never sends deprecated `temperature` or Gemini-2.5-only `thinkingBudget` (which fail validation on newer models).
+ * - Flash-Lite models (`gemini-3.5-flash-lite`, `gemini-flash-lite-latest`) already default to `minimal` thinking,
+ *   so an empty/minimal config avoids any parameter rejection.
+ * - Standard Flash models (`gemini-3.8-flash`, `gemini-3.6-flash`, etc.) use `thinkingConfig: { thinkingLevel: 'LOW' }`
+ *   so they don't spend extra seconds on default `MEDIUM` reasoning.
+ */
+function buildSentenceRequestPayload_(wordsChunk, modelId, bareConfig) {
+  const payloadObj = {
+    contents: [{ parts: [{ text: buildMandarinFirstPromptText_(wordsChunk) }] }]
   };
-  if (useSchema) {
-    genConfig.responseSchema = SENTENCE_BATCH_SCHEMA;
-  }
-  return JSON.stringify({
-    contents: [{ parts: [{ text: buildMandarinFirstPromptText_(wordsChunk) }] }],
-    generationConfig: genConfig
-  });
-}
-
-function parseSentenceBatchResponseText_(rawText) {
-  if (!rawText) return null;
-  let cleaned = String(rawText).trim();
-  if (cleaned.indexOf('```') === 0) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-  }
-  const parsed = JSON.parse(cleaned);
-  if (!Array.isArray(parsed)) return null;
-  const map = {};
-  parsed.forEach(function(item) {
-    if (!item || !item.traditional) return;
-    const zh = String(item.mandarin_sentence || item.sample_mandarin || '').trim();
-    const en = String(item.english_sentence || item.english_prompt || '').trim();
-    if (zh && en) {
-      map[String(item.traditional).trim()] = {
-        traditional: String(item.traditional).trim(),
-        english_gloss: String(item.english_gloss || '').trim(),
-        mandarin_sentence: zh,
-        sample_mandarin: zh,
-        english_sentence: en,
-        common_synonyms: String(item.common_synonyms || '').trim()
+  if (!bareConfig) {
+    const m = String(modelId || '').toLowerCase();
+    if (m.indexOf('lite') === -1) {
+      payloadObj.generationConfig = {
+        thinkingConfig: { thinkingLevel: 'LOW' }
       };
     }
-  });
-  return map;
+  }
+  return JSON.stringify(payloadObj);
 }
 
 /**
- * Fallback for a single chunk if the parallel wave hit HTTP 429 (Free Tier RPM quota) or transient error.
- * Immediately tries `gemini-2.5-flash-lite` (separate, higher RPM quota bucket) before optional short backoff.
+ * Parses TSV (or pipe-separated / JSON fallback) output from Gemini into a lookup map keyed by `traditional`.
  */
-function generateSingleChunkWithFallback_(wordsChunk, apiKey, primaryModel, allowSleepRetry) {
-  const altModel = primaryModel === 'gemini-2.5-flash-lite' ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite';
-  const attempts = [
-    { model: altModel, useSchema: true, sleepBeforeMs: 0 },
-    { model: primaryModel, useSchema: false, sleepBeforeMs: 0 },
-    { model: altModel, useSchema: false, sleepBeforeMs: allowSleepRetry ? 5000 : -1 }
-  ];
+function parseSentenceBatchResponseText_(rawText) {
+  if (!rawText) return null;
+  let cleaned = String(rawText).trim();
+  if (cleaned.indexOf('```') !== -1) {
+    cleaned = cleaned.replace(/^```[a-zA-Z]*\s*/i, '').replace(/\s*```$/, '').trim();
+  }
+  if (!cleaned) return null;
+
+  const map = {};
+
+  // Fallback support if a model ever returns a JSON array
+  if (cleaned.charAt(0) === '[') {
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed)) {
+        parsed.forEach(function(item) {
+          if (!item || !item.traditional) return;
+          const trad = String(item.traditional).trim();
+          const zh = String(item.mandarin_sentence || item.sample_mandarin || '').trim();
+          const en = String(item.english_sentence || item.english_prompt || '').trim();
+          if (trad && zh && en) {
+            map[trad] = {
+              traditional: trad,
+              mandarin_sentence: zh,
+              sample_mandarin: zh,
+              english_sentence: en,
+              english_gloss: String(item.english_gloss || '').trim(),
+              common_synonyms: String(item.common_synonyms || '').trim()
+            };
+          }
+        });
+        return map;
+      }
+    } catch (e) {}
+  }
+
+  const lines = cleaned.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    let parts = line.indexOf('\t') !== -1 ? line.split('\t') : null;
+    if (!parts && line.indexOf('|') !== -1) {
+      parts = line.split('|');
+    }
+    if (!parts || parts.length < 3) continue;
+
+    const trad = String(parts[0] || '')
+      .replace(/^\d+[\.\)\s]+/, '')
+      .replace(/^[-*•]\s*/, '')
+      .trim();
+    const zh = String(parts[1] || '').trim();
+    const en = String(parts[2] || '').replace(/^["']|["']$/g, '').trim();
+    const gloss = String(parts[3] || '').trim();
+    const syns = String(parts[4] || '').trim();
+
+    // Skip accidental header lines
+    if (!trad || trad.toLowerCase() === 'traditional' || trad.toLowerCase() === 'col 1') continue;
+    // Validate that `zh` has CJK characters and `en` has Latin letters
+    if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(zh) || !/[a-zA-Z]/.test(en)) continue;
+
+    map[trad] = {
+      traditional: trad,
+      mandarin_sentence: zh,
+      sample_mandarin: zh,
+      english_sentence: en,
+      english_gloss: gloss,
+      common_synonyms: syns
+    };
+  }
+
+  return map;
+}
+
+function extractGeminiResponseText_(respText) {
+  const data = JSON.parse(respText);
+  const parts = data &&
+    data.candidates &&
+    data.candidates[0] &&
+    data.candidates[0].content &&
+    data.candidates[0].content.parts;
+  if (!Array.isArray(parts)) return '';
+  const chunks = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] && !parts[i].thought && parts[i].text) {
+      chunks.push(parts[i].text);
+    }
+  }
+  return chunks.join('\n');
+}
+
+function extractApiErrorDetail_(resp, modelId) {
+  if (!resp) return 'No response from ' + modelId;
+  const code = resp.getResponseCode();
+  let msg = '';
+  try {
+    const errObj = JSON.parse(resp.getContentText());
+    if (errObj && errObj.error && errObj.error.message) {
+      msg = ' — ' + String(errObj.error.message).slice(0, 140);
+    }
+  } catch (e) {}
+  return 'HTTP ' + code + ' on ' + modelId + msg;
+}
+
+/**
+ * Fallback across candidate live models (and bare zero-config payload if any parameter is rejected).
+ */
+function generateSingleChunkWithFallback_(wordsChunk, apiKey, candidateModels, failedPrimaryModel) {
+  const attempts = [];
+  // First retry the primary model with bare `{}` config in case `thinkingConfig` caused HTTP 400
+  if (failedPrimaryModel) {
+    attempts.push({ model: failedPrimaryModel, bareConfig: true });
+  }
+  for (let i = 0; i < candidateModels.length && attempts.length < 5; i++) {
+    const m = candidateModels[i];
+    if (m === failedPrimaryModel) continue;
+    attempts.push({ model: m, bareConfig: false });
+  }
+  if (candidateModels.length > 1) {
+    attempts.push({ model: candidateModels[1], bareConfig: true });
+  }
 
   let lastErr = '';
   for (let i = 0; i < attempts.length; i++) {
     const att = attempts[i];
-    if (att.sleepBeforeMs < 0) continue;
-    if (att.sleepBeforeMs > 0) {
-      Utilities.sleep(att.sleepBeforeMs);
-    }
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
       encodeURIComponent(att.model) + ':generateContent?key=' + encodeURIComponent(apiKey);
     try {
       const resp = UrlFetchApp.fetch(url, {
         method: 'post',
         contentType: 'application/json',
-        payload: buildSentenceRequestPayload_(wordsChunk, att.useSchema),
+        payload: buildSentenceRequestPayload_(wordsChunk, att.model, att.bareConfig),
         muteHttpExceptions: true
       });
-      const code = resp.getResponseCode();
-      if (code === 200) {
-        const data = JSON.parse(resp.getContentText());
-        const text = data.candidates &&
-          data.candidates[0] &&
-          data.candidates[0].content &&
-          data.candidates[0].content.parts &&
-          data.candidates[0].content.parts[0] &&
-          data.candidates[0].content.parts[0].text;
+      if (resp.getResponseCode() === 200) {
+        const text = extractGeminiResponseText_(resp.getContentText());
         const map = parseSentenceBatchResponseText_(text);
         if (map && Object.keys(map).length > 0) {
-          return { map: map, error: '' };
+          return { map: map, workingModel: att.model, error: '' };
         }
+        lastErr = 'Empty/unparseable output from ' + att.model;
       } else {
-        lastErr = 'HTTP ' + code + ' on ' + att.model;
+        lastErr = extractApiErrorDetail_(resp, att.model);
       }
     } catch (e) {
-      lastErr = e && e.message ? e.message : String(e);
+      lastErr = (e && e.message ? e.message : String(e)) + ' (' + att.model + ')';
     }
   }
 
-  return { map: {}, error: lastErr || 'Chunk generation failed' };
+  return { map: {}, workingModel: '', error: lastErr || 'All candidate Gemini models failed' };
 }
 
 /**
  * Orders words so blank rows (`!mandarin_sentence || !english_prompt`) and due/active words are generated FIRST.
- * That way even if a huge deck pauses at the time budget, every missing/upcoming word is already saved!
  */
 function sortWordsForPromptGeneration_(words) {
   const nowMs = new Date().getTime();
@@ -717,15 +884,15 @@ function sortWordsForPromptGeneration_(words) {
 }
 
 /**
- * Generates Mandarin-first -> English translation pairs in fast parallel waves (3 x 30 = 90 words/wave)
- * and INCREMENTALLY WRITES & FLUSHES TO THE SHEET AFTER EVERY SINGLE WAVE!
- *
- * Also enforces `maxExecutionMs` (default 240s for Sheets Menu, 45s for Web App HTTP calls)
- * so Apps Script NEVER hits the 360-second execution timeout or loses generated sentences!
+ * High-speed bulk Mandarin -> English sentence generator:
+ * - Dynamically discovers active Flash-Lite / Flash models on `/v1beta/models` (e.g. `gemini-3.5-flash-lite`, `gemini-3.8-flash`).
+ * - Sends up to `3 x 115 = 345` words per parallel `UrlFetchApp.fetchAll` wave using compact TSV lines,
+ *   completing a 332-word deck in ~5-10 seconds in a SINGLE parallel round-trip!
+ * - Writes and flushes to the Sheet immediately after each wave.
  */
 function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
   if (!wordsToUpdate || wordsToUpdate.length === 0) {
-    return { updatedCount: 0, totalRequested: 0, remainingCount: 0, generatedMap: {}, lastError: '' };
+    return { updatedCount: 0, totalRequested: 0, remainingCount: 0, generatedMap: {}, modelUsed: '', lastError: '' };
   }
 
   const opts = options || {};
@@ -736,15 +903,14 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
 
   const effectiveSettings = settings || getSettings_();
   const apiKey = getGeminiApiKey_();
-  const primaryModel = resolveFastBatchModel_(effectiveSettings);
-  const primaryUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+  const candidateModels = discoverFastGeminiModels_(apiKey, effectiveSettings);
+  let activePrimaryModel = candidateModels[0];
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const vocabSheet = ss.getSheetByName(TAB_VOCAB);
   const lastRow = vocabSheet.getLastRow();
   if (lastRow <= 1) {
-    return { updatedCount: 0, totalRequested: wordsToUpdate.length, remainingCount: 0, generatedMap: {}, lastError: '' };
+    return { updatedCount: 0, totalRequested: wordsToUpdate.length, remainingCount: 0, generatedMap: {}, modelUsed: activePrimaryModel, lastError: '' };
   }
 
   const orderedWords = skipSort ? wordsToUpdate.slice() : sortWordsForPromptGeneration_(wordsToUpdate);
@@ -753,7 +919,8 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
   const promptValues = vocabSheet.getRange(2, 19, numDataRows, 1).getValues();
   const extraValues = vocabSheet.getRange(2, 21, numDataRows, 2).getValues();
 
-  const CHUNK_SIZE = 30;
+  // 115 words/chunk x 3 concurrent requests = 345 words in a single ~5-8s parallel wave!
+  const CHUNK_SIZE = 115;
   const WAVE_CONCURRENCY = 3;
   const chunks = [];
   for (let i = 0; i < orderedWords.length; i += CHUNK_SIZE) {
@@ -762,14 +929,13 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
 
   const generatedMap = {};
   let totalUpdated = 0;
-  let processedWords = 0;
   let lastError = '';
 
   if (showSheetToast) {
     ss.toast(
-      'Generating natural Mandarin -> English sentences for ' + orderedWords.length + ' words (' + primaryModel + ')...',
+      'Generating Mandarin -> English pairs for ' + orderedWords.length + ' words in parallel (' + activePrimaryModel + ')...',
       'Mandarin Tutor',
-      6
+      8
     );
   }
 
@@ -779,12 +945,15 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
     }
 
     const waveChunks = chunks.slice(w, w + WAVE_CONCURRENCY);
+    const primaryUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(activePrimaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+
     const requests = waveChunks.map(function(chunk) {
       return {
         url: primaryUrl,
         method: 'post',
         contentType: 'application/json',
-        payload: buildSentenceRequestPayload_(chunk, true),
+        payload: buildSentenceRequestPayload_(chunk, activePrimaryModel, false),
         muteHttpExceptions: true
       };
     });
@@ -798,30 +967,33 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
     }
 
     const waveMap = {};
+    const missedInWave = [];
+
     for (let r = 0; r < waveChunks.length; r++) {
       let chunkMap = null;
       const resp = responses[r];
       if (resp && resp.getResponseCode() === 200) {
         try {
-          const data = JSON.parse(resp.getContentText());
-          const text = data.candidates &&
-            data.candidates[0] &&
-            data.candidates[0].content &&
-            data.candidates[0].content.parts &&
-            data.candidates[0].content.parts[0] &&
-            data.candidates[0].content.parts[0].text;
+          const text = extractGeminiResponseText_(resp.getContentText());
           chunkMap = parseSentenceBatchResponseText_(text);
         } catch (parseErr) {
           lastError = parseErr && parseErr.message ? parseErr.message : String(parseErr);
         }
       } else if (resp) {
-        lastError = 'HTTP ' + resp.getResponseCode() + ' on ' + primaryModel;
+        lastError = extractApiErrorDetail_(resp, activePrimaryModel);
       }
 
       if (!chunkMap || Object.keys(chunkMap).length === 0) {
-        const allowSleep = (new Date().getTime() - startMs + 12000) < maxExecutionMs;
-        const fb = generateSingleChunkWithFallback_(waveChunks[r], apiKey, primaryModel, allowSleep);
+        const fb = generateSingleChunkWithFallback_(
+          waveChunks[r],
+          apiKey,
+          candidateModels,
+          resp && resp.getResponseCode() === 400 ? activePrimaryModel : ''
+        );
         chunkMap = fb.map;
+        if (fb.workingModel) {
+          activePrimaryModel = fb.workingModel;
+        }
         if (fb.error && Object.keys(chunkMap).length === 0) {
           lastError = fb.error;
         }
@@ -831,13 +1003,42 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
         waveMap[tradKey] = chunkMap[tradKey];
         generatedMap[tradKey] = chunkMap[tradKey];
       });
+
+      // Track any occasional straggler rows if a large chunk skipped 1-2 lines
+      if (chunkMap && Object.keys(chunkMap).length > 0) {
+        waveChunks[r].forEach(function(wordObj) {
+          if (!waveMap[wordObj.traditional]) {
+            missedInWave.push(wordObj);
+          }
+        });
+      }
+    }
+
+    // Quick straggler pass if 1-5 words in a 332-word wave were skipped
+    if (missedInWave.length > 0 && missedInWave.length <= 40 && (new Date().getTime() - startMs + 5000) < maxExecutionMs) {
+      const stragglerUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+        encodeURIComponent(activePrimaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+      try {
+        const sResp = UrlFetchApp.fetch(stragglerUrl, {
+          method: 'post',
+          contentType: 'application/json',
+          payload: buildSentenceRequestPayload_(missedInWave, activePrimaryModel, false),
+          muteHttpExceptions: true
+        });
+        if (sResp.getResponseCode() === 200) {
+          const sMap = parseSentenceBatchResponseText_(extractGeminiResponseText_(sResp.getContentText())) || {};
+          Object.keys(sMap).forEach(function(k) {
+            waveMap[k] = sMap[k];
+            generatedMap[k] = sMap[k];
+          });
+        }
+      } catch (e) {}
     }
 
     // Apply this wave's generated sentences and FLUSH IMMEDIATELY to the Google Sheet!
     let waveUpdated = 0;
     let waveGlossModified = false;
     waveChunks.forEach(function(chunk) {
-      processedWords += chunk.length;
       chunk.forEach(function(wordObj) {
         const gen = waveMap[wordObj.traditional];
         if (!gen || !gen.english_sentence || !gen.mandarin_sentence) return;
@@ -866,7 +1067,7 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
 
       if (showSheetToast) {
         ss.toast(
-          'Saved ' + totalUpdated + ' / ' + orderedWords.length + ' Mandarin -> English sentence pairs to Sheet...',
+          'Saved ' + totalUpdated + ' / ' + orderedWords.length + ' Mandarin -> English sentence pairs (' + activePrimaryModel + ')...',
           'Mandarin Tutor',
           5
         );
@@ -874,19 +1075,19 @@ function populateSheetPromptsForWords_(wordsToUpdate, settings, options) {
     }
   }
 
-  const remainingCount = Math.max(0, orderedWords.length - processedWords);
+  const remainingCount = Math.max(0, orderedWords.length - totalUpdated);
   return {
     updatedCount: totalUpdated,
     totalRequested: orderedWords.length,
     remainingCount: remainingCount,
     generatedMap: generatedMap,
+    modelUsed: activePrimaryModel,
     lastError: lastError
   };
 }
 
 /**
  * RPC & Menu handler to pre-generate or refresh Mandarin -> English sentence pairs across active words in `Vocab`.
- * Supports chunked pagination (`offset`, `limit`) for fast live progress from the PWA!
  */
 function handlePregeneratePrompts_(body) {
   const opts = body || {};
@@ -913,18 +1114,22 @@ function handlePregeneratePrompts_(body) {
     skipSort: Boolean(opts.limit)
   });
 
-  // Count how many words in the entire Sheet are still missing sentences (or remaining in slice)
   const remainingAfterSlice = forceRefreshAll
-    ? Math.max(0, allEligible.length - (offset + sliceToProcess.length - res.remainingCount))
+    ? Math.max(0, allEligible.length - (offset + res.updatedCount))
     : Math.max(0, allEligible.length - res.updatedCount);
+
+  if (res.updatedCount === 0 && sliceToProcess.length > 0 && res.lastError && !opts.allowZeroUpdate) {
+    throw new Error('Sentence generation failed (' + res.lastError + ').');
+  }
 
   return {
     ok: true,
     totalEligible: allEligible.length,
-    processedInCall: sliceToProcess.length - res.remainingCount,
+    processedInCall: res.updatedCount,
     updatedCount: res.updatedCount,
-    nextOffset: offset + (sliceToProcess.length - res.remainingCount),
+    nextOffset: offset + sliceToProcess.length,
     remainingCount: remainingAfterSlice,
+    modelUsed: res.modelUsed || '',
     lastError: res.lastError || ''
   };
 }
@@ -934,43 +1139,61 @@ function handlePregeneratePrompts_(body) {
  */
 function menuPregenerateMissingPrompts() {
   setupSheet();
+  const startedAt = new Date().getTime();
   const res = handlePregeneratePrompts_({
     forceRefreshAll: false,
     maxExecutionMs: 245000,
-    showSheetToast: true
+    showSheetToast: true,
+    allowZeroUpdate: true
   });
   if (res.totalEligible === 0) {
     SpreadsheetApp.getUi().alert('All active vocabulary words already have both Mandarin and English sentences!');
     return;
   }
-  const extraMsg = res.remainingCount > 0
-    ? '\n\n' + res.remainingCount + ' words still need sentences (paused safely before Apps Script time/quota limit — click "Generate Missing Mandarin -> English Sentences" once more to finish the rest!).'
-    : '\n\nAll words in your Sheet are now ready!';
-  const errNote = (res.updatedCount === 0 && res.lastError) ? ('\nLast API note: ' + res.lastError) : '';
+  const elapsedSec = ((new Date().getTime() - startedAt) / 1000).toFixed(1);
+  if (res.updatedCount === 0) {
+    SpreadsheetApp.getUi().alert(
+      'Failed to generate sentences (0 of ' + res.totalEligible + ' saved).\n\n' +
+      'Error detail: ' + (res.lastError || 'Unknown API error')
+    );
+    return;
+  }
+  const statusLine = res.remainingCount > 0
+    ? '\n\n' + res.remainingCount + ' words still need sentences — run "Generate Missing Mandarin -> English Sentences" once more to finish them.'
+    : '\n\nAll active words in your Sheet now have natural Mandarin + English sentences!';
   SpreadsheetApp.getUi().alert(
     'Saved natural Mandarin -> English sentence pairs for ' + res.updatedCount +
-    ' of ' + res.totalEligible + ' words missing sentences.' + extraMsg + errNote
+    ' of ' + res.totalEligible + ' words in ' + elapsedSec + 's (model: ' + res.modelUsed + ').' + statusLine
   );
 }
 
 /**
- * Menu Item 2: Refresh All mode — regenerates natural Mandarin -> English pairs across all active words,
- * saving incrementally to the Sheet every ~90 words so zero work is ever lost!
+ * Menu Item 2: Refresh All mode — regenerates natural Mandarin -> English pairs across all active words.
  */
 function menuPregeneratePrompts() {
   setupSheet();
+  const startedAt = new Date().getTime();
   const res = handlePregeneratePrompts_({
     forceRefreshAll: true,
     maxExecutionMs: 245000,
-    showSheetToast: true
+    showSheetToast: true,
+    allowZeroUpdate: true
   });
-  const extraMsg = res.remainingCount > 0
-    ? '\n\n' + res.remainingCount + ' words remaining (saved cleanly before Apps Script 6-min limit — run "Generate Missing..." or run again if needed).'
+  const elapsedSec = ((new Date().getTime() - startedAt) / 1000).toFixed(1);
+  if (res.updatedCount === 0 && res.totalEligible > 0) {
+    SpreadsheetApp.getUi().alert(
+      'Failed to generate sentences (0 of ' + res.totalEligible + ' active words saved).\n\n' +
+      'Error detail: ' + (res.lastError || 'Unknown API error')
+    );
+    return;
+  }
+  const statusLine = res.updatedCount < res.totalEligible
+    ? '\n\n(' + (res.totalEligible - res.updatedCount) + ' words were not updated — run "Generate Missing Mandarin -> English Sentences" to fill them.)' +
+      (res.lastError ? '\nLast API note: ' + res.lastError : '')
     : '\n\n100% of your active vocabulary words now have natural Mandarin + English sentences saved in the Sheet!';
-  const errNote = (res.updatedCount === 0 && res.lastError) ? ('\nLast API note: ' + res.lastError) : '';
   SpreadsheetApp.getUi().alert(
     'Saved natural Mandarin -> English sentence pairs for ' + res.updatedCount +
-    ' of ' + res.totalEligible + ' active vocabulary words.' + extraMsg + errNote
+    ' of ' + res.totalEligible + ' active vocabulary words in ' + elapsedSec + 's (model: ' + res.modelUsed + ').' + statusLine
   );
 }
 
@@ -982,7 +1205,7 @@ function getLiveSessionAuth_(settings) {
   return {
     apiKey: apiKey,
     liveModel: settings.LIVE_MODEL || 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-    fallbackLiveModel: settings.LIVE_FALLBACK_MODEL || 'models/gemini-2.5-flash-native-audio-latest',
+    fallbackLiveModel: settings.LIVE_FALLBACK_MODEL || 'models/gemini-3.8-live',
     voiceName: settings.VOICE_NAME || 'Aoede'
   };
 }
