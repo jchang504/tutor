@@ -678,85 +678,126 @@ class MandarinTutorApp {
   }
 
   /**
-   * File picker for AnkiDroid Plain Text (.txt) exports, Hanping local backups (.bak/.gz/.json), or CSV/TSV.
+   * File picker for AnkiDroid Plain Text (.txt) exports.
+   * Detects empty Filtered Deck exports and auto-discovers all Anki tags in the file.
    */
   async handleFilePicked(event) {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
 
     try {
-      const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      let text = '';
-
-      // 1. Check for GZIP magic bytes (0x1f 0x8b) used by Hanping local backups (.bak / .gz)
-      if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b && 'DecompressionStream' in window) {
-        const ds = new DecompressionStream('gzip');
-        const decompressedStream = new Blob([bytes]).stream().pipeThrough(ds);
-        const decompressedBuf = await new Response(decompressedStream).arrayBuffer();
-        text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(decompressedBuf));
-      } else {
-        text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-      }
-
-      // 2. If the decoded content contains null bytes (e.g. a binary SQLite backup file),
-      // extract clean printable lines / CJK + Pinyin segments
-      if (text.includes('\u0000')) {
-        text = this.extractVocabFromBinaryText(text);
-      }
-
+      const text = await file.text();
       this.els.textareaHanpingCsv.value = text;
-      const lineCount = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#')).length;
-      this.showToast(`Loaded ${file.name} (${lineCount} entries ready to import).`, 'info');
+      const dataLines = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
+
+      if (dataLines.length === 0) {
+        this.els.importResultBox.classList.remove('hidden');
+        this.els.importResultBox.textContent =
+          `Note: "${file.name}" contains 0 notes (only Anki header lines). This happens when exporting an empty Filtered Deck in AnkiDroid. Instead, export your main parent deck (e.g. "Everyday" or "All decks") as "Notes in Plain Text (.txt)" with "Include tags" checked, then choose your tag in the filter above!`;
+        this.showToast(`"${file.name}" has 0 notes (empty Filtered Deck). Export your main deck instead!`, 'error');
+        this.populateAnkiTagOptions('');
+        return;
+      }
+
+      const tagCount = this.populateAnkiTagOptions(text);
+      this.els.importResultBox.classList.add('hidden');
+      this.showToast(
+        `Loaded ${file.name}: ${dataLines.length} notes (${tagCount} tags detected).`,
+        'info'
+      );
     } catch (err) {
       this.showToast(`Could not read ${file.name}: ${err.message}`, 'error');
     }
   }
 
   /**
-   * Fallback extractor if a user selects a binary SQLite / Anki / Hanping backup file:
-   * pulls out `\x1f`-delimited Anki note fields or CJK headwords.
+   * Scans an AnkiDroid "Notes in Plain Text (.txt)" file for `#tags column:N` (or the last tab column)
+   * and populates the tag filter dropdown with all discovered tags and their note counts.
    */
-  extractVocabFromBinaryText(raw) {
-    const outLines = [];
-    // Anki SQLite `notes.flds` separates fields with ASCII Unit Separator (0x1f)
-    if (raw.includes('\x1f')) {
-      const chunks = raw.split(/[\x00-\x08\x0b-\x1e]+/);
-      for (const chunk of chunks) {
-        if (chunk.includes('\x1f') && /[\u4e00-\u9fff]/.test(chunk)) {
-          const tabLine = chunk.replace(/\x1f/g, '\t').replace(/[^\x09\x20-\x7e\u00a0-\uffff]/g, '').trim();
-          if (tabLine) outLines.push(tabLine);
-        }
+  populateAnkiTagOptions(rawText) {
+    if (!this.els.selectAnkiTag) return 0;
+    const lines = String(rawText || '').split(/\r?\n/);
+    let tagsColIndex = -1;
+    const tagCounts = new Map();
+    let totalNotes = 0;
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('#')) {
+        const m = line.match(/^#tags\s+column:(\d+)/i);
+        if (m) tagsColIndex = Number(m[1]) - 1;
+        continue;
       }
-      if (outLines.length > 0) return outLines.join('\n');
+      if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(line)) continue;
+      const cols = line.split('\t');
+      if (cols.length < 2) continue;
+      totalNotes++;
+
+      const colIdx = tagsColIndex >= 0 && tagsColIndex < cols.length ? tagsColIndex : cols.length - 1;
+      const rawTagsCell = (cols[colIdx] || '').trim();
+      if (!rawTagsCell || /[\u4e00-\u9fff]/.test(rawTagsCell)) continue;
+
+      const tokens = rawTagsCell.split(/\s+/).filter(Boolean);
+      for (const tok of tokens) {
+        // Ignore plain English definitions that happen to be in the last column when tags aren't exported
+        if (tagsColIndex === -1 && tokens.length > 4) continue;
+        tagCounts.set(tok, (tagCounts.get(tok) || 0) + 1);
+      }
     }
 
-    // Otherwise extract unique CJK vocabulary tokens
-    const matches = raw.match(/[\u4e00-\u9fff]{1,8}/g) || [];
-    const unique = [...new Set(matches)];
-    return unique.join('\n');
+    const currentVal = this.els.inputAnkiTag.value.trim();
+    const sortedTags = [...tagCounts.entries()].sort((a, b) => b[1] - a[1]);
+
+    this.els.selectAnkiTag.innerHTML = '';
+    const allOpt = document.createElement('option');
+    allOpt.value = '';
+    allOpt.textContent = `All Notes in File (${totalNotes} notes)`;
+    this.els.selectAnkiTag.appendChild(allOpt);
+
+    for (const [tag, count] of sortedTags) {
+      const opt = document.createElement('option');
+      opt.value = tag;
+      opt.textContent = `${tag} (${count} notes)`;
+      if (currentVal && tag.toLowerCase() === currentVal.toLowerCase()) {
+        opt.selected = true;
+      }
+      this.els.selectAnkiTag.appendChild(opt);
+    }
+
+    return sortedTags.length;
   }
 
   async uploadHanpingCsv() {
     const csvText = this.els.textareaHanpingCsv.value.trim();
+    const tagFilter = (this.els.inputAnkiTag ? this.els.inputAnkiTag.value : '').trim();
     if (!csvText) {
-      this.showToast('Please select an AnkiDroid .txt export, Hanping backup, or paste rows first.', 'error');
+      this.showToast('Please select an AnkiDroid .txt export file or paste rows first.', 'error');
+      return;
+    }
+    const dataLines = csvText.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
+    if (dataLines.length === 0) {
+      this.showToast(
+        'This file has 0 notes (only # header lines from an empty Filtered Deck). Export your main parent deck with "Include tags" checked instead.',
+        'error'
+      );
       return;
     }
     try {
       this.els.btnUploadHanping.disabled = true;
       this.els.btnUploadHanping.textContent = 'Importing & Cross-Referencing TOCFL...';
-      const res = await this.callBackend('import_hanping', { csvText });
+      const res = await this.callBackend('import_hanping', { csvText, tagFilter });
       this.els.importResultBox.classList.remove('hidden');
+      const tagSummary = tagFilter ? ` matching tag "${tagFilter}"` : '';
       this.els.importResultBox.textContent =
-        `Imported ${res.addedCount} new words into Google Sheet (${res.skippedDuplicate} existing duplicates preserved).`;
-      this.showToast(`Added ${res.addedCount} words to Sheet!`, 'success');
+        `Imported ${res.addedCount} new words${tagSummary} into Google Sheet (${res.skippedDuplicate} existing duplicates preserved).`;
+      this.showToast(`Added ${res.addedCount} words${tagSummary} to Sheet!`, 'success');
       await this.refreshBackendStatus(false);
     } catch (err) {
       this.showToast(err.message, 'error');
     } finally {
       this.els.btnUploadHanping.disabled = false;
-      this.els.btnUploadHanping.textContent = 'Import Vocab to Sheet';
+      this.els.btnUploadHanping.textContent = 'Import AnkiDroid Notes to Sheet';
     }
   }
 

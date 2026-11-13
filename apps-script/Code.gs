@@ -841,11 +841,12 @@ function handleWordAction_(body) {
  */
 function handleImportHanping_(body) {
   const csvText = String(body.csvText || '').trim();
+  const tagFilter = String(body.tagFilter || '').trim();
   if (!csvText) {
-    throw new Error('Empty Hanping CSV text.');
+    throw new Error('Empty AnkiDroid export text.');
   }
 
-  // Also cross-reference PSeitz/tocfl if cached so Hanping/AnkiDroid words get Zhuyin, TOCFL level & spoken frequency!
+  // Also cross-reference PSeitz/tocfl if cached so AnkiDroid words get Zhuyin, TOCFL level & spoken frequency!
   let tocflMap = {};
   try {
     tocflMap = fetchTocflLookupMap_();
@@ -853,9 +854,12 @@ function handleImportHanping_(body) {
     // Non-fatal if GitHub fetch fails during import
   }
 
-  const parsedEntries = parseHanpingText_(csvText, tocflMap);
+  const parsedEntries = parseHanpingText_(csvText, tocflMap, tagFilter);
   if (parsedEntries.length === 0) {
-    throw new Error('No valid Chinese vocabulary rows found in the provided file.');
+    if (tagFilter) {
+      throw new Error('No Chinese vocabulary notes found matching tag "' + tagFilter + '". Make sure "Include tags" was checked when exporting from AnkiDroid.');
+    }
+    throw new Error('No Chinese vocabulary notes found in the file. (If you exported an empty Filtered Deck, export your main parent deck or "All decks" as "Notes in Plain Text (.txt)" with "Include tags" checked instead.)');
   }
 
   const existing = readAllVocab_();
@@ -878,7 +882,7 @@ function handleImportHanping_(body) {
     }
 
     const tocflHit = tocflMap[trad] || {};
-    const rowId = 'hp_' + new Date().getTime() + '_' + idx;
+    const rowId = 'anki_' + new Date().getTime() + '_' + idx;
     const row = [
       rowId,
       trad,
@@ -886,7 +890,7 @@ function handleImportHanping_(body) {
       entry.pinyin || tocflHit.pinyin || '',
       entry.zhuyin || tocflHit.zhuyin || '',
       entry.english_gloss || '',
-      'hanping',
+      'ankidroid',
       tocflHit.tocfl_level || '',
       tocflHit.spoken_per_million || 0,
       tocflHit.written_per_million || 0,
@@ -913,56 +917,21 @@ function handleImportHanping_(body) {
     ok: true,
     addedCount: newRows.length,
     skippedDuplicate: skippedDuplicate,
-    totalParsed: parsedEntries.length
+    totalParsed: parsedEntries.length,
+    tagFilter: tagFilter
   };
 }
 
 /**
- * Flexible parser for:
- * 1. AnkiDroid "Notes in Plain Text (.txt)" / "Cards in Plain Text (.txt)" (including `Hanping Chinese Type` notes,
- *    optional GUID/notetype/deck prefix columns, `#...` header directives, HTML spans, and `[sound:...]` tags)
- * 2. Hanping Local Backup JSON / JSONL or plain-text word lists
- * 3. Standard Hanping CSV/TSV or CC-CEDICT (`傳統[传统] chuán tǒng /tradition/`)
+ * Parser for AnkiDroid "Notes in Plain Text (.txt)" / "Cards in Plain Text (.txt)" exports
+ * (including `Hanping Chinese Type` notes, `#tags column:N` headers, optional tag filtering,
+ * HTML spans, and `[sound:...]` tags).
  */
-function parseHanpingText_(rawText, tocflMap) {
+function parseHanpingText_(rawText, tocflMap, tagFilter) {
   const trimmed = String(rawText || '').trim();
   if (!trimmed) return [];
   const lookup = tocflMap || {};
-
-  // 0. Check if input is a JSON array or object (e.g. from a Hanping local backup or JSON export)
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      const parsedJson = JSON.parse(trimmed);
-      const list = Array.isArray(parsedJson)
-        ? parsedJson
-        : (parsedJson.words || parsedJson.items || parsedJson.vocab || parsedJson.starred || parsedJson.entries || []);
-      if (Array.isArray(list) && list.length > 0) {
-        const jsonResults = [];
-        list.forEach(function(item) {
-          if (typeof item === 'string') {
-            const sub = parseHanpingText_(item, lookup);
-            if (sub.length > 0) jsonResults.push(sub[0]);
-          } else if (item && typeof item === 'object') {
-            const trad = String(item.traditional || item.trad || item.hanzi || item.headword || item.word || item.text || '').trim();
-            const simp = String(item.simplified || item.simp || '').trim();
-            const pinyin = String(item.pinyin || item.pronunciation || '').trim();
-            const gloss = cleanAnkiHtml_(String(item.english_gloss || item.english || item.definition || item.defn || item.meaning || item.gloss || ''));
-            if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(trad)) {
-              jsonResults.push({
-                traditional: trad,
-                simplified: simp,
-                pinyin: pinyin,
-                english_gloss: gloss
-              });
-            }
-          }
-        });
-        if (jsonResults.length > 0) return jsonResults;
-      }
-    } catch (e) {
-      // Fall through to line-by-line parsing
-    }
-  }
+  const targetTagLower = String(tagFilter || '').trim().toLowerCase();
 
   const lines = trimmed.split(/\r?\n/);
   const results = [];
@@ -981,9 +950,9 @@ function parseHanpingText_(rawText, tocflMap) {
       continue;
     }
 
-    // 1. Check CEDICT / Hanping bracket format: `餐館[餐馆] cān guǎn /restaurant/` or `餐館 cān guǎn /restaurant/`
+    // 1. Check CEDICT / bracket format: `餐館[餐馆] cān guǎn /restaurant/`
     const cedictMatch = line.match(/^([^\s\[\],;]+)(?:\[([^\]]+)\])?\s+([a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\s:·]+?)\s+\/(.+)\/$/);
-    if (cedictMatch && /[\u4e00-\u9fff\u3400-\u4dbf]/.test(cedictMatch[1])) {
+    if (cedictMatch && /[\u4e00-\u9fff\u3400-\u4dbf]/.test(cedictMatch[1]) && !targetTagLower) {
       results.push({
         traditional: cedictMatch[1].trim(),
         simplified: (cedictMatch[2] || '').trim(),
@@ -1003,6 +972,22 @@ function parseHanpingText_(rawText, tocflMap) {
       continue;
     }
 
+    // Extract tags from the designated `#tags column:N` (or the last column if `#tags column` wasn't specified)
+    const effectiveTagCol = (tagsColIndex >= 0 && tagsColIndex < rawFields.length)
+      ? tagsColIndex
+      : (rawFields.length >= 4 ? rawFields.length - 1 : -1);
+    const rawTagsStr = effectiveTagCol >= 0 ? cleanAnkiHtml_(rawFields[effectiveTagCol]) : '';
+    const rowTags = rawTagsStr ? rawTagsStr.split(/\s+/).filter(Boolean) : [];
+
+    // If the user specified a tagFilter (e.g. a Hanping tag), check if this note carries that tag
+    if (targetTagLower) {
+      const hasMatchingTag = rowTags.some(function(t) {
+        const tl = t.toLowerCase();
+        return tl === targetTagLower || tl.endsWith('::' + targetTagLower);
+      });
+      if (!hasMatchingTag) continue;
+    }
+
     // Clean HTML & [sound:...] from all fields
     const fields = rawFields.map(function(f, idx) {
       if (tagsColIndex !== -1 && idx === tagsColIndex) return '';
@@ -1011,7 +996,7 @@ function parseHanpingText_(rawText, tocflMap) {
 
     // Scan fields to find Chinese headword column(s), Pinyin column, and English definition column.
     // This automatically skips AnkiDroid leading metadata columns like GUID (`k8J9a!2x`),
-    // Note Type (`Hanping Chinese Type`), or Deck Name (`Chinese::Hanping`).
+    // Note Type (`Hanping Chinese Type`), or Deck Name (`Everyday` / `Chinese::Hanping`).
     const cjkCols = [];
     let pinyin = '';
     const glossParts = [];
@@ -1021,7 +1006,7 @@ function parseHanpingText_(rawText, tocflMap) {
       if (!val) continue;
 
       // Skip Anki metadata columns
-      if (/^hanping\s+chinese/i.test(val) || /^chinese::/i.test(val) || /^default$/i.test(val)) {
+      if (/^hanping\s+chinese/i.test(val) || /^chinese::/i.test(val) || /^everyday/i.test(val) || /^default$/i.test(val)) {
         continue;
       }
       // Skip Anki GUID in col 0..1 (8-12 ASCII chars with no spaces and no CJK, when there are 4+ columns)
@@ -1051,6 +1036,11 @@ function parseHanpingText_(rawText, tocflMap) {
         continue;
       }
 
+      // Skip the fallback last column if it exactly matches the tag filter or looks like single-token tags
+      if (c === fields.length - 1 && tagsColIndex === -1 && targetTagLower && val.toLowerCase().indexOf(targetTagLower) !== -1) {
+        continue;
+      }
+
       // Detect English definition column (contains Latin letters, not just a single tag token)
       if (/[a-zA-Z]{2,}/.test(val) && !/^(hanping|starred|tocfl|anki)/i.test(val)) {
         glossParts.push(val);
@@ -1075,7 +1065,8 @@ function parseHanpingText_(rawText, tocflMap) {
       traditional: trad,
       simplified: simp === trad ? '' : simp,
       pinyin: pinyin,
-      english_gloss: glossParts.join('; ').trim()
+      english_gloss: glossParts.join('; ').trim(),
+      notes: rowTags.length > 0 ? ('Tags: ' + rowTags.join(' ')) : ''
     });
   }
 

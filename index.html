@@ -238,33 +238,48 @@
   <div id="drawer-import" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="import-title">
     <div class="modal-sheet">
       <div class="modal-header">
-        <h2 id="import-title">Sync Vocab (Hanping &amp; TOCFL)</h2>
+        <h2 id="import-title">Sync Vocab (AnkiDroid &amp; TOCFL)</h2>
         <button id="btn-close-import" class="btn-secondary" type="button">Close</button>
       </div>
 
       <div class="form-grid">
         <div class="field-group">
-          <label for="file-hanping-csv">1. Import from AnkiDroid (<code>.txt</code>) or Hanping Backup / Export</label>
-          <input id="file-hanping-csv" type="file" accept=".txt,.csv,.tsv,.json,.bak,.gz,.hbackup" />
+          <label for="file-hanping-csv">1. Select AnkiDroid Plain Text Export (<code>.txt</code>)</label>
+          <input id="file-hanping-csv" type="file" accept=".txt,.tsv,.csv" />
           <span class="field-hint">
-            <strong>Free AnkiDroid Workaround:</strong> In AnkiDroid, tap <strong>⋮ &rarr; Export</strong>, choose <strong>Export format: Notes in Plain Text (.txt)</strong>, and pick that <code>.txt</code> file here! Also supports Hanping Local Backup files (<code>.bak</code> / <code>.gz</code> / <code>.json</code>) and CSV/TSV exports. Automatically cross-references <code>PSeitz/tocfl</code> for Zhuyin &amp; spoken frequency.
+            In AnkiDroid, export your <strong>main parent deck</strong> (e.g. <code>Everyday</code> or <code>All decks</code> — <em>not</em> an empty Filtered Deck) as <strong>Notes in Plain Text (.txt)</strong> with <strong>Include tags</strong> checked. Your normal Anki deck &amp; scheduling stay 100% untouched!
           </span>
         </div>
 
+        <div class="form-row-2col">
+          <div class="field-group">
+            <label for="select-anki-tag">Filter by Tag Detected in File</label>
+            <select id="select-anki-tag">
+              <option value="">All Notes in File (No Tag Filter)</option>
+            </select>
+            <span class="field-hint">Auto-populated from <code>#tags column</code> when you pick a file.</span>
+          </div>
+          <div class="field-group">
+            <label for="input-anki-tag">Or Type Tag Name Manually</label>
+            <input id="input-anki-tag" type="text" placeholder="e.g. Hanping::Starred" autocomplete="off" />
+            <span class="field-hint">Only notes carrying this tag will be imported.</span>
+          </div>
+        </div>
+
         <div class="field-group">
-          <label for="textarea-hanping-csv">Or Paste AnkiDroid / Hanping Rows Directly</label>
-          <textarea id="textarea-hanping-csv" placeholder="餐館&#9;餐馆&#9;cān guǎn&#9;restaurant&#10;順便,shùn biàn,conveniently; in passing"></textarea>
+          <label for="textarea-hanping-csv">Preview / Paste AnkiDroid Notes (Tab-Separated)</label>
+          <textarea id="textarea-hanping-csv" placeholder="#separator:tab&#10;#html:false&#10;#tags column:4&#10;餐館&#9;cān guǎn&#9;restaurant&#9;my_tag"></textarea>
         </div>
 
         <button id="btn-upload-hanping" class="btn-primary" type="button">
-          Import Vocab to Sheet
+          Import AnkiDroid Notes to Sheet
         </button>
 
         <div class="divider-line"></div>
 
         <div class="info-callout">
           <strong>2. Supplement from Official Taiwan NAER / TOCFL Dataset (<code>PSeitz/tocfl</code>):</strong><br />
-          Whenever a 20-word session needs more new words than you have queued from Hanping, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending. You can also pre-populate a batch of TOCFL words into your Sheet right now:
+          Whenever a 20-word session needs more new words than you have queued from AnkiDroid, the backend automatically pulls new words from your target TOCFL level sorted by <code>spoken_per_million</code> descending. You can also pre-populate a batch of TOCFL words into your Sheet right now:
         </div>
 
         <div class="form-row-2col">
