@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tw-mandarin-tutor-v4';
+const CACHE_NAME = 'tw-mandarin-tutor-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -30,6 +30,14 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((networkResp) => {
+        if (networkResp && networkResp.ok && event.request.url.startsWith(self.location.origin)) {
+          const clone = networkResp.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
+        return networkResp;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

@@ -768,14 +768,56 @@ class MandarinTutorApp {
     return sortedTags.length;
   }
 
+  /**
+   * Filters AnkiDroid plain-text lines client-side by `tagFilter` (case-insensitive)
+   * using `#tags column:N` (or the last tab column). Preserves `#...` header lines.
+   * Doing this client-side ensures tag filtering works even before redeploying Apps Script,
+   * and reduces payload size to Google Sheets.
+   */
+  filterAnkiTextByTag(rawText, tagFilter) {
+    const target = String(tagFilter || '').trim().toLowerCase();
+    if (!target) return rawText;
+
+    const lines = String(rawText || '').split(/\r?\n/);
+    let tagsColIndex = -1;
+    const headerLines = [];
+    const matchedLines = [];
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('#')) {
+        headerLines.push(line);
+        const m = line.match(/^#tags\s+column:(\d+)/i);
+        if (m) tagsColIndex = Number(m[1]) - 1;
+        continue;
+      }
+      const cols = rawLine.split('\t');
+      const colIdx = tagsColIndex >= 0 && tagsColIndex < cols.length ? tagsColIndex : cols.length - 1;
+      const rawTagsCell = (cols[colIdx] || '').trim();
+      if (!rawTagsCell) continue;
+      const tags = rawTagsCell.split(/\s+/).filter(Boolean);
+      const isMatch = tags.some((t) => {
+        const tl = t.toLowerCase();
+        return tl === target || tl.endsWith('::' + target);
+      });
+      if (isMatch) {
+        matchedLines.push(rawLine);
+      }
+    }
+
+    if (matchedLines.length === 0) return '';
+    return [...headerLines, ...matchedLines].join('\n');
+  }
+
   async uploadHanpingCsv() {
-    const csvText = this.els.textareaHanpingCsv.value.trim();
+    const rawCsvText = this.els.textareaHanpingCsv.value.trim();
     const tagFilter = (this.els.inputAnkiTag ? this.els.inputAnkiTag.value : '').trim();
-    if (!csvText) {
+    if (!rawCsvText) {
       this.showToast('Please select an AnkiDroid .txt export file or paste rows first.', 'error');
       return;
     }
-    const dataLines = csvText.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
+    const dataLines = rawCsvText.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
     if (dataLines.length === 0) {
       this.showToast(
         'This file has 0 notes (only # header lines from an empty Filtered Deck). Export your main parent deck with "Include tags" checked instead.',
@@ -783,6 +825,13 @@ class MandarinTutorApp {
       );
       return;
     }
+
+    const csvText = tagFilter ? this.filterAnkiTextByTag(rawCsvText, tagFilter) : rawCsvText;
+    if (!csvText) {
+      this.showToast(`No notes found with tag "${tagFilter}" in the loaded text.`, 'error');
+      return;
+    }
+
     try {
       this.els.btnUploadHanping.disabled = true;
       this.els.btnUploadHanping.textContent = 'Importing & Cross-Referencing TOCFL...';

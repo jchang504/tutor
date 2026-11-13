@@ -1083,6 +1083,7 @@ function cleanAnkiHtml_(str) {
     .replace(/<br\s*\/?>/gi, '; ')
     .replace(/<\/div\s*>/gi, '; ')
     .replace(/<[^>]+>/g, '')
+    .replace(/%27/gi, "'")
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
