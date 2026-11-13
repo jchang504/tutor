@@ -14,7 +14,7 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { GeminiLiveVoicePipeline } from './live-audio.js';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=9';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 const STORAGE_KEYS = {
@@ -162,11 +162,16 @@ class MandarinTutorApp {
     });
 
     // Giant eyes-free tap zone on the main orb:
-    // - If waiting for user speech, tapping the orb immediately commits the user's turn ("Done Speaking")
+    // - If disconnected after retries, tapping reconnects the current word in place
+    // - If waiting for user speech, tapping immediately commits the user's turn ("Done Speaking")
     // - Otherwise starts or pauses/resumes the session
     this.els.voiceOrb.addEventListener('click', () => {
       if (!this.sessionActive) {
         this.startDrivingSession();
+      } else if (!this.sessionPaused && this.pipeline.isDisconnected()) {
+        this.pipeline.reconnectCurrentWord().catch((err) => {
+          this.showToast(err.message || 'Reconnect failed — tap again when online.', 'error');
+        });
       } else if (!this.sessionPaused && this.pipeline.isWaitingForUser()) {
         this.pipeline.finishUserTurnNow();
       } else {
@@ -715,6 +720,18 @@ class MandarinTutorApp {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && this.sessionActive && !this.sessionPaused) {
         this.requestWakeLock();
+        if (this.pipeline.audioCtx && this.pipeline.audioCtx.state === 'suspended') {
+          this.pipeline.audioCtx.resume().catch(() => {});
+        }
+        if (this.pipeline.isDisconnected()) {
+          this.pipeline.reconnectCurrentWord().catch(() => {});
+        }
+      }
+    });
+
+    window.addEventListener('online', () => {
+      if (this.sessionActive && !this.sessionPaused && this.pipeline.isDisconnected()) {
+        this.pipeline.reconnectCurrentWord().catch(() => {});
       }
     });
   }
