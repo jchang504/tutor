@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v14):
+ * Key architectural guarantees (v15):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -13,12 +13,18 @@
  * 4. Mid-sentence crash recovery: if a cellular drop or server `1011` interrupts the tutor
  *    BEFORE `turnComplete`, auto-reconnect rotates to the next healthy Live model immediately
  *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
+ * 5. Smart context- & sentence-completeness-aware endpointing (~850–1100ms on completed sentences,
+ *    ~1950ms on incomplete mid-sentence pauses, and ~2650ms on the Phase 2->3 Reply & Ask Back turn)
+ *    paired with clean digital-zero 16kHz PCM gating so server VAD responds fast without road-noise lag.
  */
 
-import { debugLogger } from './debug-logger.js?v=14';
+import { debugLogger } from './debug-logger.js?v=15';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+
+// 1600 samples @ 16kHz (3200 zero bytes) = exact 100ms frame of pure digital silence
+const ZERO_PCM16_100MS_BASE64 = btoa('\0'.repeat(3200));
 
 const WORKLET_CODE = `
 class PcmRecorderProcessor extends AudioWorkletProcessor {
@@ -70,6 +76,199 @@ export function detectSpokenTerminalCue(spokenText = '') {
     return { type: 'complete_word' };
   }
   return null;
+}
+
+/**
+ * Detects whether a Mandarin string contains an actual question (excluding declarative
+ * negative phrases like `沒做什麼` / `不知道去哪裡` that are statements rather than questions).
+ */
+export function containsMandarinQuestion(text = '') {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  if (/[？?]/.test(s)) return true;
+
+  const strippedDeclaratives = s.replace(
+    /沒(?:有)?(?:做|說|吃|買|去|看|發生|講|想)?(?:什麼|甚麼)|(?:不知道|不確定|忘了|忘記)(?:要|該|會|能|可以|怎麼|怎樣)?(?:去|到|做|買|吃|說|看|講|選|點)?(?:哪裡|哪兒|哪個|哪邊|哪家|什麼|甚麼|誰|怎麼|怎樣|為什麼|幾點|多少|多久)?/g,
+    ''
+  );
+
+  return (
+    /[嗎呢]\s*[。！？!?]*$/.test(strippedDeclaratives) ||
+    /那你呢|你呢|對吧|是吧|好嗎|可以嗎|對嗎|行嗎/.test(strippedDeclaratives) ||
+    /什麼|甚麼|誰|哪裡|哪兒|哪個|哪邊|哪家|哪一家|哪間|哪些|怎麼|怎樣|為什麼|幹嘛|幾點|幾個|幾次|幾天|幾年|幾歲|多少|多久|多遠|多常|還是|([一-龥])不\1|([一-龥])沒\2|喜不喜歡|可不可以|有沒有|正不正常|可不可能|經不經常/.test(
+      strippedDeclaratives
+    )
+  );
+}
+
+/**
+ * Determines what kind of user response the tutor's just-completed turn expects next:
+ * - `'translate'`: Phase 1 sentence translation (or Phase 1 synonym/pronunciation/hint retry)
+ * - `'reply_and_ask_back'`: Tutor asked a Phase 2 follow-up question; student needs time to
+ *   BOTH answer the question AND ask a related question back!
+ * - `'ask_question_only'`: Student already answered, and tutor prompted `"現在換你問我一個問題吧！"`
+ */
+export function classifyNextUserTurnExpectation(tutorSpokenText = '', completedTutorTurnsCount = 1) {
+  const txt = String(tutorSpokenText || '').trim();
+  if (!txt || completedTutorTurnsCount <= 1) {
+    return 'translate';
+  }
+
+  if (/換你問我|問我一個問題|請你問我|問我問題|向我提問/.test(txt)) {
+    if (/再說一次|再唸一次|重新說一次/.test(txt)) {
+      return 'reply_and_ask_back';
+    }
+    return 'ask_question_only';
+  }
+
+  if (
+    /把這句話翻成中文|翻成中文|試著用.*再說一次|再完整說一次|重新說一次|再說一次試試|再唸一次|試著再說一次|給你一點提示|提示你一下/.test(
+      txt
+    )
+  ) {
+    return 'translate';
+  }
+
+  if (containsMandarinQuestion(txt)) {
+    return 'reply_and_ask_back';
+  }
+
+  return 'translate';
+}
+
+/**
+ * Checks during a `'reply_and_ask_back'` turn whether the student has ALREADY spoken
+ * both their answer AND their follow-up question back to the tutor.
+ */
+export function hasCompletedReplyAndQuestionBack(transcript = '', speechSegmentsInTurn = 1) {
+  const raw = String(transcript || '').trim();
+
+  if (raw) {
+    const clauses = raw
+      .split(/[。！？!?，,；;\s]+/)
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    if (clauses.length >= 2 && containsMandarinQuestion(clauses[clauses.length - 1])) {
+      return true;
+    }
+
+    const hanziOnly = (raw.match(/[\u4e00-\u9fff]/g) || []).join('');
+    if (hanziOnly.length >= 6) {
+      const tailAfterShortAnswer = raw.slice(Math.min(raw.length, 3));
+      if (
+        /(?:那你|你|老師|您)/.test(tailAfterShortAnswer) &&
+        containsMandarinQuestion(tailAfterShortAnswer)
+      ) {
+        return true;
+      }
+    }
+
+    if (speechSegmentsInTurn >= 2 && containsMandarinQuestion(raw)) {
+      return true;
+    }
+    return false;
+  }
+
+  // Pure acoustic fallback only if server ASR emitted zero text across 2 distinct speech segments
+  return speechSegmentsInTurn >= 2;
+}
+
+/**
+ * Intelligent context- and sentence-completeness-aware post-speech silence calculator:
+ * - Responds snappily (~850–1100ms, matching consumer Gemini Live) when a sentence/question is complete.
+ * - Holds longer (~1850–1950ms) when the user pauses mid-sentence (short fragment, filler, or dangling word).
+ * - Grants generous thinking time (~2650ms) on the Phase 2->3 `'reply_and_ask_back'` turn after the user
+ *   answers the tutor's question while they think of a question to ask back — then snaps right back
+ *   to ~950ms the instant they finish asking their question!
+ */
+export function computeSmartSilenceThresholdMs({
+  transcript = '',
+  turnExpectation = 'translate',
+  speechSegmentsInTurn = 1,
+  voicedMs = 0,
+  expectedMinHanzi = 0
+} = {}) {
+  const raw = String(transcript || '').trim();
+  const hanziCount = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
+
+  // 1. Instant voice control commands
+  if (
+    raw &&
+    /^(跳過|下一題|下一個|換下一題|暫停|先暫停|結束練習|停止練習|再說一次|再唸一次|再說一次英文|提示|給我提示|skip|next|pause|repeat|hint)[。！!？?\s]*$/i.test(
+      raw
+    )
+  ) {
+    return { thresholdMs: 850, reason: 'voice_command' };
+  }
+
+  const hasTerminalPunct = /[。！？!?]\s*$/.test(raw);
+  const hasTrailingCommaOrFiller =
+    /[，,、…—-]\s*$/.test(raw) || /(?:嗯|呃|那個|就是|然後)\s*[。，,、…]*$/.test(raw);
+  const hasAlwaysDanglingWord =
+    /(?:因為|所以|如果|要是|雖然|但是|可是|不過|而且|還是|或者|的時候|的話|我覺得|我想|我要|我打算|我準備|正在|試著|在|從|離|把|被|給|跟|對|比|往)\s*[。，,、…]*$/.test(
+      raw
+    );
+  const hasUnpunctuatedAuxiliaryTail =
+    !hasTerminalPunct && /(?:去|到|要|想|會|能|可以|應該|可能|喜歡|開始|繼續)\s*$/.test(raw);
+
+  const isTrailingIncomplete =
+    Boolean(raw) &&
+    (hasTrailingCommaOrFiller || hasAlwaysDanglingWord || hasUnpunctuatedAuxiliaryTail);
+
+  // 2. Phase 2 -> 3: Answer tutor's question AND ask a question back!
+  if (turnExpectation === 'reply_and_ask_back') {
+    if (
+      !isTrailingIncomplete &&
+      hasCompletedReplyAndQuestionBack(raw, speechSegmentsInTurn)
+    ) {
+      return { thresholdMs: 950, reason: 'reply_and_question_complete' };
+    }
+    return {
+      thresholdMs: isTrailingIncomplete ? 2850 : 2650,
+      reason: 'awaiting_followup_question'
+    };
+  }
+
+  // 3. Phase 3 standalone question turn (`"現在換你問我一個問題吧！"`)
+  if (turnExpectation === 'ask_question_only') {
+    if (!isTrailingIncomplete && containsMandarinQuestion(raw) && hanziCount >= 3) {
+      return { thresholdMs: 950, reason: 'question_complete' };
+    }
+    if (isTrailingIncomplete || (raw && !containsMandarinQuestion(raw))) {
+      return { thresholdMs: 1850, reason: 'forming_question' };
+    }
+    return {
+      thresholdMs: voicedMs >= 1300 ? 1200 : 1650,
+      reason: 'question_acoustic'
+    };
+  }
+
+  // 4. Phase 1 sentence translation (and general single-sentence turns)
+  const minCompleteHanzi =
+    expectedMinHanzi >= 5 ? Math.max(4, Math.ceil(expectedMinHanzi * 0.6)) : 4;
+
+  if (raw) {
+    if (
+      isTrailingIncomplete ||
+      (expectedMinHanzi >= 6 && hanziCount > 0 && hanziCount < Math.ceil(expectedMinHanzi * 0.52))
+    ) {
+      return { thresholdMs: 1950, reason: 'incomplete_sentence_fragment' };
+    }
+    if (hasTerminalPunct && hanziCount >= minCompleteHanzi) {
+      return { thresholdMs: 950, reason: 'sentence_complete_punctuated' };
+    }
+    if (hanziCount >= minCompleteHanzi && voicedMs >= 1000) {
+      return { thresholdMs: 1100, reason: 'sentence_complete_length' };
+    }
+    return { thresholdMs: 1500, reason: 'short_partial_transcript' };
+  }
+
+  // Acoustic fallback when interim/final transcript has not arrived yet
+  if (voicedMs >= 1350) {
+    return { thresholdMs: 1200, reason: 'acoustic_sentence_complete' };
+  }
+  return { thresholdMs: 1650, reason: 'acoustic_short_utterance' };
 }
 
 export function buildWordSystemInstruction(word, priorTurns = []) {
@@ -158,18 +357,26 @@ export class GeminiLiveVoicePipeline {
     this.activeSources = new Set();
     this.pendingActionAfterPlayback = null;
 
-    // Hybrid VAD (Server automaticActivityDetection + Client 2.8s silence backup)
-    this.silenceWaitMs = 2800;
+    // Smart Context- & Sentence-Completeness-Aware Endpointing + Clean Zero-PCM Silence Gating
+    this.silenceWaitMs = 1100;
+    this.turnExpectation = 'translate';
     this.listeningForUser = false;
     this.tutorTurnActive = false;
     this.userSpokeInTurn = false;
     this.serverAckedCurrentUserTurn = false;
     this.hasUnflushedAudio = false;
     this.consecutiveSpeechFrames = 0;
+    this.resumeSpeechFrames = 0;
+    this.speechSegmentsInTurn = 0;
+    this.turnVoicedMs = 0;
+    this.turnPeakSpeechRms = 0.06;
+    this.silenceFramesSentInPause = 0;
+    this.pausePreRollBuffer = [];
     this.lastVoiceActivityTime = 0;
     this.lastCountdownText = '';
     this.noiseFloor = 0.005;
     this.currentTurnUserTranscript = '';
+    this.currentTurnInterimUserTranscript = '';
     this.currentTurnTutorTranscript = '';
     this.interruptedTutorPartialText = '';
     this.noReplyRecoveryTimer = null;
@@ -225,6 +432,31 @@ export class GeminiLiveVoicePipeline {
       !this.tutorTurnActive &&
       !this.wordTerminalActionLocked
     );
+  }
+
+  _getCombinedLiveUserTranscript() {
+    const fin = this.currentTurnUserTranscript.trim();
+    const interim = this.currentTurnInterimUserTranscript.trim();
+    if (fin && interim) return `${fin} ${interim}`;
+    return fin || interim;
+  }
+
+  _getExpectedMinHanziForCurrentWord() {
+    if (!this.currentWord) return 0;
+    const ref = String(
+      this.currentWord.mandarin_sentence || this.currentWord.sample_mandarin || ''
+    );
+    return (ref.match(/[\u4e00-\u9fff]/g) || []).length;
+  }
+
+  _getCurrentDynamicSilenceTarget() {
+    return computeSmartSilenceThresholdMs({
+      transcript: this._getCombinedLiveUserTranscript(),
+      turnExpectation: this.turnExpectation,
+      speechSegmentsInTurn: Math.max(1, this.speechSegmentsInTurn),
+      voicedMs: this.turnVoicedMs,
+      expectedMinHanzi: this._getExpectedMinHanziForCurrentWord()
+    });
   }
 
   /**
@@ -291,14 +523,10 @@ export class GeminiLiveVoicePipeline {
       return;
     }
 
-    const pcm16Base64 = this._downsampleAndEncodePcm16(
-      float32Samples,
-      this.audioCtx.sampleRate,
-      16000
-    );
+    const inputRate = this.audioCtx ? this.audioCtx.sampleRate : 24000;
+    const pcm16Base64 = this._downsampleAndEncodePcm16(float32Samples, inputRate, 16000);
 
     const speechStartThreshold = Math.max(0.016, Math.min(0.05, this.noiseFloor * 2.8));
-    const speechContinueThreshold = Math.max(0.011, Math.min(0.036, this.noiseFloor * 1.9));
 
     if (!this.userSpokeInTurn) {
       this._sendAudioChunk(pcm16Base64);
@@ -307,14 +535,21 @@ export class GeminiLiveVoicePipeline {
         this.consecutiveSpeechFrames += 1;
         if (this.consecutiveSpeechFrames >= 3) {
           this.userSpokeInTurn = true;
+          this.speechSegmentsInTurn = 1;
+          this.turnVoicedMs = 300;
+          this.turnPeakSpeechRms = Math.max(0.06, Math.min(0.4, rms));
+          this.silenceFramesSentInPause = 0;
+          this.resumeSpeechFrames = 0;
+          this.pausePreRollBuffer = [];
           this.lastVoiceActivityTime = now;
           this.lastCountdownText = '';
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
             rms: Number(rms.toFixed(4)),
             noiseFloor: Number(this.noiseFloor.toFixed(4)),
-            threshold: Number(speechStartThreshold.toFixed(4))
+            threshold: Number(speechStartThreshold.toFixed(4)),
+            turnExpectation: this.turnExpectation
           });
-          this._emitState('listening', 'Hearing your Mandarin... (auto-sends after pause)');
+          this._emitState('listening', 'Hearing your Mandarin...');
         }
       } else {
         this.consecutiveSpeechFrames = 0;
@@ -323,25 +558,90 @@ export class GeminiLiveVoicePipeline {
       return;
     }
 
-    this._sendAudioChunk(pcm16Base64);
+    const speechContinueThreshold = Math.max(
+      0.014,
+      Math.min(0.042, Math.max(this.noiseFloor * 2.3, this.turnPeakSpeechRms * 0.12))
+    );
+    const silenceBeforeFrame = now - this.lastVoiceActivityTime;
 
-    if (rms >= speechContinueThreshold) {
-      this.lastVoiceActivityTime = now;
-      if (this.lastCountdownText !== '') {
-        this.lastCountdownText = '';
-        this._emitState('listening', 'Hearing your Mandarin... (auto-sends after pause)');
+    let isVoicedSpeech = false;
+    if (silenceBeforeFrame <= 300) {
+      isVoicedSpeech = rms >= speechContinueThreshold;
+    } else if (rms >= Math.max(speechStartThreshold * 1.35, speechContinueThreshold * 1.55)) {
+      isVoicedSpeech = true;
+    } else if (rms >= speechContinueThreshold) {
+      this.resumeSpeechFrames += 1;
+      if (this.resumeSpeechFrames >= 2) {
+        isVoicedSpeech = true;
       }
     } else {
-      const silenceElapsed = now - this.lastVoiceActivityTime;
-      if (silenceElapsed >= this.silenceWaitMs) {
-        this.commitUserSpeechTurn('auto_silence');
-      } else if (silenceElapsed >= 600) {
-        const remainSec = Math.max(0.1, (this.silenceWaitMs - silenceElapsed) / 1000).toFixed(1);
-        const statusMsg = `Pause detected — sending in ${remainSec}s (or tap Done)`;
-        if (statusMsg !== this.lastCountdownText) {
-          this.lastCountdownText = statusMsg;
-          this._emitState('listening', statusMsg);
+      this.resumeSpeechFrames = 0;
+    }
+
+    if (isVoicedSpeech) {
+      // If user was in a real pause (>= 450ms) and resumed speaking (e.g. asking their follow-up question),
+      // flush the 200ms pre-roll buffer so the onset consonant is never clipped!
+      if (silenceBeforeFrame >= 450) {
+        this.speechSegmentsInTurn += 1;
+        for (const bufferedChunk of this.pausePreRollBuffer) {
+          this._sendAudioChunk(bufferedChunk);
         }
+      }
+      this.pausePreRollBuffer = [];
+      this.silenceFramesSentInPause = 0;
+      this.resumeSpeechFrames = 0;
+      this.lastVoiceActivityTime = now;
+      this.turnVoicedMs += 100;
+      this.turnPeakSpeechRms = Math.min(0.4, Math.max(this.turnPeakSpeechRms * 0.98, rms));
+      this._sendAudioChunk(pcm16Base64);
+
+      if (this.lastCountdownText !== '') {
+        this.lastCountdownText = '';
+        this._emitState('listening', 'Hearing your Mandarin...');
+      }
+      return;
+    }
+
+    const silenceElapsed = now - this.lastVoiceActivityTime;
+    const { thresholdMs, reason } = this._getCurrentDynamicSilenceTarget();
+
+    if (silenceElapsed >= thresholdMs) {
+      this.commitUserSpeechTurn(`smart_${reason}`, {
+        thresholdMs,
+        silenceElapsedMs: Math.round(silenceElapsed),
+        completenessReason: reason
+      });
+      return;
+    }
+
+    // During a pause BEFORE thresholdMs is reached:
+    // - Frames 1–2 (200ms): send real mic tail so final consonant/tone release is preserved.
+    // - Frames 3–5 (300ms): send clean digital-zero PCM so server ASR emits `inputTranscription` promptly
+    //   while total silence sent (500ms) remains safely below server `silenceDurationMs` (950ms)!
+    // - Frames >= 6: hold silence locally (keeping a 200ms pre-roll ring buffer) so server VAD never cuts
+    //   the student off early while thinking mid-sentence or formulating their follow-up question!
+    if (this.silenceFramesSentInPause < 2) {
+      this._sendAudioChunk(pcm16Base64);
+      this.silenceFramesSentInPause += 1;
+    } else if (this.silenceFramesSentInPause < 5) {
+      this._sendAudioChunk(ZERO_PCM16_100MS_BASE64);
+      this.silenceFramesSentInPause += 1;
+    } else {
+      this.pausePreRollBuffer.push(pcm16Base64);
+      if (this.pausePreRollBuffer.length > 2) {
+        this.pausePreRollBuffer.shift();
+      }
+    }
+
+    if (silenceElapsed >= 450) {
+      const remainSec = Math.max(0.1, (thresholdMs - silenceElapsed) / 1000).toFixed(1);
+      const statusMsg =
+        reason === 'awaiting_followup_question'
+          ? `Waiting ${remainSec}s for your question back (or tap Done)`
+          : `Pause detected — sending in ${remainSec}s (or tap Done)`;
+      if (statusMsg !== this.lastCountdownText) {
+        this.lastCountdownText = statusMsg;
+        this._emitState('listening', statusMsg);
       }
     }
   }
@@ -385,18 +685,32 @@ export class GeminiLiveVoicePipeline {
     } catch (_) {}
   }
 
-  commitUserSpeechTurn(reason = 'auto_silence') {
+  commitUserSpeechTurn(reason = 'auto_silence', telemetryExtra = {}) {
     if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (this.tutorTurnActive || this.wordTerminalActionLocked) return;
 
     const hadUserSpeech = this.userSpokeInTurn;
+    // Burst clean digital-zero 16kHz PCM frames so server automaticActivityDetection (`silenceDurationMs: 950`)
+    // deterministically sees >= 1200ms of clean silence and fires end-of-turn immediately (both on smart
+    // endpointing AND when tapping `Done Speaking`), immune to car road noise!
+    if (hadUserSpeech && this.listeningForUser) {
+      const zeroBurstCount = Math.max(6, 12 - this.silenceFramesSentInPause);
+      for (let i = 0; i < zeroBurstCount; i++) {
+        this._sendAudioChunk(ZERO_PCM16_100MS_BASE64);
+      }
+    }
+
     const chunksSent = this.sentAudioChunksInTurn;
+    const liveTranscriptSnapshot = this._getCombinedLiveUserTranscript();
     this.isPhase1InitialTurn = false;
     this.silentTurnRetries = 0;
     this.listeningForUser = false;
     this.userSpokeInTurn = false;
     this.serverAckedCurrentUserTurn = false;
     this.consecutiveSpeechFrames = 0;
+    this.resumeSpeechFrames = 0;
+    this.silenceFramesSentInPause = 0;
+    this.pausePreRollBuffer = [];
     this.sentAudioChunksInTurn = 0;
     this.lastCountdownText = '';
     this.turnCommitPerfMs = performance.now();
@@ -404,8 +718,12 @@ export class GeminiLiveVoicePipeline {
     debugLogger.finalizeStreamingEntries('input_transcript');
     debugLogger.log('info', 'user_turn_committed', `Committed user turn (${reason})`, {
       reason,
+      turnExpectation: this.turnExpectation,
+      speechSegmentsInTurn: this.speechSegmentsInTurn,
+      voicedMs: this.turnVoicedMs,
+      ...telemetryExtra,
       audioChunksSent: chunksSent,
-      transcriptSoFar: this.currentTurnUserTranscript.trim()
+      transcriptSoFar: liveTranscriptSnapshot
     });
 
     this._emitState('connecting', 'Processing your Mandarin...');
@@ -415,7 +733,7 @@ export class GeminiLiveVoicePipeline {
       clearTimeout(this.noReplyRecoveryTimer);
     }
 
-    const recoveryWaitMs = hadUserSpeech || this.currentTurnUserTranscript.trim() ? 8500 : 4500;
+    const recoveryWaitMs = hadUserSpeech || liveTranscriptSnapshot ? 5000 : 3000;
     this.noReplyRecoveryTimer = setTimeout(() => {
       this.noReplyRecoveryTimer = null;
       if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -429,7 +747,7 @@ export class GeminiLiveVoicePipeline {
         return;
       }
 
-      const latestTranscript = this.currentTurnUserTranscript.trim();
+      const latestTranscript = this._getCombinedLiveUserTranscript();
       if (latestTranscript) {
         debugLogger.log(
           'warn',
@@ -514,7 +832,9 @@ export class GeminiLiveVoicePipeline {
     this.currentWord = word;
     this.lastLiveConfig = Object.assign({}, liveConfig);
     this.wordTurns = [];
+    this.turnExpectation = 'translate';
     this.currentTurnUserTranscript = '';
+    this.currentTurnInterimUserTranscript = '';
     this.currentTurnTutorTranscript = '';
     this.interruptedTutorPartialText = '';
     this.serverAckedCurrentUserTurn = false;
@@ -567,14 +887,15 @@ export class GeminiLiveVoicePipeline {
   }
 
   _commitPendingUserTranscriptToTurns() {
-    const pendingUser = this.currentTurnUserTranscript.trim();
+    const pendingUser = this._getCombinedLiveUserTranscript();
     if (pendingUser) {
       const last = this.wordTurns[this.wordTurns.length - 1];
       if (!last || last.role !== 'user' || last.text !== pendingUser) {
         this.wordTurns.push({ role: 'user', text: pendingUser });
       }
-      this.currentTurnUserTranscript = '';
     }
+    this.currentTurnUserTranscript = '';
+    this.currentTurnInterimUserTranscript = '';
   }
 
   _commitCompletedTutorTranscriptToTurns() {
@@ -872,8 +1193,8 @@ export class GeminiLiveVoicePipeline {
         if (useExtendedConfig) {
           setupObj.realtimeInputConfig = {
             automaticActivityDetection: {
-              prefixPaddingMs: 300,
-              silenceDurationMs: 2200
+              prefixPaddingMs: 250,
+              silenceDurationMs: 950
             }
           };
           setupObj.contextWindowCompression = {
@@ -946,8 +1267,12 @@ export class GeminiLiveVoicePipeline {
             // Case 3: Reconnecting after a COMPLETED tutor turn (user's turn to speak)
             if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
               this.isPhase1InitialTurn = false;
-              debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening');
-              this._beginListeningTurn('Reconnected — speak in Mandarin');
+              const tutorTurnsSoFar = this.wordTurns.filter((t) => t.role === 'tutor').length;
+              this.turnExpectation = classifyNextUserTurnExpectation(lastTurn.text, tutorTurnsSoFar);
+              debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening', {
+                turnExpectation: this.turnExpectation
+              });
+              this._beginListeningTurn();
               resolve();
               return;
             }
@@ -1044,14 +1369,25 @@ export class GeminiLiveVoicePipeline {
     this.userSpokeInTurn = false;
     this.serverAckedCurrentUserTurn = false;
     this.consecutiveSpeechFrames = 0;
+    this.resumeSpeechFrames = 0;
+    this.speechSegmentsInTurn = 0;
+    this.turnVoicedMs = 0;
+    this.turnPeakSpeechRms = 0.06;
+    this.silenceFramesSentInPause = 0;
+    this.pausePreRollBuffer = [];
     this.sentAudioChunksInTurn = 0;
     this.currentTurnUserTranscript = '';
+    this.currentTurnInterimUserTranscript = '';
     this.lastCountdownText = '';
-    this.postPlaybackCooldownUntil = performance.now() + 500;
-    this._emitState(
-      'listening',
-      customLabel || 'Your turn — speak in Mandarin (auto-sends after pause)'
-    );
+    this.postPlaybackCooldownUntil = performance.now() + 180;
+
+    let defaultLabel = 'Your turn — speak in Mandarin';
+    if (this.turnExpectation === 'reply_and_ask_back') {
+      defaultLabel = 'Your turn — answer & ask a question back';
+    } else if (this.turnExpectation === 'ask_question_only') {
+      defaultLabel = 'Your turn — ask the tutor a question in Mandarin';
+    }
+    this._emitState('listening', customLabel || defaultLabel);
   }
 
   _executeTerminalCue(cue, triggerSource = 'turn_complete') {
@@ -1100,13 +1436,13 @@ export class GeminiLiveVoicePipeline {
     }
     if (!this.tutorTurnActive) {
       if (this.listeningForUser) {
-        // Server-side automatic VAD committed the user's turn before the 2.8s client silence backup!
+        // Server-side automatic VAD committed the user's turn
         this.isPhase1InitialTurn = false;
         this.silentTurnRetries = 0;
         debugLogger.finalizeStreamingEntries('input_transcript');
         this.turnCommitPerfMs = performance.now();
         debugLogger.log('info', 'server_vad_turn_committed', 'Server VAD detected end of user speech', {
-          userTranscript: this.currentTurnUserTranscript.trim()
+          userTranscript: this._getCombinedLiveUserTranscript()
         });
       }
       this._commitPendingUserTranscriptToTurns();
@@ -1166,13 +1502,22 @@ export class GeminiLiveVoicePipeline {
         }
       }
 
+      if (sc.interimInputTranscription && sc.interimInputTranscription.text) {
+        this.currentTurnInterimUserTranscript = sc.interimInputTranscription.text;
+      }
+
       if (sc.inputTranscription && sc.inputTranscription.text) {
         const text = sc.inputTranscription.text;
+        this.currentTurnInterimUserTranscript = '';
         this.currentTurnUserTranscript += text;
         debugLogger.appendStream('info', 'input_transcript', text);
         this.onTranscript('user', text);
-        if (this.listeningForUser) {
+        // IMPORTANT: Do NOT reset `lastVoiceActivityTime` if `userSpokeInTurn` is already true!
+        // `inputTranscription` chunks arrive 800-1800ms AFTER acoustic speech pauses, which previously
+        // restarted the post-speech silence timer and added ~1.5-2.0s of extra lag on every turn.
+        if (this.listeningForUser && !this.userSpokeInTurn) {
           this.userSpokeInTurn = true;
+          this.speechSegmentsInTurn = Math.max(1, this.speechSegmentsInTurn);
           this.lastVoiceActivityTime = performance.now();
         }
       }
@@ -1399,6 +1744,16 @@ export class GeminiLiveVoicePipeline {
           return;
         }
 
+        const tutorTurnsSoFar = this.wordTurns.filter((t) => t.role === 'tutor').length;
+        this.turnExpectation = classifyNextUserTurnExpectation(completedTutorText, tutorTurnsSoFar);
+        if (this.turnExpectation === 'reply_and_ask_back') {
+          debugLogger.setContext({ phase: 2 });
+          this.onPhaseHint(2);
+        } else if (this.turnExpectation === 'ask_question_only') {
+          debugLogger.setContext({ phase: 3 });
+          this.onPhaseHint(3);
+        }
+
         this._schedulePostPlaybackCallback(() => {
           if (this.isActive && !this.wordTerminalActionLocked) {
             this._beginListeningTurn();
@@ -1497,7 +1852,7 @@ export class GeminiLiveVoicePipeline {
       return;
     }
     const remainingSec = Math.max(0, this.nextPlayTime - this.audioCtx.currentTime);
-    setTimeout(cb, Math.ceil(remainingSec * 1000) + 220);
+    setTimeout(cb, Math.ceil(remainingSec * 1000) + 80);
   }
 
   stopPlaybackImmediately() {

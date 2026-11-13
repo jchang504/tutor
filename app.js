@@ -14,8 +14,8 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=14';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=14';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=15';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=15';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 /**
@@ -221,6 +221,7 @@ class MandarinTutorApp {
     this.pipeline = new GeminiLiveVoicePipeline({
       onStateChange: (state, statusText) => this.handlePipelineState(state, statusText),
       onTranscript: (role, text) => this.handleTranscript(role, text),
+      onPhaseHint: (phase) => this.setPhaseIndicator(phase),
       onCompleteWord: (completionPayload) => this.handleWordCompleted(completionPayload),
       onSessionControl: (cmd) => this.handleVoiceControlCommand(cmd),
       onAudioLevel: (lvl) => this.updateAudioMeter(lvl),
@@ -1058,7 +1059,7 @@ ${dialogueText}`;
       if (this.sessionActive && !this.sessionPaused) {
         this.launchCurrentWord();
       }
-    }, 800);
+    }, 320);
   }
 
   /**
