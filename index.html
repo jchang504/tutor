@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=16" />
+  <link rel="stylesheet" href="./index.css?v=17" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -77,6 +77,9 @@
           <div class="progress-track">
             <div id="stage-progress-fill" class="progress-fill"></div>
           </div>
+          <button id="active-audio-pill" class="audio-pill-btn" type="button" title="Tap to configure Car / Android Auto Audio &amp; Volume Boost">
+            Audio: Media / Android Auto · Boost 2.2x
+          </button>
         </div>
       </div>
 
@@ -241,6 +244,44 @@
         <div class="divider-line"></div>
 
         <div class="field-group">
+          <label for="input-audio-routing">Car &amp; Android Auto Audio Routing Mode</label>
+          <select id="input-audio-routing">
+            <option value="media_auto" selected>Media / Android Auto Far-Field (Default — Fixes Media Volume &amp; AA Stereo)</option>
+            <option value="bluetooth_hfp">Bluetooth Call / Car HFP Mic (For Bluetooth-Only Without Android Auto)</option>
+            <option value="voice_comm">Phone Speakerphone AEC (Indoor Desk Mode)</option>
+          </select>
+          <span class="field-hint">
+            <strong>Android Auto (Nissan Leaf USB/Wireless):</strong> Keep on <em>Media / Android Auto Far-Field</em> — Pixel volume buttons control Media Volume, stereo audio plays over car speakers, and the adaptive 4.8x far-field pre-amp picks up your voice from your dash/console.<br />
+            <strong>Bluetooth-Only (No Android Auto):</strong> Switch to <em>Bluetooth Call / Car HFP Mic</em> if your phone is in a pocket/bag and you want to force the car's overhead Bluetooth call mic.
+          </span>
+        </div>
+
+        <div class="form-row-2col">
+          <div class="field-group">
+            <label for="input-volume-boost">Tutor Speech Loudness Boost</label>
+            <select id="input-volume-boost">
+              <option value="1.0">1.0x (Unboosted Raw)</option>
+              <option value="1.6">1.6x (+4 dB Mild Boost)</option>
+              <option value="2.2" selected>2.2x (+7 dB Podcast / Maps Match)</option>
+              <option value="3.0">3.0x (+9.5 dB Highway / Loud Cabin)</option>
+            </select>
+            <span class="field-hint">Uses compressor + soft limiter so loud boosts never clip.</span>
+          </div>
+          <div class="field-group">
+            <label for="input-mic-device">Microphone Input Override</label>
+            <div style="display:flex; gap:6px;">
+              <select id="input-mic-device" style="flex:1;">
+                <option value="auto" selected>Auto (Best for Routing Mode)</option>
+              </select>
+              <button id="btn-refresh-mics" class="btn-secondary" type="button" style="padding:0 10px;">Scan</button>
+            </div>
+            <span id="active-mic-status-hint" class="field-hint">Active mic: Not started yet</span>
+          </div>
+        </div>
+
+        <div class="divider-line"></div>
+
+        <div class="field-group">
           <label for="input-direct-gemini-key">Optional: Direct Gemini API Key (For Instant Testing / Override)</label>
           <input id="input-direct-gemini-key" type="password" placeholder="AIzaSy... (leave blank to use key stored in Apps Script)" autocomplete="off" />
           <span class="field-hint">Normally your Gemini API key stays inside Apps Script Properties. You can also paste one here to test the 5-word sample deck before setting up your Sheet.</span>
@@ -385,7 +426,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=16"></script>
+  <script type="module" src="./app.js?v=17"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -397,7 +438,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=16').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=17').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

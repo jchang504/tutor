@@ -14,8 +14,8 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=16';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=16';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=17';
+import { GeminiLiveVoicePipeline } from './live-audio.js?v=17';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 /**
@@ -184,7 +184,10 @@ const STORAGE_KEYS = {
   BATCH_SIZE: 'tw_tutor_batch_size',
   NEW_RATIO: 'tw_tutor_new_ratio',
   VOICE_NAME: 'tw_tutor_voice_name',
-  PREFERRED_LIVE_MODEL: 'tw_tutor_preferred_live_model'
+  PREFERRED_LIVE_MODEL: 'tw_tutor_preferred_live_model',
+  AUDIO_ROUTING_MODE: 'tw_tutor_audio_routing_mode',
+  MIC_DEVICE_ID: 'tw_tutor_mic_device_id',
+  VOLUME_BOOST: 'tw_tutor_volume_boost'
 };
 
 class MandarinTutorApp {
@@ -225,20 +228,33 @@ class MandarinTutorApp {
       onCompleteWord: (completionPayload) => this.handleWordCompleted(completionPayload),
       onSessionControl: (cmd) => this.handleVoiceControlCommand(cmd),
       onAudioLevel: (lvl) => this.updateAudioMeter(lvl),
+      onAudioHardwareUpdate: (micInfo, inputs) => this.handleAudioHardwareUpdate(micInfo, inputs),
       onError: (err) => {
         debugLogger.log('error', 'pipeline_error', err.message || String(err));
         this.showToast(err.message || String(err), 'error');
       }
     });
 
+    const savedRouting = localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE) || 'media_auto';
+    const savedMicId = localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) || 'auto';
+    const savedBoost = Number(localStorage.getItem(STORAGE_KEYS.VOLUME_BOOST) || '2.2');
+    this.pipeline.setAudioConfig({
+      routingMode: savedRouting,
+      preferredDeviceId: savedMicId,
+      outputVolumeBoost: savedBoost
+    });
+
     this.bindDom();
     this.loadSavedConfigIntoInputs();
+    this.handleAudioHardwareUpdate(this.pipeline.activeMicInfo, this.pipeline.enumeratedAudioInputs);
     this.setupDebugLogsSubscription();
     this.setupMediaSessionControls();
     this.setupWakeLockLifecycle();
     debugLogger.log('info', 'app_boot', `Mandarin Driving Tutor ${APP_VERSION} booted`, {
       preferredLiveModel: this.liveAuth.preferredLiveModel,
-      voiceName: this.liveAuth.voiceName
+      voiceName: this.liveAuth.voiceName,
+      audioRoutingMode: savedRouting,
+      volumeBoost: savedBoost
     });
     this.refreshBackendStatus();
   }
@@ -255,6 +271,7 @@ class MandarinTutorApp {
       stageStatusPill: document.getElementById('stage-status-pill'),
       stageProgressText: document.getElementById('stage-progress-text'),
       stageProgressBar: document.getElementById('stage-progress-fill'),
+      activeAudioPill: document.getElementById('active-audio-pill'),
       englishPromptText: document.getElementById('english-prompt-text'),
       targetWordBox: document.getElementById('target-word-box'),
       targetHanzi: document.getElementById('target-hanzi'),
@@ -309,6 +326,11 @@ class MandarinTutorApp {
       inputTocflLevel: document.getElementById('input-tocfl-level'),
       inputVoiceName: document.getElementById('input-voice-name'),
       inputLiveModel: document.getElementById('input-live-model'),
+      inputAudioRouting: document.getElementById('input-audio-routing'),
+      inputVolumeBoost: document.getElementById('input-volume-boost'),
+      inputMicDevice: document.getElementById('input-mic-device'),
+      btnRefreshMics: document.getElementById('btn-refresh-mics'),
+      activeMicStatusHint: document.getElementById('active-mic-status-hint'),
       btnSaveSettings: document.getElementById('input-save-settings') || document.getElementById('btn-save-settings'),
       btnTestConnection: document.getElementById('btn-test-connection'),
 
@@ -400,10 +422,40 @@ class MandarinTutorApp {
       this.els.selectLogFilter.addEventListener('change', () => this.renderLogsDrawer());
     }
 
-    this.els.btnOpenSettings.addEventListener('click', () => this.els.drawerSettings.classList.remove('hidden'));
+    const openSettingsAndEnumerate = () => {
+      this.els.drawerSettings.classList.remove('hidden');
+      this.pipeline.enumerateAudioDevices('settings_open').catch(() => {});
+    };
+
+    this.els.btnOpenSettings.addEventListener('click', openSettingsAndEnumerate);
+    if (this.els.activeAudioPill) {
+      this.els.activeAudioPill.addEventListener('click', openSettingsAndEnumerate);
+    }
     this.els.btnCloseSettings.addEventListener('click', () => this.els.drawerSettings.classList.add('hidden'));
     this.els.btnOpenImport.addEventListener('click', () => this.els.drawerImport.classList.remove('hidden'));
     this.els.btnCloseImport.addEventListener('click', () => this.els.drawerImport.classList.add('hidden'));
+
+    if (this.els.inputVolumeBoost) {
+      this.els.inputVolumeBoost.addEventListener('change', () => {
+        const boostVal = Number(this.els.inputVolumeBoost.value || '2.2');
+        localStorage.setItem(STORAGE_KEYS.VOLUME_BOOST, String(boostVal));
+        this.pipeline.setOutputVolumeBoost(boostVal);
+      });
+    }
+    if (this.els.btnRefreshMics) {
+      this.els.btnRefreshMics.addEventListener('click', async () => {
+        try {
+          if (!this.pipeline.micStream && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            const temp = await navigator.mediaDevices.getUserMedia({ audio: true });
+            temp.getTracks().forEach((t) => t.stop());
+          }
+          const { inputs } = await this.pipeline.enumerateAudioDevices('manual_scan_btn');
+          this.showToast(`Found ${inputs.length} microphone input(s).`, 'info');
+        } catch (err) {
+          this.showToast(err.message || 'Microphone scan blocked.', 'error');
+        }
+      });
+    }
 
     this.els.btnSaveSettings.addEventListener('click', () => this.saveSettings());
     this.els.btnTestConnection.addEventListener('click', () => this.refreshBackendStatus(true));
@@ -451,6 +503,60 @@ class MandarinTutorApp {
     }
   }
 
+  handleAudioHardwareUpdate(micInfo = {}, inputs = []) {
+    const modeLabel =
+      micInfo.routingMode === 'bluetooth_hfp'
+        ? 'BT Call HFP'
+        : micInfo.routingMode === 'voice_comm'
+        ? 'Phone Speaker AEC'
+        : 'Media / Android Auto';
+    const micLabel = micInfo.label || 'Not initialized';
+    const boost = micInfo.outputBoost || this.pipeline.outputVolumeBoost || 2.2;
+
+    if (this.els && this.els.activeAudioPill) {
+      const shortMic =
+        micLabel === 'Not initialized'
+          ? 'Ready'
+          : micLabel.length > 22
+          ? `${micLabel.slice(0, 21)}…`
+          : micLabel;
+      this.els.activeAudioPill.textContent = `Audio: ${modeLabel} · ${shortMic} · ${boost}x`;
+    }
+
+    if (this.els && this.els.activeMicStatusHint) {
+      this.els.activeMicStatusHint.textContent =
+        micLabel === 'Not initialized'
+          ? `Mode: ${modeLabel} · Mic acquired when session starts`
+          : `Active mic: "${micLabel}" (AEC=${Boolean(micInfo.echoCancellation)}, Boost=${boost}x)`;
+    }
+
+    if (this.els && this.els.inputMicDevice && Array.isArray(inputs)) {
+      const savedPref =
+        localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) ||
+        this.pipeline.preferredMicDeviceId ||
+        'auto';
+      const currentOptions = [{ value: 'auto', text: 'Auto (Best for Routing Mode)' }];
+      for (const inp of inputs) {
+        if (inp.deviceId) {
+          currentOptions.push({
+            value: inp.deviceId,
+            text: inp.label || `Mic (${inp.shortId})`
+          });
+        }
+      }
+      this.els.inputMicDevice.innerHTML = '';
+      for (const o of currentOptions) {
+        const optEl = document.createElement('option');
+        optEl.value = o.value;
+        optEl.textContent = o.text;
+        if (o.value === savedPref) {
+          optEl.selected = true;
+        }
+        this.els.inputMicDevice.appendChild(optEl);
+      }
+    }
+  }
+
   loadSavedConfigIntoInputs() {
     this.els.inputGasUrl.value = localStorage.getItem(STORAGE_KEYS.GAS_URL) || '';
     this.els.inputSecret.value = localStorage.getItem(STORAGE_KEYS.SECRET) || '';
@@ -461,6 +567,16 @@ class MandarinTutorApp {
     this.els.inputVoiceName.value = localStorage.getItem(STORAGE_KEYS.VOICE_NAME) || 'Aoede';
     if (this.els.inputLiveModel) {
       this.els.inputLiveModel.value = localStorage.getItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL) || 'auto';
+    }
+    if (this.els.inputAudioRouting) {
+      this.els.inputAudioRouting.value =
+        localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE) || 'media_auto';
+    }
+    if (this.els.inputVolumeBoost) {
+      this.els.inputVolumeBoost.value = localStorage.getItem(STORAGE_KEYS.VOLUME_BOOST) || '2.2';
+    }
+    if (this.els.inputMicDevice) {
+      this.els.inputMicDevice.value = localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) || 'auto';
     }
     this.els.selectSupplementLevel.value = localStorage.getItem(STORAGE_KEYS.TOCFL_LEVEL) || '2';
   }
@@ -474,6 +590,15 @@ class MandarinTutorApp {
     const tocflLevel = this.els.inputTocflLevel.value.trim() || '2';
     const voiceName = this.els.inputVoiceName.value.trim() || 'Aoede';
     const preferredLiveModel = this.els.inputLiveModel ? this.els.inputLiveModel.value : 'auto';
+    const audioRoutingMode = this.els.inputAudioRouting
+      ? this.els.inputAudioRouting.value
+      : 'media_auto';
+    const volumeBoost = this.els.inputVolumeBoost ? this.els.inputVolumeBoost.value : '2.2';
+    const micDeviceId = this.els.inputMicDevice ? this.els.inputMicDevice.value : 'auto';
+
+    const routingOrMicChanged =
+      audioRoutingMode !== this.pipeline.audioRoutingMode ||
+      micDeviceId !== this.pipeline.preferredMicDeviceId;
 
     localStorage.setItem(STORAGE_KEYS.GAS_URL, gasUrl);
     localStorage.setItem(STORAGE_KEYS.SECRET, secret);
@@ -483,6 +608,23 @@ class MandarinTutorApp {
     localStorage.setItem(STORAGE_KEYS.TOCFL_LEVEL, tocflLevel);
     localStorage.setItem(STORAGE_KEYS.VOICE_NAME, voiceName);
     localStorage.setItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL, preferredLiveModel);
+    localStorage.setItem(STORAGE_KEYS.AUDIO_ROUTING_MODE, audioRoutingMode);
+    localStorage.setItem(STORAGE_KEYS.VOLUME_BOOST, volumeBoost);
+    localStorage.setItem(STORAGE_KEYS.MIC_DEVICE_ID, micDeviceId);
+
+    this.pipeline.setAudioConfig({
+      routingMode: audioRoutingMode,
+      preferredDeviceId: micDeviceId,
+      outputVolumeBoost: Number(volumeBoost)
+    });
+
+    if (routingOrMicChanged && this.pipeline.micStream) {
+      try {
+        await this.pipeline.initAudioHardware(true);
+      } catch (errMic) {
+        debugLogger.log('error', 'mic_hotswap_error', errMic.message || String(errMic));
+      }
+    }
 
     this.liveAuth.voiceName = voiceName;
     this.liveAuth.preferredLiveModel = preferredLiveModel;
@@ -495,7 +637,10 @@ class MandarinTutorApp {
       newRatioPct,
       tocflLevel,
       voiceName,
-      preferredLiveModel
+      preferredLiveModel,
+      audioRoutingMode,
+      volumeBoost: Number(volumeBoost),
+      micDeviceId: micDeviceId === 'auto' ? 'auto' : micDeviceId.slice(0, 10)
     });
 
     if (gasUrl && secret) {
@@ -896,7 +1041,7 @@ class MandarinTutorApp {
     const startMs = performance.now();
     const candidates = await this._discoverFastGradingCandidates(apiKey);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 6500);
+    const timer = setTimeout(() => ctrl.abort(new Error('grading_timeout_14s')), 14000);
 
     try {
       const dialogueText = wordTurns
@@ -1738,10 +1883,12 @@ ${dialogueText}`;
       closeNote = `code=${d.code ?? '?'}${d.reason ? ` ("${this.escapeHtml(d.reason)}")` : ''} (${stats.unexpectedCloseCount} total)`;
     }
 
+    const audioSummary = debugLogger.context?.audioSummary || 'Not initialized yet';
     this.els.logsSummaryBox.innerHTML =
       `<strong>App ${this.escapeHtml(stats.version)}</strong> · Model: <code>${this.escapeHtml(stats.activeModel)}</code> · Events: <strong>${stats.totalEntries}</strong> · Hidden Thoughts: <strong>${stats.thoughtTurnCount}</strong><br />` +
+      `Audio: <code>${this.escapeHtml(audioSummary)}</code><br />` +
       `Unexpected WS Closes: <strong>${closeNote}</strong><br />` +
-      `<span style="font-size:0.76rem; color:var(--text-muted);">Tap <strong>Copy Logs for Gemini</strong> below and paste directly into Gemini chat to debug any voice, thinking, or WebSocket issue.</span>`;
+      `<span style="font-size:0.76rem; color:var(--text-muted);">Tap <strong>Copy Logs for Gemini</strong> below and paste directly into Gemini chat to debug any voice, car audio, or WebSocket issue.</span>`;
 
     const filter = this.els.selectLogFilter ? this.els.selectLogFilter.value : 'all';
     const entries = debugLogger.getEntries(filter);

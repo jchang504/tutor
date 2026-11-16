@@ -787,6 +787,31 @@ body {
 .log-level-tool { color: var(--accent-jade); font-weight: 600; }
 .log-level-ws { color: var(--accent-sky); }
 
+.audio-pill-btn {
+  margin-top: 4px;
+  align-self: flex-start;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audio-pill-btn:hover {
+  border-color: var(--accent-sky);
+  color: var(--text-primary);
+}
+
 @media (max-width: 480px) {
   .header-actions {
     gap: 6px;

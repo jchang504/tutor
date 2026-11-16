@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v16):
+ * Key architectural guarantees (v17):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -16,15 +16,44 @@
  * 5. Smart context- & sentence-completeness-aware endpointing (~850–1100ms on completed sentences,
  *    ~1950ms on incomplete mid-sentence pauses, and ~2650ms on the Phase 2->3 Reply & Ask Back turn)
  *    paired with clean digital-zero 16kHz PCM gating so server VAD responds fast without road-noise lag.
+ * 6. Car / Android Auto Audio Pipeline (`media_auto` default):
+ *    - Keeps Android Chrome in `AudioManager.MODE_NORMAL` (`STREAM_MUSIC`) so Pixel hardware volume
+ *      buttons adjust Media Volume (instead of Call Volume) and Android Auto stereo speakers play
+ *      cleanly without Bluetooth HFP conflicts or near-field handset noise-gate attenuation.
+ *    - WebAudio Broadcast Voice Mastering Chain (`85Hz` high-pass -> `DynamicsCompressorNode` ->
+ *      configurable `2.2x` makeup gain -> soft `tanh` limiter) boosts tutor speech loudness to match
+ *      podcasts / Google Maps navigation.
+ *    - Adaptive Far-Field Cabin Mic Pre-Amp (`1.0x`–`4.8x`) + sensitive SNR-based VAD ensures distant
+ *      driver speech in a car cabin is reliably detected and loud enough for Gemini ASR.
  */
 
-import { debugLogger } from './debug-logger.js?v=16';
+import { debugLogger } from './debug-logger.js?v=17';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
 // 1600 samples @ 16kHz (3200 zero bytes) = exact 100ms frame of pure digital silence
 const ZERO_PCM16_100MS_BASE64 = btoa('\0'.repeat(3200));
+
+/**
+ * Computes smooth, adaptive far-field microphone pre-amp gain (`1.0x` – `4.8x`):
+ * - Indoor close-talk speech (`rawRms >= 0.19`) stays at `1.0x` (untouched).
+ * - Distant car-cabin / cupholder / mount speech (`rawRms ~ 0.02–0.06`) smoothly boosts up to `4.8x`
+ *   (paired with soft `tanh` limiting during PCM16 encoding) so Gemini ASR receives healthy speech energy
+ *   without boosting pure road-noise pauses.
+ */
+export function computeAdaptiveInputGain(rawRms = 0, noiseFloor = 0.004, currentGain = 1.0) {
+  const safeNoise = Math.max(0.0002, Number(noiseFloor) || 0.004);
+  const voiceGate = Math.max(0.0055, safeNoise * 2.15);
+  if (rawRms >= voiceGate) {
+    if (rawRms >= 0.19 && currentGain <= 1.05) {
+      return 1.0;
+    }
+    const desired = Math.max(1.0, Math.min(4.8, 0.19 / Math.max(0.02, rawRms)));
+    return Number((0.72 * currentGain + 0.28 * desired).toFixed(3));
+  }
+  return Math.max(1.0, Number((0.96 * currentGain + 0.04 * 1.0).toFixed(3)));
+}
 
 const WORKLET_CODE = `
 class PcmRecorderProcessor extends AudioWorkletProcessor {
@@ -239,7 +268,7 @@ export function computeSmartSilenceThresholdMs({
       return { thresholdMs: 1850, reason: 'forming_question' };
     }
     return {
-      thresholdMs: voicedMs >= 1300 ? 1200 : 1650,
+      thresholdMs: voicedMs >= 1300 ? 1500 : 1850,
       reason: 'question_acoustic'
     };
   }
@@ -264,11 +293,12 @@ export function computeSmartSilenceThresholdMs({
     return { thresholdMs: 1500, reason: 'short_partial_transcript' };
   }
 
-  // Acoustic fallback when interim/final transcript has not arrived yet
+  // Acoustic fallback when interim/final transcript has not arrived yet (e.g. mobile cellular latency in car):
+  // Give 1650–1950ms so a brief mid-sentence pause while cellular ASR is still in flight doesn't cut off early!
   if (voicedMs >= 1350) {
-    return { thresholdMs: 1200, reason: 'acoustic_sentence_complete' };
+    return { thresholdMs: 1650, reason: 'acoustic_sentence_complete' };
   }
-  return { thresholdMs: 1650, reason: 'acoustic_short_utterance' };
+  return { thresholdMs: 1950, reason: 'acoustic_short_utterance' };
 }
 
 export function buildWordSystemInstruction(word, priorTurns = []) {
@@ -344,11 +374,31 @@ export class GeminiLiveVoicePipeline {
     this.onCompleteWord = callbacks.onCompleteWord || (() => {});
     this.onSessionControl = callbacks.onSessionControl || (() => {});
     this.onAudioLevel = callbacks.onAudioLevel || (() => {});
+    this.onAudioHardwareUpdate = callbacks.onAudioHardwareUpdate || (() => {});
     this.onError = callbacks.onError || (() => {});
 
     this.audioCtx = null;
     this.micStream = null;
+    this.micSourceNode = null;
     this.workletNode = null;
+    this.workletLoaded = false;
+    this.deviceChangeBound = false;
+
+    // Car / Android Auto Audio Routing & Broadcast Mastering Chain
+    this.audioRoutingMode = 'media_auto'; // 'media_auto' | 'bluetooth_hfp' | 'voice_comm'
+    this.preferredMicDeviceId = 'auto';
+    this.outputVolumeBoost = 2.2;
+    this.outputEntryNode = null;
+    this.outputBoostNode = null;
+    this.enumeratedAudioInputs = [];
+    this.activeMicInfo = {
+      label: 'Not initialized',
+      routingMode: 'media_auto',
+      echoCancellation: false,
+      noiseSuppression: false,
+      outputBoost: 2.2
+    };
+
     this.ws = null;
     this.activeModelId = null;
     this.isMuted = false;
@@ -373,12 +423,18 @@ export class GeminiLiveVoicePipeline {
     this.resumeSpeechFrames = 0;
     this.speechSegmentsInTurn = 0;
     this.turnVoicedMs = 0;
-    this.turnPeakSpeechRms = 0.06;
+    this.turnPeakSpeechRms = 0.04;
     this.silenceFramesSentInPause = 0;
     this.pausePreRollBuffer = [];
     this.lastVoiceActivityTime = 0;
     this.lastCountdownText = '';
-    this.noiseFloor = 0.005;
+    this.noiseFloor = 0.0035;
+    this.currentInputGain = 1.0;
+    this.turnFramesCount = 0;
+    this.turnZeroFramesCount = 0;
+    this.turnRawMaxRms = 0;
+    this.turnRawSumRms = 0;
+    this.turnBoostedMaxRms = 0;
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
     this.currentTurnTutorTranscript = '';
@@ -407,6 +463,203 @@ export class GeminiLiveVoicePipeline {
     this.maxReconnectAttempts = 3;
     this.isReconnecting = false;
     this.connectionState = 'idle';
+  }
+
+  setAudioConfig({ routingMode, preferredDeviceId, outputVolumeBoost } = {}) {
+    if (routingMode && ['media_auto', 'bluetooth_hfp', 'voice_comm'].includes(routingMode)) {
+      this.audioRoutingMode = routingMode;
+    }
+    if (typeof preferredDeviceId === 'string' && preferredDeviceId.trim()) {
+      this.preferredMicDeviceId = preferredDeviceId.trim();
+    }
+    if (outputVolumeBoost !== undefined) {
+      this.setOutputVolumeBoost(outputVolumeBoost);
+    } else {
+      this._syncAudioSummaryContext();
+    }
+  }
+
+  setOutputVolumeBoost(boost = 2.2) {
+    const parsed = Number(boost);
+    const clamped = Number.isFinite(parsed) ? Math.max(0.8, Math.min(3.5, parsed)) : 2.2;
+    this.outputVolumeBoost = Number(clamped.toFixed(2));
+    if (this.outputBoostNode && this.audioCtx) {
+      this.outputBoostNode.gain.setValueAtTime(this.outputVolumeBoost, this.audioCtx.currentTime);
+    }
+    this.activeMicInfo.outputBoost = this.outputVolumeBoost;
+    this._syncAudioSummaryContext();
+    this.onAudioHardwareUpdate(this.activeMicInfo, this.enumeratedAudioInputs);
+  }
+
+  _routingModeShortLabel(mode = this.audioRoutingMode) {
+    if (mode === 'bluetooth_hfp') return 'BT Call HFP';
+    if (mode === 'voice_comm') return 'Phone Speaker AEC';
+    return 'Media / Android Auto';
+  }
+
+  _syncAudioSummaryContext() {
+    const modeLabel = this._routingModeShortLabel(this.audioRoutingMode);
+    const micLabel = this.activeMicInfo?.label || 'Not initialized';
+    const summary = `${modeLabel} | Mic: "${micLabel}" (AEC=${Boolean(
+      this.activeMicInfo?.echoCancellation
+    )}, NS=${Boolean(this.activeMicInfo?.noiseSuppression)}) | OutBoost: ${this.outputVolumeBoost}x`;
+    debugLogger.setContext({ audioSummary: summary });
+  }
+
+  _createSoftLimiterCurve(samples = 2048) {
+    const curve = new Float32Array(samples);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / (samples - 1) - 1;
+      curve[i] = Math.tanh(x * 1.25) / Math.tanh(1.25);
+    }
+    return curve;
+  }
+
+  _ensureOutputMasteringChain() {
+    if (!this.audioCtx || this.outputEntryNode) return;
+    try {
+      const highpass = this.audioCtx.createBiquadFilter();
+      highpass.type = 'highpass';
+      highpass.frequency.value = 85;
+      highpass.Q.value = 0.707;
+
+      const compressor = this.audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -22;
+      compressor.knee.value = 12;
+      compressor.ratio.value = 3.5;
+      compressor.attack.value = 0.004;
+      compressor.release.value = 0.18;
+
+      const boostGain = this.audioCtx.createGain();
+      boostGain.gain.value = this.outputVolumeBoost;
+
+      const limiter = this.audioCtx.createWaveShaper();
+      limiter.curve = this._createSoftLimiterCurve(2048);
+      limiter.oversample = '2x';
+
+      highpass.connect(compressor);
+      compressor.connect(boostGain);
+      boostGain.connect(limiter);
+      limiter.connect(this.audioCtx.destination);
+
+      this.outputEntryNode = highpass;
+      this.outputBoostNode = boostGain;
+    } catch (err) {
+      debugLogger.log(
+        'warn',
+        'audio_mastering_fallback',
+        `Mastering chain fallback to direct destination: ${err.message || err}`
+      );
+      this.outputEntryNode = this.audioCtx.destination;
+    }
+  }
+
+  async enumerateAudioDevices(reason = 'manual') {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.enumerateDevices !== 'function'
+    ) {
+      return { inputs: [], outputs: [] };
+    }
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      const inputs = all
+        .filter((d) => d.kind === 'audioinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId || '',
+          shortId: (d.deviceId || '').slice(0, 10),
+          label: d.label || `Microphone ${idx + 1}`,
+          groupId: (d.groupId || '').slice(0, 8)
+        }));
+      const outputs = all
+        .filter((d) => d.kind === 'audiooutput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId || '',
+          shortId: (d.deviceId || '').slice(0, 10),
+          label: d.label || `Speaker ${idx + 1}`
+        }));
+
+      this.enumeratedAudioInputs = inputs;
+      const hasBluetoothInput = inputs.some((d) =>
+        /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(d.label)
+      );
+      const hasUsbInput = inputs.some((d) => /usb|android auto/i.test(d.label));
+      const hasSpeakerphoneInput = inputs.some((d) => /speakerphone/i.test(d.label));
+
+      debugLogger.log('info', 'audio_devices_enumerated', `Enumerated ${inputs.length} mic(s) (${reason})`, {
+        reason,
+        hasBluetoothInput,
+        hasUsbInput,
+        hasSpeakerphoneInput,
+        inputs: inputs.map((i) => ({ id: i.shortId, label: i.label })),
+        outputs: outputs.map((o) => ({ id: o.shortId, label: o.label }))
+      });
+
+      this.onAudioHardwareUpdate(this.activeMicInfo, this.enumeratedAudioInputs);
+      return { inputs, outputs };
+    } catch (err) {
+      debugLogger.log('warn', 'audio_enumerate_failed', err.message || String(err));
+      return { inputs: [], outputs: [] };
+    }
+  }
+
+  _pickAutoDeviceIdForMode(inputs = [], mode = this.audioRoutingMode) {
+    if (!Array.isArray(inputs) || inputs.length === 0) return null;
+    if (mode === 'bluetooth_hfp') {
+      const bt = inputs.find(
+        (d) =>
+          /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(d.label) &&
+          !/earpiece|wired/i.test(d.label)
+      );
+      return bt ? bt.deviceId : null;
+    }
+    if (mode === 'voice_comm') {
+      const spk = inputs.find((d) => /speakerphone/i.test(d.label));
+      return spk ? spk.deviceId : null;
+    }
+    // In `media_auto` (Media / Android Auto Far-Field), avoid earpiece; prefer USB/external if present, else default
+    const usb = inputs.find(
+      (d) => /usb|external/i.test(d.label) && !/earpiece/i.test(d.label)
+    );
+    return usb ? usb.deviceId : null;
+  }
+
+  _buildAudioConstraints(targetDeviceId = null) {
+    const devConstraint =
+      targetDeviceId && targetDeviceId !== 'auto' ? { deviceId: { exact: targetDeviceId } } : {};
+
+    if (this.audioRoutingMode === 'bluetooth_hfp') {
+      return {
+        ...devConstraint,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      };
+    }
+    if (this.audioRoutingMode === 'voice_comm') {
+      return {
+        ...devConstraint,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: true
+      };
+    }
+    // Default `media_auto`:
+    // Disables WebRTC `VOICE_COMMUNICATION` (`echoCancellation: false, noiseSuppression: false`) so:
+    // 1. Pixel 9 stays in `AudioManager.MODE_NORMAL` (`STREAM_MUSIC`) -> Volume rocker controls Media Volume!
+    // 2. Android Auto stereo media plays cleanly on Nissan Leaf SV speakers without Bluetooth HFP conflicts.
+    // 3. Far-field driver speech 2–3 ft away is NOT crushed by Android's near-field handset noise gate.
+    // (Safe from echo because our pipeline is strictly half-duplex and gates mic during playback + 280ms decay!)
+    return {
+      ...devConstraint,
+      channelCount: 1,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: true
+    };
   }
 
   _emitState(state, statusText) {
@@ -463,57 +716,258 @@ export class GeminiLiveVoicePipeline {
     });
   }
 
+  _buildTurnMicTelemetry() {
+    const frames = this.turnFramesCount;
+    const avgRms = frames > 0 ? this.turnRawSumRms / frames : 0;
+    return {
+      routingMode: this.audioRoutingMode,
+      micLabel: this.activeMicInfo?.label || 'unknown',
+      frames,
+      zeroFrames: this.turnZeroFramesCount,
+      rawMaxRms: Number(this.turnRawMaxRms.toFixed(4)),
+      rawAvgRms: Number(avgRms.toFixed(4)),
+      boostedMaxRms: Number(this.turnBoostedMaxRms.toFixed(4)),
+      inputGain: Number(this.currentInputGain.toFixed(2)),
+      noiseFloor: Number(this.noiseFloor.toFixed(4))
+    };
+  }
+
   /**
-   * Initializes the persistent WebAudio context and microphone stream once when the user taps "Start Driving Session".
+   * Initializes (or hot-swaps) the WebAudio mastering chain and microphone stream.
    */
-  async initAudioHardware() {
+  async initAudioHardware(forceReacquireMic = false) {
     if (!this.audioCtx) {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      this.audioCtx = new AudioContextClass({ sampleRate: 24000 });
-      debugLogger.log('info', 'audio_ctx_init', `Initialized WebAudio (${this.audioCtx.sampleRate}Hz)`);
+      try {
+        this.audioCtx = new AudioContextClass({ sampleRate: 24000, latencyHint: 'interactive' });
+      } catch (_) {
+        this.audioCtx = new AudioContextClass({ sampleRate: 24000 });
+      }
+      debugLogger.log('info', 'audio_ctx_init', `Initialized WebAudio (${this.audioCtx.sampleRate}Hz)`, {
+        sampleRate: this.audioCtx.sampleRate,
+        baseLatency: this.audioCtx.baseLatency ?? null,
+        outputBoost: this.outputVolumeBoost,
+        routingMode: this.audioRoutingMode
+      });
     }
+    this._ensureOutputMasteringChain();
+
     if (this.audioCtx.state === 'suspended') {
       await this.audioCtx.resume();
     }
 
-    if (!this.micStream) {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-      const trackLabel = this.micStream.getAudioTracks()[0]?.label || 'default mic';
-      debugLogger.log('info', 'mic_acquired', `Microphone ready (${trackLabel})`);
-
+    if (!this.workletLoaded) {
       const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
       const workletUrl = URL.createObjectURL(blob);
       await this.audioCtx.audioWorklet.addModule(workletUrl);
       URL.revokeObjectURL(workletUrl);
+      this.workletLoaded = true;
+    }
 
-      const source = this.audioCtx.createMediaStreamSource(this.micStream);
+    if (!this.workletNode) {
       this.workletNode = new AudioWorkletNode(this.audioCtx, 'pcm-recorder-processor');
-
       this.workletNode.port.onmessage = (event) => {
         if (!this.isActive || this.isMuted || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
           return;
         }
         const float32Samples = event.data;
-        const rms = this._computeMicLevel(float32Samples);
-        this._processMicFrameWithVad(float32Samples, rms);
+        const rawRms = this._computeRawRms(float32Samples);
+        this._processMicFrameWithVad(float32Samples, rawRms);
       };
 
-      source.connect(this.workletNode);
       const silentGain = this.audioCtx.createGain();
       silentGain.gain.value = 0;
       this.workletNode.connect(silentGain);
       silentGain.connect(this.audioCtx.destination);
     }
+
+    const existingTracks = this.micStream ? this.micStream.getAudioTracks() : [];
+    const micDead =
+      existingTracks.length === 0 || existingTracks.every((t) => t.readyState === 'ended');
+
+    if (!this.micStream || forceReacquireMic || micDead) {
+      await this._acquireAndBindMicrophone(forceReacquireMic ? 'reconfigure' : 'session_init');
+    }
+
+    if (
+      !this.deviceChangeBound &&
+      typeof navigator !== 'undefined' &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.addEventListener === 'function'
+    ) {
+      this.deviceChangeBound = true;
+      navigator.mediaDevices.addEventListener('devicechange', async () => {
+        const { inputs } = await this.enumerateAudioDevices('devicechange_hotplug');
+        const activeTrack = this.micStream ? this.micStream.getAudioTracks()[0] : null;
+        const trackEnded = !activeTrack || activeTrack.readyState === 'ended';
+        const autoBtTarget =
+          this.audioRoutingMode === 'bluetooth_hfp' && this.preferredMicDeviceId === 'auto'
+            ? this._pickAutoDeviceIdForMode(inputs, 'bluetooth_hfp')
+            : null;
+        const shouldSwitchToNewBt =
+          Boolean(autoBtTarget) &&
+          activeTrack &&
+          !/bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(activeTrack.label || '');
+
+        debugLogger.log('info', 'audio_device_changed', 'Audio hardware topology changed (USB/AA/BT)', {
+          trackEnded,
+          shouldSwitchToNewBt,
+          activeTrackLabel: activeTrack ? activeTrack.label : null,
+          inputsCount: inputs.length
+        });
+
+        if (this.isActive && (trackEnded || shouldSwitchToNewBt)) {
+          this._acquireAndBindMicrophone('hotplug_recovery').catch((err) => {
+            debugLogger.log('error', 'mic_hotplug_recovery_failed', err.message || String(err));
+          });
+        }
+      });
+    }
   }
 
-  _processMicFrameWithVad(float32Samples, rms) {
+  async _acquireAndBindMicrophone(reason = 'init') {
+    if (this.micSourceNode) {
+      try {
+        this.micSourceNode.disconnect();
+      } catch (_) {}
+      this.micSourceNode = null;
+    }
+    if (this.micStream) {
+      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream = null;
+    }
+
+    let preInputs = this.enumeratedAudioInputs;
+    if (!preInputs || preInputs.length === 0) {
+      const enumRes = await this.enumerateAudioDevices(`${reason}_pre`);
+      preInputs = enumRes.inputs;
+    }
+
+    const chosenDeviceId =
+      this.preferredMicDeviceId !== 'auto'
+        ? this.preferredMicDeviceId
+        : this._pickAutoDeviceIdForMode(preInputs, this.audioRoutingMode);
+
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: this._buildAudioConstraints(chosenDeviceId)
+      });
+    } catch (errSpecific) {
+      debugLogger.log(
+        'warn',
+        'mic_constraints_fallback',
+        `Specific mic constraints failed (${errSpecific.message || errSpecific}); falling back to default device`,
+        { routingMode: this.audioRoutingMode, chosenDeviceId: (chosenDeviceId || '').slice(0, 10) }
+      );
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: this._buildAudioConstraints(null)
+      });
+    }
+
+    // Re-enumerate once permission is granted so full device labels (`Bluetooth headset`, `Speakerphone`, etc.) appear!
+    const postEnum = await this.enumerateAudioDevices(`${reason}_post`);
+    if (
+      this.preferredMicDeviceId === 'auto' &&
+      (this.audioRoutingMode === 'bluetooth_hfp' || this.audioRoutingMode === 'voice_comm')
+    ) {
+      const currentLabel = stream.getAudioTracks()[0]?.label || '';
+      const desiredAutoId = this._pickAutoDeviceIdForMode(postEnum.inputs, this.audioRoutingMode);
+      const alreadyMatched =
+        this.audioRoutingMode === 'bluetooth_hfp'
+          ? /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(currentLabel)
+          : /speakerphone/i.test(currentLabel);
+
+      if (desiredAutoId && !alreadyMatched) {
+        try {
+          const upgradedStream = await navigator.mediaDevices.getUserMedia({
+            audio: this._buildAudioConstraints(desiredAutoId)
+          });
+          stream.getTracks().forEach((t) => t.stop());
+          stream = upgradedStream;
+        } catch (_) {}
+      }
+    }
+
+    this.micStream = stream;
+    const track = stream.getAudioTracks()[0];
+    const settings = track && typeof track.getSettings === 'function' ? track.getSettings() : {};
+    const trackLabel = track?.label || 'Default Microphone';
+
+    this.activeMicInfo = {
+      label: trackLabel,
+      routingMode: this.audioRoutingMode,
+      echoCancellation:
+        settings.echoCancellation ?? (this.audioRoutingMode !== 'media_auto'),
+      noiseSuppression:
+        settings.noiseSuppression ?? (this.audioRoutingMode === 'bluetooth_hfp'),
+      autoGainControl: settings.autoGainControl ?? true,
+      sampleRate: settings.sampleRate || this.audioCtx?.sampleRate || 24000,
+      muted: Boolean(track?.muted),
+      readyState: track?.readyState || 'live',
+      outputBoost: this.outputVolumeBoost
+    };
+
+    if (track) {
+      track.onmute = () => {
+        debugLogger.log('warn', 'mic_track_event', `Mic track muted by OS (${trackLabel})`, {
+          event: 'mute',
+          label: trackLabel,
+          routingMode: this.audioRoutingMode
+        });
+      };
+      track.onunmute = () => {
+        debugLogger.log('info', 'mic_track_event', `Mic track unmuted (${trackLabel})`, {
+          event: 'unmute',
+          label: trackLabel,
+          routingMode: this.audioRoutingMode
+        });
+      };
+      track.onended = () => {
+        debugLogger.log('warn', 'mic_track_event', `Mic track ended (${trackLabel})`, {
+          event: 'ended',
+          label: trackLabel,
+          routingMode: this.audioRoutingMode
+        });
+        if (this.isActive && !this.intentionalClose) {
+          this._acquireAndBindMicrophone('track_ended_recovery').catch(() => {});
+        }
+      };
+    }
+
+    this.micSourceNode = this.audioCtx.createMediaStreamSource(this.micStream);
+    this.micSourceNode.connect(this.workletNode);
+
+    this._syncAudioSummaryContext();
+    debugLogger.log(
+      'info',
+      'mic_acquired',
+      `Microphone ready: "${trackLabel}" [${this._routingModeShortLabel()}]`,
+      {
+        reason,
+        label: trackLabel,
+        routingMode: this.audioRoutingMode,
+        preferredMicDeviceId:
+          this.preferredMicDeviceId === 'auto'
+            ? 'auto'
+            : this.preferredMicDeviceId.slice(0, 10),
+        muted: Boolean(track?.muted),
+        readyState: track?.readyState || 'unknown',
+        settings: {
+          sampleRate: settings.sampleRate ?? null,
+          channelCount: settings.channelCount ?? null,
+          echoCancellation: settings.echoCancellation ?? null,
+          noiseSuppression: settings.noiseSuppression ?? null,
+          autoGainControl: settings.autoGainControl ?? null
+        },
+        outputVolumeBoost: this.outputVolumeBoost
+      }
+    );
+
+    this.onAudioHardwareUpdate(this.activeMicInfo, this.enumeratedAudioInputs);
+  }
+
+  _processMicFrameWithVad(float32Samples, rawRms) {
     const now = performance.now();
 
     if (
@@ -527,28 +981,57 @@ export class GeminiLiveVoicePipeline {
       return;
     }
 
-    const inputRate = this.audioCtx ? this.audioCtx.sampleRate : 24000;
-    const pcm16Base64 = this._downsampleAndEncodePcm16(float32Samples, inputRate, 16000);
+    this.turnFramesCount += 1;
+    if (rawRms < 0.00005) {
+      this.turnZeroFramesCount += 1;
+    }
+    if (rawRms > this.turnRawMaxRms) {
+      this.turnRawMaxRms = rawRms;
+    }
+    this.turnRawSumRms += rawRms;
 
-    const speechStartThreshold = Math.max(0.016, Math.min(0.05, this.noiseFloor * 2.8));
+    this.currentInputGain = computeAdaptiveInputGain(
+      rawRms,
+      this.noiseFloor,
+      this.currentInputGain
+    );
+    const boostedRms = Math.min(1, rawRms * this.currentInputGain);
+    if (boostedRms > this.turnBoostedMaxRms) {
+      this.turnBoostedMaxRms = boostedRms;
+    }
+    this.onAudioLevel(Math.min(1, boostedRms * 5));
+
+    const inputRate = this.audioCtx ? this.audioCtx.sampleRate : 24000;
+    const pcm16Base64 = this._downsampleAndEncodePcm16(
+      float32Samples,
+      inputRate,
+      16000,
+      this.currentInputGain
+    );
+
+    // Far-field car-friendly SNR threshold (floor 0.0075 instead of 0.016 so distant cabin speech triggers reliably!)
+    const speechStartThreshold = Math.max(0.0075, Math.min(0.042, this.noiseFloor * 2.85));
 
     if (!this.userSpokeInTurn) {
       this._sendAudioChunk(pcm16Base64);
 
-      if (rms >= speechStartThreshold) {
+      if (rawRms >= speechStartThreshold) {
         this.consecutiveSpeechFrames += 1;
-        if (this.consecutiveSpeechFrames >= 3) {
+        const requiredFrames = rawRms >= speechStartThreshold * 1.18 ? 2 : 3;
+        if (this.consecutiveSpeechFrames >= requiredFrames) {
           this.userSpokeInTurn = true;
           this.speechSegmentsInTurn = 1;
-          this.turnVoicedMs = 300;
-          this.turnPeakSpeechRms = Math.max(0.06, Math.min(0.4, rms));
+          this.turnVoicedMs = requiredFrames * 100;
+          this.turnPeakSpeechRms = Math.max(0.025, Math.min(0.4, rawRms));
           this.silenceFramesSentInPause = 0;
           this.resumeSpeechFrames = 0;
           this.pausePreRollBuffer = [];
           this.lastVoiceActivityTime = now;
           this.lastCountdownText = '';
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
-            rms: Number(rms.toFixed(4)),
+            rawRms: Number(rawRms.toFixed(4)),
+            boostedRms: Number(boostedRms.toFixed(4)),
+            inputGain: Number(this.currentInputGain.toFixed(2)),
             noiseFloor: Number(this.noiseFloor.toFixed(4)),
             threshold: Number(speechStartThreshold.toFixed(4)),
             turnExpectation: this.turnExpectation
@@ -557,23 +1040,27 @@ export class GeminiLiveVoicePipeline {
         }
       } else {
         this.consecutiveSpeechFrames = 0;
-        this.noiseFloor = 0.93 * this.noiseFloor + 0.07 * rms;
+        const updatedNoise =
+          rawRms < this.noiseFloor
+            ? 0.85 * this.noiseFloor + 0.15 * rawRms
+            : 0.97 * this.noiseFloor + 0.03 * rawRms;
+        this.noiseFloor = Math.max(0.0002, Math.min(0.025, updatedNoise));
       }
       return;
     }
 
     const speechContinueThreshold = Math.max(
-      0.014,
-      Math.min(0.042, Math.max(this.noiseFloor * 2.3, this.turnPeakSpeechRms * 0.12))
+      0.0055,
+      Math.min(0.036, Math.max(this.noiseFloor * 2.15, this.turnPeakSpeechRms * 0.11))
     );
     const silenceBeforeFrame = now - this.lastVoiceActivityTime;
 
     let isVoicedSpeech = false;
     if (silenceBeforeFrame <= 300) {
-      isVoicedSpeech = rms >= speechContinueThreshold;
-    } else if (rms >= Math.max(speechStartThreshold * 1.35, speechContinueThreshold * 1.55)) {
+      isVoicedSpeech = rawRms >= speechContinueThreshold;
+    } else if (rawRms >= Math.max(speechStartThreshold * 1.25, speechContinueThreshold * 1.45)) {
       isVoicedSpeech = true;
-    } else if (rms >= speechContinueThreshold) {
+    } else if (rawRms >= speechContinueThreshold) {
       this.resumeSpeechFrames += 1;
       if (this.resumeSpeechFrames >= 2) {
         isVoicedSpeech = true;
@@ -596,7 +1083,7 @@ export class GeminiLiveVoicePipeline {
       this.resumeSpeechFrames = 0;
       this.lastVoiceActivityTime = now;
       this.turnVoicedMs += 100;
-      this.turnPeakSpeechRms = Math.min(0.4, Math.max(this.turnPeakSpeechRms * 0.98, rms));
+      this.turnPeakSpeechRms = Math.min(0.4, Math.max(this.turnPeakSpeechRms * 0.98, rawRms));
       this._sendAudioChunk(pcm16Base64);
 
       if (this.lastCountdownText !== '') {
@@ -694,10 +1181,21 @@ export class GeminiLiveVoicePipeline {
     if (this.tutorTurnActive || this.wordTerminalActionLocked) return;
 
     const hadUserSpeech = this.userSpokeInTurn;
+    if (reason === 'manual_done' && this.listeningForUser && this.pausePreRollBuffer.length > 0) {
+      for (const bufferedChunk of this.pausePreRollBuffer) {
+        this._sendAudioChunk(bufferedChunk);
+      }
+      this.pausePreRollBuffer = [];
+    }
+
     // Burst clean digital-zero 16kHz PCM frames so server automaticActivityDetection (`silenceDurationMs: 950`)
     // deterministically sees >= 1200ms of clean silence and fires end-of-turn immediately (both on smart
-    // endpointing AND when tapping `Done Speaking`), immune to car road noise!
-    if (hadUserSpeech && this.listeningForUser) {
+    // endpointing AND when tapping `Done Speaking`, even if car cabin speech stayed below local VAD!),
+    // completely immune to car road noise!
+    const shouldSendZeroBurst =
+      this.listeningForUser &&
+      (hadUserSpeech || (reason === 'manual_done' && this.sentAudioChunksInTurn > 0));
+    if (shouldSendZeroBurst) {
       const zeroBurstCount = Math.max(6, 12 - this.silenceFramesSentInPause);
       for (let i = 0; i < zeroBurstCount; i++) {
         this._sendAudioChunk(ZERO_PCM16_100MS_BASE64);
@@ -706,6 +1204,8 @@ export class GeminiLiveVoicePipeline {
 
     const chunksSent = this.sentAudioChunksInTurn;
     const liveTranscriptSnapshot = this._getCombinedLiveUserTranscript();
+    const micStats = this._buildTurnMicTelemetry();
+
     this.isPhase1InitialTurn = false;
     this.silentTurnRetries = 0;
     this.listeningForUser = false;
@@ -727,7 +1227,8 @@ export class GeminiLiveVoicePipeline {
       voicedMs: this.turnVoicedMs,
       ...telemetryExtra,
       audioChunksSent: chunksSent,
-      transcriptSoFar: liveTranscriptSnapshot
+      transcriptSoFar: liveTranscriptSnapshot,
+      micStats
     });
 
     this._emitState('connecting', 'Processing your Mandarin...');
@@ -737,7 +1238,7 @@ export class GeminiLiveVoicePipeline {
       clearTimeout(this.noReplyRecoveryTimer);
     }
 
-    const recoveryWaitMs = hadUserSpeech || liveTranscriptSnapshot ? 5000 : 3000;
+    const recoveryWaitMs = hadUserSpeech || liveTranscriptSnapshot ? 5000 : 3200;
     this.noReplyRecoveryTimer = setTimeout(() => {
       this.noReplyRecoveryTimer = null;
       if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -757,7 +1258,7 @@ export class GeminiLiveVoicePipeline {
           'warn',
           'no_reply_timer_fired',
           `No server output after ${recoveryWaitMs}ms; sending single realtimeInput.text nudge`,
-          { latestTranscript }
+          { latestTranscript, micStats }
         );
         this.serverAckedCurrentUserTurn = true;
         try {
@@ -773,7 +1274,8 @@ export class GeminiLiveVoicePipeline {
         debugLogger.log(
           'info',
           'no_reply_timer_fired',
-          `No speech transcribed after ${recoveryWaitMs}ms (ambient noise); resuming listening`
+          `No speech transcribed after ${recoveryWaitMs}ms (ambient noise or quiet mic); resuming listening`,
+          { micStats }
         );
         this._beginListeningTurn();
       }
@@ -796,7 +1298,7 @@ export class GeminiLiveVoicePipeline {
       const osc = this.audioCtx.createOscillator();
       const gain = this.audioCtx.createGain();
       osc.connect(gain);
-      gain.connect(this.audioCtx.destination);
+      gain.connect(this.outputEntryNode || this.audioCtx.destination);
 
       if (type === 'start') {
         osc.frequency.setValueAtTime(523.25, now); // C5
@@ -1376,14 +1878,22 @@ export class GeminiLiveVoicePipeline {
     this.resumeSpeechFrames = 0;
     this.speechSegmentsInTurn = 0;
     this.turnVoicedMs = 0;
-    this.turnPeakSpeechRms = 0.06;
+    this.turnPeakSpeechRms = 0.04;
+    this.turnFramesCount = 0;
+    this.turnZeroFramesCount = 0;
+    this.turnRawMaxRms = 0;
+    this.turnRawSumRms = 0;
+    this.turnBoostedMaxRms = 0;
     this.silenceFramesSentInPause = 0;
     this.pausePreRollBuffer = [];
     this.sentAudioChunksInTurn = 0;
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
     this.lastCountdownText = '';
-    this.postPlaybackCooldownUntil = performance.now() + 180;
+    // 280ms post-playback decay in `media_auto` ensures car cabin speaker reverb dies out completely
+    // before the mic opens, giving rock-solid zero-echo half-duplex without WebRTC VOICE_COMMUNICATION!
+    const cooldownMs = this.audioRoutingMode === 'media_auto' ? 280 : 180;
+    this.postPlaybackCooldownUntil = performance.now() + cooldownMs;
 
     let defaultLabel = 'Your turn — speak in Mandarin';
     if (this.turnExpectation === 'reply_and_ask_back') {
@@ -1684,7 +2194,8 @@ export class GeminiLiveVoicePipeline {
           const engPrompt = String(this.currentWord.english_prompt || '').trim();
           const engWords = engPrompt.match(/[A-Za-z0-9']+/g) || [];
           const minBothSec = Math.min(3.65, Math.max(3.15, 2.35 + engWords.length * 0.19));
-          const hasChineseInstructionEnd = /中文|說說看|怎麼說|翻譯/.test(completedTutorText);
+          const compactTutorText = completedTutorText.replace(/\s+/g, '');
+          const hasChineseInstructionEnd = /中文|說說看|怎麼說|翻譯/.test(compactTutorText);
           const lowerTranscript = completedTutorText.toLowerCase();
           const matchedEngWords = engWords.filter((w) =>
             lowerTranscript.includes(w.toLowerCase())
@@ -1832,7 +2343,7 @@ export class GeminiLiveVoicePipeline {
 
     const src = this.audioCtx.createBufferSource();
     src.buffer = audioBuffer;
-    src.connect(this.audioCtx.destination);
+    src.connect(this.outputEntryNode || this.audioCtx.destination);
 
     const now = this.audioCtx.currentTime;
     if (this.nextPlayTime < now) {
@@ -1907,10 +2418,20 @@ export class GeminiLiveVoicePipeline {
 
   async destroyAll() {
     this.closeCurrentWordSocket();
+    if (this.micSourceNode) {
+      try {
+        this.micSourceNode.disconnect();
+      } catch (_) {}
+      this.micSourceNode = null;
+    }
     if (this.micStream) {
       this.micStream.getTracks().forEach((t) => t.stop());
       this.micStream = null;
     }
+    this.outputEntryNode = null;
+    this.outputBoostNode = null;
+    this.workletNode = null;
+    this.workletLoaded = false;
     if (this.audioCtx) {
       try {
         await this.audioCtx.close();
@@ -1919,18 +2440,25 @@ export class GeminiLiveVoicePipeline {
     }
   }
 
-  _computeMicLevel(float32Samples) {
+  _computeRawRms(float32Samples) {
     let sum = 0;
-    for (let i = 0; i < float32Samples.length; i += 4) {
+    const step = 2;
+    let count = 0;
+    for (let i = 0; i < float32Samples.length; i += step) {
       const s = float32Samples[i];
       sum += s * s;
+      count += 1;
     }
-    const rms = Math.sqrt(sum / (float32Samples.length / 4));
+    return count > 0 ? Math.sqrt(sum / count) : 0;
+  }
+
+  _computeMicLevel(float32Samples) {
+    const rms = this._computeRawRms(float32Samples);
     this.onAudioLevel(Math.min(1, rms * 5));
     return rms;
   }
 
-  _downsampleAndEncodePcm16(buffer, inputRate, outputRate) {
+  _downsampleAndEncodePcm16(buffer, inputRate, outputRate, inputGain = 1.0) {
     let samples = buffer;
     if (inputRate !== outputRate) {
       const ratio = inputRate / outputRate;
@@ -1951,9 +2479,12 @@ export class GeminiLiveVoicePipeline {
       }
     }
 
+    const usePreAmp = Number.isFinite(inputGain) && inputGain > 1.01;
     const bytes = new Uint8Array(samples.length * 2);
     for (let i = 0; i < samples.length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
+      const rawSample = samples[i];
+      const boosted = usePreAmp ? Math.tanh(rawSample * inputGain) : rawSample;
+      const s = Math.max(-1, Math.min(1, boosted));
       const int16 = s < 0 ? s * 0x8000 : s * 0x7fff;
       bytes[i * 2] = int16 & 0xff;
       bytes[i * 2 + 1] = (int16 >> 8) & 0xff;

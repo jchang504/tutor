@@ -10,7 +10,7 @@
  * - Formats a paste-ready Markdown diagnostic bundle for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v16';
+export const APP_VERSION = 'v17';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
@@ -53,7 +53,8 @@ class DebugLogger {
       wordPrompt: null,
       model: null,
       phase: null,
-      connectionState: 'idle'
+      connectionState: 'idle',
+      audioSummary: null
     };
     this.hasUnreadIssue = false;
     this.issueCount = 0;
@@ -333,6 +334,7 @@ class DebugLogger {
       `- **Exported At:** ${new Date().toISOString()}`,
       `- **App Version:** ${APP_VERSION}`,
       `- **User Agent:** ${ua}`,
+      `- **Audio Pipeline:** ${this.context.audioSummary || 'not initialized'}`,
       `- **Active / Last Model:** ${stats.activeModel}`,
       `- **Current / Last Word:** ${stats.activeWord}${this.context.wordPrompt ? ` ("${this.context.wordPrompt}")` : ''}`,
       `- **Connection State:** ${stats.connectionState} (Phase: ${this.context.phase || 'n/a'})`,
@@ -349,7 +351,7 @@ class DebugLogger {
       lines.push(`- **Last Error:** ${stats.lastError.summary} (${stats.lastError.ts})`);
     }
 
-    // Highlight section: errors, warnings, unexpected closes, tool calls, and hidden model thoughts
+    // Highlight section: errors, warnings, unexpected closes, tool calls, audio hardware routing, and hidden model thoughts
     const highlights = this.entries.filter(
       (e) =>
         e.level === 'error' ||
@@ -357,7 +359,11 @@ class DebugLogger {
         e.level === 'thought' ||
         e.level === 'tool' ||
         e.event === 'ws_close_unexpected' ||
-        e.event === 'no_reply_timer_fired'
+        e.event === 'no_reply_timer_fired' ||
+        e.event === 'mic_acquired' ||
+        e.event === 'audio_devices_enumerated' ||
+        e.event === 'audio_device_changed' ||
+        e.event === 'mic_track_event'
     );
 
     if (highlights.length > 0) {
