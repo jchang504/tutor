@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v19):
+ * Key architectural guarantees (v20):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -24,7 +24,7 @@
  *      compressor, or waveshaper distortion over Bluetooth SCO/HFP).
  */
 
-import { debugLogger } from './debug-logger.js?v=19';
+import { debugLogger } from './debug-logger.js?v=20';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -344,8 +344,8 @@ export function buildWordSystemInstruction(
 ) {
   const referenceMandarin = (word.mandarin_sentence || word.sample_mandarin || '').trim();
   const synonymsLine = word.common_synonyms
-    ? `常見近義詞（若學生誤用請溫柔引導換成目標詞，不要扣分）：${word.common_synonyms}`
-    : '若學生使用了其他合法的近義詞，請肯定他的句子，並提示他換成我們今天要練習的目標詞，不要直接唸出目標詞的發音，也不扣分。';
+    ? `常見近義詞（若學生先說了近義詞，請肯定句子自然並請他換成今天要練習的另一個近義詞，不要直接唸出目標詞讀音，也不要扣分）：${word.common_synonyms}`
+    : '若學生使用了其他合法的近義詞，請先肯定句子自然，並請他「換成我們今天要練習的另一個近義詞」再把整句話說一次，不要直接唸出目標詞的發音，也不扣分。';
 
   let resumeSection = '';
   if (Array.isArray(priorTurns) && priorTurns.length > 0) {
@@ -411,7 +411,7 @@ export function buildWordSystemInstruction(
      - **局部錯誤請勿直接洩漏整句答案（極重要）**：
        - 如果問題**只出在某一個詞、某個字的發音/聲調、或某個短語**（或是夾雜了一個英文詞），請**只針對那個特定的詞、聲調或短語給予糾正與示範**，**盡量不要直接把整句正確答案唸出來**，讓學生自己組合並說出完整句子！
        - **只有當整句話的整體語法結構或語序都錯了**（或學生主動要求直接給答案）時，才直接示範完整的自然句子「${referenceMandarin}」並請他跟著說一次。
-     - **近義詞引導**：若學生用了合法近義詞而非「${word.traditional}」，先肯定句子自然，並溫柔提示他換成今天要練習的目標詞（不要直接唸出目標詞讀音）。
+     - **近義詞引導**：若學生用了合法近義詞而非「${word.traditional}」，請先肯定句子自然（例如：「『⋯⋯』也很自然，意思完全對！不過我們今天要練習另一個近義詞，試著換成那個詞把整句話再說一次喔！」），不要直接唸出目標詞讀音。
   3. **修正後務必停下來等待學生重說「完整句子」（重複修正直到整句完全正確）**：
      - **關鍵鐵律**：只要你給了**任何糾正、英文詞翻譯、或近義詞提示**，請務必請學生**把修正後的「整句中文」重新完整說一次**，然後**立刻停下來等待學生開口**！**絕對不可以**在同一輪糾正裡直接問階段二的延伸問題！
      - 如果學生只單獨唸了那一個詞、沒有說完整句話，請肯定那個詞對了，並請他**把整句話完整連起來說一次**。

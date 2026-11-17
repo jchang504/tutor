@@ -14,11 +14,11 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=19';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=20';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=19';
+} from './live-audio.js?v=20';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
@@ -28,12 +28,13 @@ function escapeRegExp(str = '') {
 /**
  * Inspects completed dialogue turns across BOTH Phase 1 (translation) and Phase 3
  * (follow-up question reply) to separate:
- * - Benign synonym redirects (student used a valid synonym while target word was hidden, then used target word cleanly)
+ * - Benign synonym redirects (student used a valid synonym while target word was hidden, then used target word cleanly,
+ *   even if the tutor gave a non-spoiler disambiguation clue like word length / nuance / "提示你一下" to steer from
+ *   one valid synonym like `幸好` to `還好`) -> MUST score 4 (`Easy`)!
  * - Corrections on NON-target words or general Phase 3 sentence structure (tone/pronunciation fixes,
  *   measure-word/grammar tweaks, full-sentence grammar remodels, or English-to-Mandarin word translations
- *   where `targetTraditional` itself was not the error)
- *   -> MUST NOT penalize the FSRS score for the target word!
- * - Real pronunciation/tone or grammar corrections on the TARGET word itself (`targetTraditional`).
+ *   where `targetTraditional` itself was not the error) -> MUST NOT penalize the FSRS score for the target word!
+ * - Real spoiler hints / surrenders or real pronunciation/tone/grammar corrections on `targetTraditional` itself.
  */
 export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
   const turns = Array.isArray(wordTurns) ? wordTurns : [];
@@ -41,21 +42,38 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
   const targetChars = target ? Array.from(new Set([...target])) : [];
   const escapedCharClass = targetChars.map((ch) => escapeRegExp(ch)).join('');
 
+  const surrenderRe =
+    /給我提示|\bhint\b|給我答案|直接告訴我|我不知道|不知道怎麼翻|整句怎麼說|想不起來|忘了怎麼說/i;
+
   let synonymRedirects = 0;
   let nonTargetCorrections = 0;
   let pronunciationCorrections = 0;
   let grammarCorrections = 0;
   let tutorRevealedTargetWord = false;
+  let tutorGaveSpoilerHint = false;
+  let userAskedForTargetHint = false;
   let seenTutorTurns = 0;
   let studentProducedTargetSoFar = false;
   let inFollowUpPhase = false;
+  let phase1CompletedWithoutSpoiler = false;
 
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
     if (!t || !t.text) continue;
 
     if (t.role === 'user') {
-      if (target && t.text.includes(target) && !tutorRevealedTargetWord) {
+      if (!inFollowUpPhase && !studentProducedTargetSoFar && surrenderRe.test(t.text)) {
+        if (!(target && t.text.includes(target))) {
+          userAskedForTargetHint = true;
+        }
+      }
+      if (
+        target &&
+        t.text.includes(target) &&
+        !tutorRevealedTargetWord &&
+        !tutorGaveSpoilerHint &&
+        !userAskedForTargetHint
+      ) {
         studentProducedTargetSoFar = true;
       }
       continue;
@@ -67,13 +85,16 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
 
     const txt = t.text;
     const isRetryTurn =
-      /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|試著用|換成我們今天|給你一點提示|提示你一下/.test(
+      /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|試著用|試著換|換成(我們)?今天|換成另|給你一點提示|提示你一下/.test(
         txt
       );
 
     // Detect transition into Phase 2 follow-up question (first non-retry tutor turn asking a question)
     if (!inFollowUpPhase && !isRetryTurn && /[？?]|什麼|哪裡|哪個|怎麼|為什麼|還是|有沒有|嗎|呢/.test(txt)) {
       inFollowUpPhase = true;
+      if (!tutorRevealedTargetWord && !tutorGaveSpoilerHint && !userAskedForTargetHint) {
+        phase1CompletedWithoutSpoiler = true;
+      }
       continue;
     }
 
@@ -86,6 +107,62 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
     }
 
     const prevUserHadTarget = target ? prevUserTxt.includes(target) : false;
+    const prevUserSurrendered = surrenderRe.test(prevUserTxt);
+    const tutorUtteredTarget = Boolean(target && txt.includes(target));
+    const isMeaningNegated =
+      /意思不太對|意思不對|不太一樣|意思不同|不是這個意思|語法錯了|結構錯了/.test(txt);
+
+    const hasEquivalencePraise =
+      !isMeaningNegated &&
+      /也可以|意思差不多|意思很接近|意思相近|意思一樣|意思完全對|意思對|完全沒問題|沒問題|很自然|很道地|很棒|很好|不錯|對了|近義詞|同義詞/.test(
+        txt
+      );
+    const hasTargetSwapCue =
+      /換成|換一個|換用|另一個|另外一個|今天(要|想)練|要練習的|這張卡片|目標詞|我們今天/.test(txt);
+    const isDirectTargetSwapPrompt =
+      !isMeaningNegated &&
+      /換成(我們)?今天|換成另(外)?一個.*詞|試著(用|換|換成)(我們)?(今天|另)|要練習的(目標|另一個|那)?詞|今天(要|想)練(習)?的.*詞/.test(
+        txt
+      );
+
+    const isSynonymRedirect =
+      !inFollowUpPhase &&
+      !prevUserHadTarget &&
+      !prevUserSurrendered &&
+      !tutorUtteredTarget &&
+      ((/[\u4e00-\u9fff]{2,}/.test(prevUserTxt) && hasEquivalencePraise && hasTargetSwapCue) ||
+        isDirectTargetSwapPrompt) &&
+      /再說一次|再完整說一次|重新說一次|試著|換成|換一個|整句|怎麼說|說說看/.test(txt);
+
+    // Did the tutor have to utter/reveal the target word itself in Phase 1 before the student ever recalled it?
+    if (
+      target &&
+      !inFollowUpPhase &&
+      !studentProducedTargetSoFar &&
+      !prevUserHadTarget &&
+      tutorUtteredTarget
+    ) {
+      tutorRevealedTargetWord = true;
+    }
+
+    // Did the tutor give an explicit spoiler hint on a NON-synonym turn before the student recalled the target word?
+    if (
+      !inFollowUpPhase &&
+      !studentProducedTargetSoFar &&
+      !prevUserHadTarget &&
+      !isSynonymRedirect &&
+      /給你一點提示|提示你一下/.test(txt)
+    ) {
+      tutorGaveSpoilerHint = true;
+    }
+
+    // A synonym redirect occurs when the student spoke a valid synonym (not `target` yet), so any disambiguating
+    // clue in this turn is NOT a target-word pronunciation or grammar error!
+    if (isSynonymRedirect) {
+      synonymRedirects += 1;
+      continue;
+    }
+
     const strippedPraise = txt.replace(/發音很(標準|好|清楚|自然|正確)|發音沒問題/g, '');
 
     // Strip clauses that explicitly praise the target word (e.g. `「經常」用得很好，不過...`)
@@ -107,27 +184,9 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
         )
       : strippedTargetPraise;
 
-    const isSynonymRedirect =
-      /也可以|意思差不多|意思很接近|意思一樣|近義詞|同義詞|要練習的詞是|今天要練的詞是|換成我們今天/.test(
-        txt
-      ) && /再說一次|試著用|換成|整句/.test(txt);
-
     const isEnglishWordLookup =
       /[A-Za-z]{2,}/.test(prevUserTxt) ||
       /中文(我們)?(可以)?(說|叫|是)|在台灣我們(常)?說/.test(txt);
-
-    // Did the tutor have to translate an English word INTO the target word itself before student ever recalled it in Phase 1?
-    if (
-      target &&
-      !inFollowUpPhase &&
-      !studentProducedTargetSoFar &&
-      !prevUserHadTarget &&
-      !isSynonymRedirect &&
-      isEnglishWordLookup &&
-      txt.includes(target)
-    ) {
-      tutorRevealedTargetWord = true;
-    }
 
     const hasToneOrPronFix =
       /聲調|幾聲|一聲|二聲|三聲|四聲|輕聲|唸成|唸錯|讀音|發音不|發音有誤|發音要|注意.*發音/.test(
@@ -136,14 +195,8 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
 
     const hasRealGrammarFix =
       /語法|語序|量詞|不通順|漏了|少了|句子可以改成|不能這樣用|完整的一句話|完整的句子/.test(txt) ||
-      (!isSynonymRedirect &&
-        !hasToneOrPronFix &&
+      (!hasToneOrPronFix &&
         /比較自然|再完整說一次|重新說一次|整句話再說一次|整句回答|把整句/.test(txt));
-
-    if (isSynonymRedirect && !hasToneOrPronFix) {
-      synonymRedirects += 1;
-      continue;
-    }
 
     if (hasToneOrPronFix) {
       if (target) {
@@ -193,10 +246,20 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
     }
   }
 
+  const studentRecalledWithoutSpoiler = Boolean(
+    (studentProducedTargetSoFar || phase1CompletedWithoutSpoiler) &&
+      !tutorRevealedTargetWord &&
+      !tutorGaveSpoilerHint &&
+      !userAskedForTargetHint
+  );
+
   return {
     synonymRedirects,
     nonTargetCorrections,
     tutorRevealedTargetWord,
+    tutorGaveSpoilerHint,
+    userAskedForTargetHint,
+    studentRecalledWithoutSpoiler,
     pronunciationCorrections,
     grammarCorrections,
     totalFixes: pronunciationCorrections + grammarCorrections
@@ -216,25 +279,13 @@ export function deriveHeuristicTelemetryFromTurns(
 ) {
   const turns = Array.isArray(wordTurns) ? wordTurns : [];
   const target = String(word.traditional || '').trim();
-  const userTurns = turns.filter((t) => t && t.role === 'user' && t.text);
-  const tutorTurns = turns.filter((t) => t && t.role === 'tutor' && t.text);
-
-  // Asking how to say a non-target English word when the student already produced `word.traditional` is NOT a target hint!
-  const userAskedForTargetHint = userTurns.some((t) => {
-    if (/給我提示|\bhint\b|給我答案|直接告訴我/i.test(t.text)) return true;
-    if (/不知道怎麼說|怎麼說/i.test(t.text)) {
-      return !(target && t.text.includes(target));
-    }
-    return false;
-  });
-  const tutorGaveExplicitAnswerHint = tutorTurns
-    .slice(1)
-    .some((t) => /給你一點提示|提示你一下/.test(t.text));
 
   const {
     synonymRedirects,
     nonTargetCorrections,
     tutorRevealedTargetWord,
+    tutorGaveSpoilerHint,
+    userAskedForTargetHint,
     pronunciationCorrections,
     grammarCorrections,
     totalFixes
@@ -244,7 +295,7 @@ export function deriveHeuristicTelemetryFromTurns(
     usedHintButton ||
       peeked ||
       userAskedForTargetHint ||
-      tutorGaveExplicitAnswerHint ||
+      tutorGaveSpoilerHint ||
       tutorRevealedTargetWord
   );
 
@@ -290,9 +341,11 @@ export function deriveHeuristicTelemetryFromTurns(
 /**
  * Deterministic post-normalization of the AI JSON grader output:
  * Ensures that:
- * 1. Benign synonym redirects on Attempt 1 -> Score 4 (`Easy`).
+ * 1. Benign synonym redirects on Attempt 1 (even with disambiguating clues from the tutor) -> Score 4 (`Easy`).
  * 2. Pronunciation, grammar, or English-word corrections strictly on OTHER words besides `targetTraditional`
- *    NEVER penalize the target word's FSRS score -> Score 4 (`Easy`)!
+ *    NEVER penalize the target word's FSRS score -> Score 4 (`Easy`).
+ * 3. Ground-truth unassisted recall (student spoke `targetTraditional` without Hint/Peek, without surrendering,
+ *    and without the tutor uttering `targetTraditional`) can NEVER be downgraded to Score 1 (`Again`) by LLM hallucination!
  */
 export function normalizeAiGradingTelemetry(
   parsed = {},
@@ -302,11 +355,25 @@ export function normalizeAiGradingTelemetry(
   targetTraditional = ''
 ) {
   const turnAnalysis = analyzeTurnCorrections(wordTurns, targetTraditional);
-  const neededHint = Boolean(
+  const hardSpoilerOccurred = Boolean(
     forceNeededHint ||
-      (parsed.needed_hint && !parsed.non_target_corrections_only) ||
+      turnAnalysis.userAskedForTargetHint ||
+      turnAnalysis.tutorGaveSpoilerHint ||
       turnAnalysis.tutorRevealedTargetWord
   );
+
+  const verifiedUnassistedRecall =
+    !hardSpoilerOccurred &&
+    (turnAnalysis.studentRecalledWithoutSpoiler ||
+      turnAnalysis.synonymRedirects > 0 ||
+      parsed.synonym_redirect_only === true ||
+      parsed.non_target_corrections_only === true);
+
+  const neededHint = hardSpoilerOccurred
+    ? true
+    : verifiedUnassistedRecall
+    ? false
+    : Boolean(parsed.needed_hint);
 
   const isCleanSynonymRedirectOnly =
     !neededHint &&
@@ -321,9 +388,9 @@ export function normalizeAiGradingTelemetry(
         turnAnalysis.totalFixes === 0));
 
   if (isCleanSynonymRedirectOnly || isNonTargetCorrectionsOnly) {
-    const defaultNote = isNonTargetCorrectionsOnly
-      ? 'Target word clean (polished other words)'
-      : 'Used synonym first, then target word cleanly';
+    const defaultNote = isCleanSynonymRedirectOnly
+      ? 'Used synonym first, then target word cleanly'
+      : 'Target word clean (polished other words)';
     return {
       target_word_recalled: true,
       needed_hint: false,
@@ -335,7 +402,11 @@ export function normalizeAiGradingTelemetry(
   }
 
   return {
-    target_word_recalled: neededHint ? false : parsed.target_word_recalled !== false,
+    target_word_recalled: neededHint
+      ? false
+      : verifiedUnassistedRecall
+      ? true
+      : parsed.target_word_recalled !== false,
     needed_hint: neededHint,
     pronunciation_attempts: Math.max(1, Number(parsed.pronunciation_attempts) || 1),
     grammar_errors: Math.max(0, Number(parsed.grammar_errors) || 0),
@@ -366,8 +437,10 @@ class MandarinTutorApp {
     this.currentIndex = 0;
     this.sessionActive = false;
     this.sessionPaused = false;
-    this.revealTarget = localStorage.getItem(STORAGE_KEYS.REVEAL_TARGET) === 'true';
+    // Always start each word masked (`Peek Target Word` is strictly per-word so peeking once never forces Score 1 on later words)
+    this.revealTarget = false;
     this.peekedInCurrentWord = false;
+    localStorage.removeItem(STORAGE_KEYS.REVEAL_TARGET);
     this.isPageUnloading = false;
     this.cachedGradingCandidates = null;
     this.lastScoredWordId = null;
@@ -545,9 +618,17 @@ class MandarinTutorApp {
     this.els.btnToggleReveal.addEventListener('click', () => {
       this.revealTarget = !this.revealTarget;
       if (this.revealTarget && this.sessionActive) {
-        this.peekedInCurrentWord = true;
+        const curWord = this.batch[this.currentIndex];
+        const target = curWord ? String(curWord.traditional || '').trim() : '';
+        const alreadyRecalledInPhase1 =
+          (debugLogger.context.phase || 1) >= 2 ||
+          (target &&
+            Array.isArray(this.pipeline.wordTurns) &&
+            this.pipeline.wordTurns.some((t) => t && t.role === 'user' && String(t.text || '').includes(target)));
+        if (!alreadyRecalledInPhase1) {
+          this.peekedInCurrentWord = true;
+        }
       }
-      localStorage.setItem(STORAGE_KEYS.REVEAL_TARGET, String(this.revealTarget));
       this.renderCurrentWordCard();
     });
 
@@ -1033,7 +1114,8 @@ class MandarinTutorApp {
     }
 
     const word = this.batch[this.currentIndex];
-    this.peekedInCurrentWord = Boolean(this.revealTarget);
+    this.revealTarget = false;
+    this.peekedInCurrentWord = false;
     this.transcriptHistory = [];
     this.renderTranscriptFeed();
     this.setPhaseIndicator(1);
@@ -1229,10 +1311,13 @@ Grading rules:
   Grammar corrections, pronunciation/tone corrections, measure-word fixes, sentence-structure coaching, or English-to-Mandarin word translations on OTHER words besides "${word.traditional}" (in EITHER the translation OR the follow-up reply) MUST NOT impact the score for "${word.traditional}"!
   * If the student recalled "${word.traditional}" on their own in the translation (or after a valid synonym redirect), pronounced "${word.traditional}" with accurate tones, and used "${word.traditional}" grammatically, THEN EVEN IF the tutor corrected tones, pronunciation, phrasing, or translated an English word on OTHER words across one or more retries in the translation or follow-up reply, you MUST set:
     target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", non_target_corrections_only=true!
-- SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT): Because the target word is hidden on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "平常" or "常常" when the hidden target is "經常"). When the tutor prompts them to swap in today's target word and the student cleanly produces "${word.traditional}" without target-word tone/grammar errors, set: target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
-- Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation ON THE TARGET WORD "${word.traditional}" ITSELF.
+- SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT, NEVER needed_hint=true!):
+  Because the target word is masked ("•••") on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "幸好"/"好險"/"不錯"/"還可以" when the hidden target is "還好", or "平常"/"常常" for "經常").
+  To help the student know WHICH synonym is on today's hidden card, the tutor may nudge them or give a non-spoiler disambiguating clue (even saying "提示你一下", mentioning nuance, or mentioning word length / first character without uttering the full word "${word.traditional}"). When the student then produces "${word.traditional}" cleanly without target-word tone/grammar errors, that is STILL an unassisted recall — you MUST set:
+  target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
+- Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation ON THE TARGET WORD "${word.traditional}" ITSELF AFTER the student attempted "${word.traditional}".
 - Only set grammar_errors > 0 if the student misused or misplaced THE TARGET WORD "${word.traditional}" ITSELF (or failed to include it in the Phase 1 translation without a valid synonym). Note: the student is NOT required to repeat "${word.traditional}" in their Phase 3 follow-up reply.
-- Set needed_hint=true ONLY if the student did not know "${word.traditional}" in Phase 1 (e.g. asked for a hint for the target word, used an English word FOR "${word.traditional}" itself, or needed the tutor to reveal "${word.traditional}" before producing it).
+- Set needed_hint=true ONLY if the student genuinely did NOT know "${word.traditional}" in Phase 1 (e.g. explicitly asked for a hint / surrendered, used an English word FOR "${word.traditional}" itself, or needed the tutor to utter the full word "${word.traditional}" before producing it).
 
 Dialogue:
 ${dialogueText}`;
@@ -1281,12 +1366,18 @@ ${dialogueText}`;
         forceNeededHint,
         word.traditional
       );
+      const aiScore = computeDeterministicScore(normalized);
 
       debugLogger.log(
         'info',
         'word_graded_ai',
-        `Graded ${word.traditional} via ${usedModel.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
-        { model: usedModel, normalized }
+        `Graded ${word.traditional} -> Score ${aiScore} (${scoreLabel(aiScore)}) via ${usedModel.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
+        {
+          model: usedModel,
+          finalScore: aiScore,
+          rawAiParsed: parsed,
+          normalized
+        }
       );
       return normalized;
     } catch (err) {

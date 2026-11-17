@@ -10,7 +10,7 @@
  * - Formats a paste-ready Markdown diagnostic bundle for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v19';
+export const APP_VERSION = 'v20';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
@@ -325,7 +325,7 @@ class DebugLogger {
   /**
    * Formats a comprehensive, LLM-friendly Markdown diagnostic bundle ready to paste into Gemini.
    */
-  formatForGemini(maxTimelineEntries = 220) {
+  formatForGemini(maxTimelineEntries = 100) {
     const stats = this.getSummaryStats();
     const ua = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown';
 
@@ -351,7 +351,7 @@ class DebugLogger {
       lines.push(`- **Last Error:** ${stats.lastError.summary} (${stats.lastError.ts})`);
     }
 
-    // Highlight section: errors, warnings, unexpected closes, tool calls, audio hardware routing, and hidden model thoughts
+    // Highlight section: errors, warnings, unexpected closes, word scoring/telemetry, audio hardware routing, and hidden model thoughts
     const highlights = this.entries.filter(
       (e) =>
         e.level === 'error' ||
@@ -359,6 +359,9 @@ class DebugLogger {
         e.level === 'thought' ||
         e.level === 'tool' ||
         e.event === 'ws_close_unexpected' ||
+        e.event === 'word_completed' ||
+        e.event === 'word_graded_ai' ||
+        e.event === 'word_graded_heuristic_fallback' ||
         e.event === 'no_reply_timer_fired' ||
         e.event === 'mic_acquired' ||
         e.event === 'audio_devices_enumerated' ||
@@ -367,9 +370,9 @@ class DebugLogger {
     );
 
     if (highlights.length > 0) {
-      lines.push('', '### Key Diagnostic Highlights (Errors, WS Closes, Tool Calls & Model Thoughts)');
+      lines.push('', '### Key Diagnostic Highlights (Scores, Errors, WS Closes & Audio)');
       lines.push('```text');
-      for (const h of highlights.slice(-60)) {
+      for (const h of highlights.slice(-35)) {
         lines.push(this._formatSingleEntryLine(h));
       }
       lines.push('```');
