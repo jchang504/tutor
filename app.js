@@ -14,11 +14,11 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=18';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=19';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=18';
+} from './live-audio.js?v=19';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
@@ -26,10 +26,12 @@ function escapeRegExp(str = '') {
 }
 
 /**
- * Inspects completed dialogue turns to separate:
+ * Inspects completed dialogue turns across BOTH Phase 1 (translation) and Phase 3
+ * (follow-up question reply) to separate:
  * - Benign synonym redirects (student used a valid synonym while target word was hidden, then used target word cleanly)
- * - Corrections on NON-target words (tone/pronunciation fixes, measure-word/grammar tweaks, or English-to-Mandarin
- *   word translations on OTHER words in the sentence after the student already recalled & used `targetTraditional`)
+ * - Corrections on NON-target words or general Phase 3 sentence structure (tone/pronunciation fixes,
+ *   measure-word/grammar tweaks, full-sentence grammar remodels, or English-to-Mandarin word translations
+ *   where `targetTraditional` itself was not the error)
  *   -> MUST NOT penalize the FSRS score for the target word!
  * - Real pronunciation/tone or grammar corrections on the TARGET word itself (`targetTraditional`).
  */
@@ -37,6 +39,7 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
   const turns = Array.isArray(wordTurns) ? wordTurns : [];
   const target = String(targetTraditional || '').trim();
   const targetChars = target ? Array.from(new Set([...target])) : [];
+  const escapedCharClass = targetChars.map((ch) => escapeRegExp(ch)).join('');
 
   let synonymRedirects = 0;
   let nonTargetCorrections = 0;
@@ -45,6 +48,7 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
   let tutorRevealedTargetWord = false;
   let seenTutorTurns = 0;
   let studentProducedTargetSoFar = false;
+  let inFollowUpPhase = false;
 
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
@@ -62,6 +66,17 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
     if (seenTutorTurns === 1) continue; // Skip initial Phase 1 English prompt turn
 
     const txt = t.text;
+    const isRetryTurn =
+      /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|試著用|換成我們今天|給你一點提示|提示你一下/.test(
+        txt
+      );
+
+    // Detect transition into Phase 2 follow-up question (first non-retry tutor turn asking a question)
+    if (!inFollowUpPhase && !isRetryTurn && /[？?]|什麼|哪裡|哪個|怎麼|為什麼|還是|有沒有|嗎|呢/.test(txt)) {
+      inFollowUpPhase = true;
+      continue;
+    }
+
     let prevUserTxt = '';
     for (let j = i - 1; j >= 0; j--) {
       if (turns[j] && turns[j].role === 'user' && turns[j].text) {
@@ -84,6 +99,14 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
         )
       : strippedPraise;
 
+    // Strip full-sentence model quotes (`「...」` longer than target + 2 chars) so quoting a full corrected
+    // sentence that merely includes `target` in context doesn't falsely blame `target` itself
+    const strippedLongSentenceQuotes = target
+      ? strippedTargetPraise.replace(/「([^」]+)」/g, (m, inner) =>
+          inner.trim().length > target.length + 2 ? '' : m
+        )
+      : strippedTargetPraise;
+
     const isSynonymRedirect =
       /也可以|意思差不多|意思很接近|意思一樣|近義詞|同義詞|要練習的詞是|今天要練的詞是|換成我們今天/.test(
         txt
@@ -93,9 +116,10 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
       /[A-Za-z]{2,}/.test(prevUserTxt) ||
       /中文(我們)?(可以)?(說|叫|是)|在台灣我們(常)?說/.test(txt);
 
-    // Did the tutor have to translate an English word INTO the target word itself before student ever recalled it?
+    // Did the tutor have to translate an English word INTO the target word itself before student ever recalled it in Phase 1?
     if (
       target &&
+      !inFollowUpPhase &&
       !studentProducedTargetSoFar &&
       !prevUserHadTarget &&
       !isSynonymRedirect &&
@@ -111,10 +135,10 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
       );
 
     const hasRealGrammarFix =
-      /語法|語序|量詞|不通順|漏了|少了|句子可以改成|不能這樣用/.test(txt) ||
+      /語法|語序|量詞|不通順|漏了|少了|句子可以改成|不能這樣用|完整的一句話|完整的句子/.test(txt) ||
       (!isSynonymRedirect &&
         !hasToneOrPronFix &&
-        /比較自然|再完整說一次|重新說一次|整句話再說一次|把整句話/.test(txt));
+        /比較自然|再完整說一次|重新說一次|整句話再說一次|整句回答|把整句/.test(txt));
 
     if (isSynonymRedirect && !hasToneOrPronFix) {
       synonymRedirects += 1;
@@ -123,10 +147,24 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
 
     if (hasToneOrPronFix) {
       if (target) {
+        const quotedTargetCharRe = escapedCharClass
+          ? new RegExp(`「[${escapedCharClass}]+」`)
+          : null;
+        const standaloneTargetCharToneRe = escapedCharClass
+          ? new RegExp(
+              `(?<![\\u4e00-\\u9fff])[${escapedCharClass}](?:這個字|的聲調|的發音|要唸|是[一二三四輕]聲|唸[一二三四輕]聲)`
+            )
+          : null;
         const mentionsTargetCharInError =
-          strippedTargetPraise.includes(target) ||
-          targetChars.some((ch) => strippedTargetPraise.includes(ch));
-        if (!mentionsTargetCharInError && (prevUserHadTarget || studentProducedTargetSoFar)) {
+          (target.length >= 2 && strippedLongSentenceQuotes.includes(target)) ||
+          Boolean(quotedTargetCharRe && quotedTargetCharRe.test(strippedLongSentenceQuotes)) ||
+          Boolean(
+            standaloneTargetCharToneRe && standaloneTargetCharToneRe.test(strippedLongSentenceQuotes)
+          );
+        if (
+          !mentionsTargetCharInError &&
+          (inFollowUpPhase || prevUserHadTarget || studentProducedTargetSoFar)
+        ) {
           nonTargetCorrections += 1;
           continue;
         }
@@ -137,8 +175,16 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
 
     if (hasRealGrammarFix || (isEnglishWordLookup && /再說一次|整句/.test(txt))) {
       if (target) {
-        const mentionsTargetInError = strippedTargetPraise.includes(target);
-        if ((prevUserHadTarget || studentProducedTargetSoFar) && !mentionsTargetInError) {
+        const mentionsTargetInGrammarError =
+          target.length >= 2
+            ? strippedLongSentenceQuotes.includes(target)
+            : new RegExp(
+                `「${escapeRegExp(target)}」|(?<![\\u4e00-\\u9fff])${escapeRegExp(target)}(?:這個字|的位置|要放在|後面|前面|不能)`
+              ).test(strippedLongSentenceQuotes);
+        if (
+          !mentionsTargetInGrammarError &&
+          (inFollowUpPhase || prevUserHadTarget || studentProducedTargetSoFar)
+        ) {
           nonTargetCorrections += 1;
           continue;
         }
@@ -1179,13 +1225,14 @@ Grading rules:
 - Reference Mandarin: "${word.mandarin_sentence || word.sample_mandarin || ''}"
 - IMPORTANT: The student ("學生") lines come from speech-to-text ASR, which may contain minor homophones or segmentation quirks (e.g. 餐館/餐廳, 設一個/是個). Always trust the tutor's ("老師") spoken reaction! If the tutor immediately praised the student ("說得很好！", etc.) without correcting the target word, set target_word_recalled=true, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural".
 - TARGET-WORD-ONLY SCORING RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT):
-  Grammar corrections, pronunciation/tone corrections, measure-word fixes, or English-to-Mandarin word translations on OTHER words in the sentence besides "${word.traditional}" MUST NOT impact the score for "${word.traditional}"!
-  * If the student recalled "${word.traditional}" on their own (or after a valid synonym redirect), pronounced "${word.traditional}" with accurate tones, and used "${word.traditional}" grammatically, THEN EVEN IF the tutor corrected tones, pronunciation, phrasing, or translated an English word on OTHER words in the sentence across one or more retries, you MUST set:
+  Both the initial translation AND the follow-up question reply include strict native-speaker coaching loops where the tutor corrects ANY non-native phrasing, tone, measure word, or English word anywhere in the student's sentences until the student repeats a clean complete sentence.
+  Grammar corrections, pronunciation/tone corrections, measure-word fixes, sentence-structure coaching, or English-to-Mandarin word translations on OTHER words besides "${word.traditional}" (in EITHER the translation OR the follow-up reply) MUST NOT impact the score for "${word.traditional}"!
+  * If the student recalled "${word.traditional}" on their own in the translation (or after a valid synonym redirect), pronounced "${word.traditional}" with accurate tones, and used "${word.traditional}" grammatically, THEN EVEN IF the tutor corrected tones, pronunciation, phrasing, or translated an English word on OTHER words across one or more retries in the translation or follow-up reply, you MUST set:
     target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", non_target_corrections_only=true!
 - SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT): Because the target word is hidden on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "平常" or "常常" when the hidden target is "經常"). When the tutor prompts them to swap in today's target word and the student cleanly produces "${word.traditional}" without target-word tone/grammar errors, set: target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
 - Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation ON THE TARGET WORD "${word.traditional}" ITSELF.
-- Only set grammar_errors > 0 if the student misused or misplaced THE TARGET WORD "${word.traditional}" ITSELF (or failed to include it without a valid synonym).
-- Set needed_hint=true ONLY if the student did not know "${word.traditional}" (e.g. asked for a hint for the target word, used an English word FOR "${word.traditional}" itself, or needed the tutor to reveal "${word.traditional}" before producing it).
+- Only set grammar_errors > 0 if the student misused or misplaced THE TARGET WORD "${word.traditional}" ITSELF (or failed to include it in the Phase 1 translation without a valid synonym). Note: the student is NOT required to repeat "${word.traditional}" in their Phase 3 follow-up reply.
+- Set needed_hint=true ONLY if the student did not know "${word.traditional}" in Phase 1 (e.g. asked for a hint for the target word, used an English word FOR "${word.traditional}" itself, or needed the tutor to reveal "${word.traditional}" before producing it).
 
 Dialogue:
 ${dialogueText}`;
@@ -1453,8 +1500,15 @@ ${dialogueText}`;
 
     const latest = this.transcriptHistory[this.transcriptHistory.length - 1];
     if (role === 'tutor' && latest) {
-      const isPhase1RetryPrompt = /再說一次|整句話|完整的句子|翻成中文/.test(latest.text);
-      if (!isPhase1RetryPrompt && (latest.text.includes('？') || latest.text.includes('?'))) {
+      const isRetryPrompt =
+        /再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|翻成中文/.test(
+          latest.text
+        );
+      if (
+        !isRetryPrompt &&
+        (debugLogger.context.phase || 1) < 2 &&
+        (latest.text.includes('？') || latest.text.includes('?'))
+      ) {
         this.setPhaseIndicator(2);
       }
       if (ENABLE_USER_ASK_BACK_FLOW && /換你問我|問我一個問題/.test(latest.text)) {

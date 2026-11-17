@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v18):
+ * Key architectural guarantees (v19):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -24,7 +24,7 @@
  *      compressor, or waveshaper distortion over Bluetooth SCO/HFP).
  */
 
-import { debugLogger } from './debug-logger.js?v=18';
+import { debugLogger } from './debug-logger.js?v=19';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -127,40 +127,73 @@ export function containsMandarinQuestion(text = '') {
 /**
  * Determines what kind of user response the tutor's just-completed turn expects next:
  * - `'translate'`: Phase 1 sentence translation (or Phase 1 pronunciation/grammar/synonym/English-word retry)
- * - `'answer_followup'`: Tutor asked a Phase 2 follow-up question (active default when `enableAskBack === false`)
+ * - `'answer_followup'`: Tutor asked a Phase 2 follow-up question or is coaching a Phase 3 follow-up reply retry
  * - `'reply_and_ask_back'`: Preserved for `enableAskBack === true` (student answers AND asks a question back)
  * - `'ask_question_only'`: Preserved for `enableAskBack === true` (`"現在換你問我一個問題吧！"`)
  */
 export function classifyNextUserTurnExpectation(
   tutorSpokenText = '',
   completedTutorTurnsCount = 1,
-  { enableAskBack = ENABLE_USER_ASK_BACK_FLOW } = {}
+  { enableAskBack = ENABLE_USER_ASK_BACK_FLOW, previousExpectation = 'translate' } = {}
 ) {
   const txt = String(tutorSpokenText || '').trim();
+  const prev = previousExpectation || 'translate';
   if (!txt || completedTutorTurnsCount <= 1) {
     return 'translate';
   }
 
   if (enableAskBack && /換你問我|問我一個問題|請你問我|問我問題|向我提問/.test(txt)) {
-    if (/再說一次|再唸一次|重新說一次/.test(txt)) {
+    if (/再說一次|再唸一次|重新說一次/.test(txt) && prev !== 'ask_question_only') {
       return 'reply_and_ask_back';
     }
     return 'ask_question_only';
   }
 
-  if (
-    /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|完整的句子|試著用|換成我們今天|給你一點提示|提示你一下/.test(
-      txt
-    )
-  ) {
+  // Explicit Phase 1 translation instruction (e.g. repeating English sentence on request)
+  if (/把這句話翻成中文|翻成中文/.test(txt)) {
     return 'translate';
   }
 
+  // Pronunciation / grammar / English-word / full-sentence retry prompt:
+  // Stay in the current phase (`'translate'` during Phase 1; `'answer_followup'` / `'reply_and_ask_back'` / `'ask_question_only'` during Phase 3)
+  if (
+    /再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|試著用|換成我們今天|給你一點提示|提示你一下/.test(
+      txt
+    )
+  ) {
+    return prev;
+  }
+
   if (containsMandarinQuestion(txt)) {
+    if (prev === 'ask_question_only') {
+      return 'ask_question_only';
+    }
     return enableAskBack ? 'reply_and_ask_back' : 'answer_followup';
   }
 
-  return 'translate';
+  return prev;
+}
+
+/**
+ * Reconstructs the current `turnExpectation` across all completed tutor turns in `wordTurns`
+ * (including across mid-word WebSocket reconnects during Phase 1 or Phase 3 correction loops).
+ */
+export function deriveTurnExpectationFromHistory(
+  wordTurns = [],
+  { enableAskBack = ENABLE_USER_ASK_BACK_FLOW } = {}
+) {
+  let expectation = 'translate';
+  let tutorCount = 0;
+  for (const t of Array.isArray(wordTurns) ? wordTurns : []) {
+    if (t && t.role === 'tutor' && t.text) {
+      tutorCount += 1;
+      expectation = classifyNextUserTurnExpectation(t.text, tutorCount, {
+        enableAskBack,
+        previousExpectation: expectation
+      });
+    }
+  }
+  return expectation;
 }
 
 /**
@@ -320,26 +353,37 @@ export function buildWordSystemInstruction(
       .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
       .join('\n');
     const resumeEndHint = enableAskBack
-      ? '若學生已反問問題（或已完成問答），請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。'
-      : '若你已經問過延伸問題且學生剛才已回答，請簡短自然回應一句並直接說出固定結尾口令「好，我們看下一題！」。';
+      ? '若學生已回答或反問問題，請同樣嚴格檢查他的發音、聲調與語法：若有錯誤或夾雜英文請先糾正並請他重說整句；若整句已經完全自然正確且已完成問答，請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。'
+      : '若你已經問過延伸問題且學生剛才已回答，請同樣先嚴格檢查他剛才那句回答的發音、聲調與語法：若有錯誤、夾雜英文或只說了單詞片段，請先糾正並停下來等待他重說整句回答；只有當整句回答已經完全自然正確時，才簡短自然回應一句並說出固定結尾口令「好，我們看下一題！」。';
     resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段；${resumeEndHint}`;
   }
 
   // Preserved Phase 3 + Phase 4 block for `ENABLE_USER_ASK_BACK_FLOW = true`
-  const askBackFlowPhases = `- **階段三（學生回答＋請學生反問老師）**：
+  const askBackFlowPhases = `- **階段三（學生回答＋請學生反問老師，並嚴格把關發音聲調與語法直到整句完全正確）**：
   1. 學生會用中文回答你的問題，並且應該要順便反問你一個相關的問題。
-  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正一句。
-  3. **關鍵規則**：如果學生只有回答你的問題、還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並等待他提問。如果學生已經反問你問題了，就直接進入階段四。
+  2. 請用與階段一完全相同的標準，非常仔細地檢查學生回答與提問的發音、聲調、用詞與語法（若夾雜英文單字請告訴他台灣華語怎麼說；局部錯誤請只糾正該詞或聲調而不要直接洩漏整句，整體語法錯誤則可示範完整自然句）。只要有任何錯誤，請務必請他把修正後的完整句子重說一次並停下來等待，反覆修正直到整句完全正確為止！
+  3. **關鍵規則**：當回答句子完全正確後，如果學生還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並對他的提問同樣把關直到整句正確後再進入階段四。
 
 - **階段四（老師簡短回答並說出固定換題口令）**：
-  當學生提出他的問題後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
-  （注意：在階段一至階段三未完成前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
+  當學生親口完整說出正確自然的提問後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+  （注意：在階段一至階段三未全部完成且句子完全正確前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
 
   // Active default Phase 3 block (`ENABLE_USER_ASK_BACK_FLOW = false` — no ask-back question required)
-  const answerOnlyFlowPhases = `- **階段三（學生回答延伸問題 → 老師簡短回應並說出固定換題口令）**：
-  1. 學生會用中文回答你的延伸問題（**不需要**請學生反問你問題）。
-  2. 如果學生在回答時夾雜了英文單字或問某個詞中文怎麼說，請告訴他那個詞的台灣華語怎麼說，並請他把回答再說一次；否則，如果他的回答裡有明顯的發音或語法小錯誤，你可以順帶用半句話輕輕點出自然的說法，接著用簡單、自然慢速的台灣華語**簡短自然回應他的回答（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
-  （注意：在階段一「學生親口完整說出正確自然的翻譯句子」與階段二/三「學生回答延伸問題」都完成之前，絕對不可以提前說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
+  const answerOnlyFlowPhases = `- **階段三（學生回答延伸問題、嚴格把關母語者自然度與發音聲調、直到整句回答完全正確 → 老師簡短回應並說出固定換題口令）**：
+  1. 學生會用中文回答你的延伸問題（**不需要**請學生反問你問題；回答內容只要自然合情理即可，不強制一定要包含目標詞，但必須是一句**語意完整的自然中文句子**）。
+  2. **對學生的回答進行與階段一完全相同的嚴格母語者把關（Strict Native Speaker Check — 極重要）**：
+     - **非常仔細地檢查發音、聲調與語法**：只要學生的回答有任何地方跟台灣母語者自然的說法不一樣——包含**任何一個字的聲調或發音不準、用詞不道地、量詞錯誤、語序不自然、漏字，或是只回答了單一詞語而非完整句子**——都請務必明確指出來糾正，不要放水帶過！
+     - **學生夾雜英文單字時**：如果學生在回答裡用了任何英文單字（或問某個英文詞怎麼說），請清楚告訴他**那個詞在台灣華語怎麼說**，然後請他把**整句中文回答**重新完整說一次！
+     - **局部錯誤請勿直接洩漏整句答案**：
+       - 如果問題**只出在某一個詞、某個字的發音/聲調、或某個短語**（或是夾雜了一個英文詞），請**只針對那個特定的詞、聲調或短語給予糾正與示範**，**盡量不要直接幫他把整句回答唸出來**，讓學生自己組合並說出完整句子！
+       - **只有當整句回答的整體語法結構或語序都錯了**（或只說了零碎單詞、或學生主動要求示範）時，才直接示範一句自然完整的中文回答並請他跟著說一次。
+  3. **修正後務必停下來等待學生重說「完整的回答句子」（重複修正直到整句完全正確，才可換下一題！）**：
+     - **關鍵鐵律**：只要你給了**任何發音/聲調糾正、語法/用詞修正、或英文詞翻譯**，請務必請學生**把修正後的「整句回答」重新完整說一次**，然後**立刻停下來等待學生開口**！**絕對不可以**在同一輪糾正裡直接結束並說出「好，我們看下一題！」！
+     - 如果學生只單獨唸了那一個詞、沒有說完整句話，請肯定那個詞對了，並請他**把整句回答完整連起來說一次**。
+     - 如果學生重說時還有其他發音、聲調或語法小錯誤，請**繼續針對錯誤糾正並請他重說整句回答**，反覆練習直到他親口完整說出一句自然、語法正確且發音標準的中文回答為止！
+  4. **整句回答完全正確後，簡短回應並切換下一題**：
+     - 當學生的回答一開始就完全自然正確，或者經過修正後終於親口完整說出正確自然的句子時，請用簡單、自然慢速的台灣華語**簡短自然回應他的回答（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+     - （注意：在階段一「翻譯句子整句完全正確」與階段三「延伸問題的回答整句完全正確」都完成之前，絕對不可以提前說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
 
   return `你是一位專業、親切、有耐心且聽力極敏銳的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
 
@@ -1730,8 +1774,7 @@ export class GeminiLiveVoicePipeline {
             // Case 3: Reconnecting after a COMPLETED tutor turn (user's turn to speak)
             if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
               this.isPhase1InitialTurn = false;
-              const tutorTurnsSoFar = this.wordTurns.filter((t) => t.role === 'tutor').length;
-              this.turnExpectation = classifyNextUserTurnExpectation(lastTurn.text, tutorTurnsSoFar);
+              this.turnExpectation = deriveTurnExpectationFromHistory(this.wordTurns);
               debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening', {
                 turnExpectation: this.turnExpectation
               });
@@ -2218,17 +2261,20 @@ export class GeminiLiveVoicePipeline {
           return;
         }
 
-        const tutorTurnsSoFar = this.wordTurns.filter((t) => t.role === 'tutor').length;
-        this.turnExpectation = classifyNextUserTurnExpectation(completedTutorText, tutorTurnsSoFar);
+        this.turnExpectation = deriveTurnExpectationFromHistory(this.wordTurns);
         if (
           this.turnExpectation === 'answer_followup' ||
           this.turnExpectation === 'reply_and_ask_back'
         ) {
-          debugLogger.setContext({ phase: 2 });
-          this.onPhaseHint(2);
+          if ((debugLogger.context.phase || 1) < 2) {
+            debugLogger.setContext({ phase: 2 });
+            this.onPhaseHint(2);
+          }
         } else if (this.turnExpectation === 'ask_question_only') {
-          debugLogger.setContext({ phase: 3 });
-          this.onPhaseHint(3);
+          if ((debugLogger.context.phase || 1) < 3) {
+            debugLogger.setContext({ phase: 3 });
+            this.onPhaseHint(3);
+          }
         }
 
         this._schedulePostPlaybackCallback(() => {
