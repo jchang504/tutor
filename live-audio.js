@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v17):
+ * Key architectural guarantees (v18):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -14,20 +14,17 @@
  *    BEFORE `turnComplete`, auto-reconnect rotates to the next healthy Live model immediately
  *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
  * 5. Smart context- & sentence-completeness-aware endpointing (~850–1100ms on completed sentences,
- *    ~1950ms on incomplete mid-sentence pauses, and ~2650ms on the Phase 2->3 Reply & Ask Back turn)
- *    paired with clean digital-zero 16kHz PCM gating so server VAD responds fast without road-noise lag.
- * 6. Car / Android Auto Audio Pipeline (`media_auto` default):
- *    - Keeps Android Chrome in `AudioManager.MODE_NORMAL` (`STREAM_MUSIC`) so Pixel hardware volume
- *      buttons adjust Media Volume (instead of Call Volume) and Android Auto stereo speakers play
- *      cleanly without Bluetooth HFP conflicts or near-field handset noise-gate attenuation.
- *    - WebAudio Broadcast Voice Mastering Chain (`85Hz` high-pass -> `DynamicsCompressorNode` ->
- *      configurable `2.2x` makeup gain -> soft `tanh` limiter) boosts tutor speech loudness to match
- *      podcasts / Google Maps navigation.
- *    - Adaptive Far-Field Cabin Mic Pre-Amp (`1.0x`–`4.8x`) + sensitive SNR-based VAD ensures distant
- *      driver speech in a car cabin is reliably detected and loud enough for Gemini ASR.
+ *    ~1950ms on incomplete mid-sentence pauses) + transient car-bump noise rejection so brief road
+ *    impulses never lock out the microphone.
+ * 6. Clean Unboosted Bluetooth Call / Earbuds Default Audio (`bluetooth_hfp` default):
+ *    - Automatically uses connected Bluetooth car hands-free or Bluetooth earbuds (`VOICE_COMMUNICATION`
+ *      with hardware AEC + NS + car/phone hardware call volume buttons), seamlessly falling back to
+ *      Phone Speakerphone when no Bluetooth device is connected.
+ *    - Pure `1.0x` linear 16kHz PCM input and direct `1.0x` 24kHz PCM output (zero software boost,
+ *      compressor, or waveshaper distortion over Bluetooth SCO/HFP).
  */
 
-import { debugLogger } from './debug-logger.js?v=17';
+import { debugLogger } from './debug-logger.js?v=18';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -36,23 +33,20 @@ const LIVE_WS_ENDPOINT =
 const ZERO_PCM16_100MS_BASE64 = btoa('\0'.repeat(3200));
 
 /**
- * Computes smooth, adaptive far-field microphone pre-amp gain (`1.0x` – `4.8x`):
- * - Indoor close-talk speech (`rawRms >= 0.19`) stays at `1.0x` (untouched).
- * - Distant car-cabin / cupholder / mount speech (`rawRms ~ 0.02–0.06`) smoothly boosts up to `4.8x`
- *   (paired with soft `tanh` limiting during PCM16 encoding) so Gemini ASR receives healthy speech energy
- *   without boosting pure road-noise pauses.
+ * Feature flag for the Phase 3 "student asks tutor a follow-up question back" step.
+ * Kept intact in code & prompts so it can be re-enabled anytime by flipping to `true`.
  */
-export function computeAdaptiveInputGain(rawRms = 0, noiseFloor = 0.004, currentGain = 1.0) {
-  const safeNoise = Math.max(0.0002, Number(noiseFloor) || 0.004);
-  const voiceGate = Math.max(0.0055, safeNoise * 2.15);
-  if (rawRms >= voiceGate) {
-    if (rawRms >= 0.19 && currentGain <= 1.05) {
-      return 1.0;
-    }
-    const desired = Math.max(1.0, Math.min(4.8, 0.19 / Math.max(0.02, rawRms)));
-    return Number((0.72 * currentGain + 0.28 * desired).toFixed(3));
-  }
-  return Math.max(1.0, Number((0.96 * currentGain + 0.04 * 1.0).toFixed(3)));
+export const ENABLE_USER_ASK_BACK_FLOW = false;
+
+/**
+ * Identifies genuine Bluetooth audio devices (car HFP hands-free, Pixel Buds, AirPods, etc.)
+ * while explicitly excluding Pixel's built-in `"Headset earpiece"` / wired USB devices.
+ */
+export function isBluetoothAudioDeviceLabel(label = '') {
+  const s = String(label || '').trim();
+  if (!s) return false;
+  if (/earpiece|wired|usb/i.test(s)) return false;
+  return /bluetooth|\bbt\b|hands-free|earbud|buds|airpods|hfp|car|leaf|nissan|headset/i.test(s);
 }
 
 const WORKLET_CODE = `
@@ -132,18 +126,22 @@ export function containsMandarinQuestion(text = '') {
 
 /**
  * Determines what kind of user response the tutor's just-completed turn expects next:
- * - `'translate'`: Phase 1 sentence translation (or Phase 1 synonym/pronunciation/hint retry)
- * - `'reply_and_ask_back'`: Tutor asked a Phase 2 follow-up question; student needs time to
- *   BOTH answer the question AND ask a related question back!
- * - `'ask_question_only'`: Student already answered, and tutor prompted `"現在換你問我一個問題吧！"`
+ * - `'translate'`: Phase 1 sentence translation (or Phase 1 pronunciation/grammar/synonym/English-word retry)
+ * - `'answer_followup'`: Tutor asked a Phase 2 follow-up question (active default when `enableAskBack === false`)
+ * - `'reply_and_ask_back'`: Preserved for `enableAskBack === true` (student answers AND asks a question back)
+ * - `'ask_question_only'`: Preserved for `enableAskBack === true` (`"現在換你問我一個問題吧！"`)
  */
-export function classifyNextUserTurnExpectation(tutorSpokenText = '', completedTutorTurnsCount = 1) {
+export function classifyNextUserTurnExpectation(
+  tutorSpokenText = '',
+  completedTutorTurnsCount = 1,
+  { enableAskBack = ENABLE_USER_ASK_BACK_FLOW } = {}
+) {
   const txt = String(tutorSpokenText || '').trim();
   if (!txt || completedTutorTurnsCount <= 1) {
     return 'translate';
   }
 
-  if (/換你問我|問我一個問題|請你問我|問我問題|向我提問/.test(txt)) {
+  if (enableAskBack && /換你問我|問我一個問題|請你問我|問我問題|向我提問/.test(txt)) {
     if (/再說一次|再唸一次|重新說一次/.test(txt)) {
       return 'reply_and_ask_back';
     }
@@ -151,7 +149,7 @@ export function classifyNextUserTurnExpectation(tutorSpokenText = '', completedT
   }
 
   if (
-    /把這句話翻成中文|翻成中文|試著用.*再說一次|再完整說一次|重新說一次|再說一次試試|再唸一次|試著再說一次|給你一點提示|提示你一下/.test(
+    /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|完整的句子|試著用|換成我們今天|給你一點提示|提示你一下/.test(
       txt
     )
   ) {
@@ -159,7 +157,7 @@ export function classifyNextUserTurnExpectation(tutorSpokenText = '', completedT
   }
 
   if (containsMandarinQuestion(txt)) {
-    return 'reply_and_ask_back';
+    return enableAskBack ? 'reply_and_ask_back' : 'answer_followup';
   }
 
   return 'translate';
@@ -168,6 +166,7 @@ export function classifyNextUserTurnExpectation(tutorSpokenText = '', completedT
 /**
  * Checks during a `'reply_and_ask_back'` turn whether the student has ALREADY spoken
  * both their answer AND their follow-up question back to the tutor.
+ * (Preserved for `ENABLE_USER_ASK_BACK_FLOW = true`.)
  */
 export function hasCompletedReplyAndQuestionBack(transcript = '', speechSegmentsInTurn = 1) {
   const raw = String(transcript || '').trim();
@@ -205,11 +204,9 @@ export function hasCompletedReplyAndQuestionBack(transcript = '', speechSegments
 
 /**
  * Intelligent context- and sentence-completeness-aware post-speech silence calculator:
- * - Responds snappily (~850–1100ms, matching consumer Gemini Live) when a sentence/question is complete.
+ * - Responds snappily (~850–1100ms, matching consumer Gemini Live) when a sentence is complete.
  * - Holds longer (~1850–1950ms) when the user pauses mid-sentence (short fragment, filler, or dangling word).
- * - Grants generous thinking time (~2650ms) on the Phase 2->3 `'reply_and_ask_back'` turn after the user
- *   answers the tutor's question while they think of a question to ask back — then snaps right back
- *   to ~950ms the instant they finish asking their question!
+ * - Preserves `'reply_and_ask_back'` (~2650ms) and `'ask_question_only'` branches when `ENABLE_USER_ASK_BACK_FLOW` is enabled.
  */
 export function computeSmartSilenceThresholdMs({
   transcript = '',
@@ -245,7 +242,7 @@ export function computeSmartSilenceThresholdMs({
     Boolean(raw) &&
     (hasTrailingCommaOrFiller || hasAlwaysDanglingWord || hasUnpunctuatedAuxiliaryTail);
 
-  // 2. Phase 2 -> 3: Answer tutor's question AND ask a question back!
+  // 2. Preserved Phase 2 -> 3: Answer tutor's question AND ask a question back (`ENABLE_USER_ASK_BACK_FLOW = true`)
   if (turnExpectation === 'reply_and_ask_back') {
     if (
       !isTrailingIncomplete &&
@@ -259,7 +256,7 @@ export function computeSmartSilenceThresholdMs({
     };
   }
 
-  // 3. Phase 3 standalone question turn (`"現在換你問我一個問題吧！"`)
+  // 3. Preserved standalone question turn (`ENABLE_USER_ASK_BACK_FLOW = true`)
   if (turnExpectation === 'ask_question_only') {
     if (!isTrailingIncomplete && containsMandarinQuestion(raw) && hanziCount >= 3) {
       return { thresholdMs: 950, reason: 'question_complete' };
@@ -273,35 +270,45 @@ export function computeSmartSilenceThresholdMs({
     };
   }
 
-  // 4. Phase 1 sentence translation (and general single-sentence turns)
+  // 4. Phase 1 sentence translation & Phase 3 follow-up answer (`'translate'` | `'answer_followup'`)
+  const effectiveExpectedMin = turnExpectation === 'answer_followup' ? 0 : expectedMinHanzi;
   const minCompleteHanzi =
-    expectedMinHanzi >= 5 ? Math.max(4, Math.ceil(expectedMinHanzi * 0.6)) : 4;
+    effectiveExpectedMin >= 5
+      ? Math.max(4, Math.ceil(effectiveExpectedMin * 0.6))
+      : turnExpectation === 'answer_followup'
+      ? 3
+      : 4;
 
   if (raw) {
     if (
       isTrailingIncomplete ||
-      (expectedMinHanzi >= 6 && hanziCount > 0 && hanziCount < Math.ceil(expectedMinHanzi * 0.52))
+      (effectiveExpectedMin >= 6 &&
+        hanziCount > 0 &&
+        hanziCount < Math.ceil(effectiveExpectedMin * 0.52))
     ) {
       return { thresholdMs: 1950, reason: 'incomplete_sentence_fragment' };
     }
     if (hasTerminalPunct && hanziCount >= minCompleteHanzi) {
       return { thresholdMs: 950, reason: 'sentence_complete_punctuated' };
     }
-    if (hanziCount >= minCompleteHanzi && voicedMs >= 1000) {
+    if (hanziCount >= minCompleteHanzi && voicedMs >= 950) {
       return { thresholdMs: 1100, reason: 'sentence_complete_length' };
     }
     return { thresholdMs: 1500, reason: 'short_partial_transcript' };
   }
 
   // Acoustic fallback when interim/final transcript has not arrived yet (e.g. mobile cellular latency in car):
-  // Give 1650–1950ms so a brief mid-sentence pause while cellular ASR is still in flight doesn't cut off early!
   if (voicedMs >= 1350) {
     return { thresholdMs: 1650, reason: 'acoustic_sentence_complete' };
   }
   return { thresholdMs: 1950, reason: 'acoustic_short_utterance' };
 }
 
-export function buildWordSystemInstruction(word, priorTurns = []) {
+export function buildWordSystemInstruction(
+  word,
+  priorTurns = [],
+  { enableAskBack = ENABLE_USER_ASK_BACK_FLOW } = {}
+) {
   const referenceMandarin = (word.mandarin_sentence || word.sample_mandarin || '').trim();
   const synonymsLine = word.common_synonyms
     ? `常見近義詞（若學生誤用請溫柔引導換成目標詞，不要扣分）：${word.common_synonyms}`
@@ -312,16 +319,35 @@ export function buildWordSystemInstruction(word, priorTurns = []) {
     const formattedTurns = priorTurns
       .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
       .join('\n');
-    resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段；若學生已反問問題（或已完成三輪問答），請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。`;
+    const resumeEndHint = enableAskBack
+      ? '若學生已反問問題（或已完成問答），請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。'
+      : '若你已經問過延伸問題且學生剛才已回答，請簡短自然回應一句並直接說出固定結尾口令「好，我們看下一題！」。';
+    resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段；${resumeEndHint}`;
   }
 
-  return `你是一位專業、親切、有耐心的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
+  // Preserved Phase 3 + Phase 4 block for `ENABLE_USER_ASK_BACK_FLOW = true`
+  const askBackFlowPhases = `- **階段三（學生回答＋請學生反問老師）**：
+  1. 學生會用中文回答你的問題，並且應該要順便反問你一個相關的問題。
+  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正一句。
+  3. **關鍵規則**：如果學生只有回答你的問題、還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並等待他提問。如果學生已經反問你問題了，就直接進入階段四。
+
+- **階段四（老師簡短回答並說出固定換題口令）**：
+  當學生提出他的問題後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+  （注意：在階段一至階段三未完成前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
+
+  // Active default Phase 3 block (`ENABLE_USER_ASK_BACK_FLOW = false` — no ask-back question required)
+  const answerOnlyFlowPhases = `- **階段三（學生回答延伸問題 → 老師簡短回應並說出固定換題口令）**：
+  1. 學生會用中文回答你的延伸問題（**不需要**請學生反問你問題）。
+  2. 如果學生在回答時夾雜了英文單字或問某個詞中文怎麼說，請告訴他那個詞的台灣華語怎麼說，並請他把回答再說一次；否則，如果他的回答裡有明顯的發音或語法小錯誤，你可以順帶用半句話輕輕點出自然的說法，接著用簡單、自然慢速的台灣華語**簡短自然回應他的回答（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+  （注意：在階段一「學生親口完整說出正確自然的翻譯句子」與階段二/三「學生回答延伸問題」都完成之前，絕對不可以提前說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
+
+  return `你是一位專業、親切、有耐心且聽力極敏銳的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
 
 【語速與難度原則（極重要）】
 1. **中文請用對學習者說話的自然慢速**：當你說台灣華語（中文）時，請放慢語速，就像面對華語學習者說話一樣，發音清楚、語調自然流暢。請保持正常的句子連貫感，不要刻意一字一頓或在詞與詞之間做不自然的停頓。
 2. **英文題目保持正常語速**：朗讀預先產生的「英文句子（Pre-Generated English Sentence）」時，請維持正常的自然英文語速。
 3. **全程使用與目標詞同等級的簡單日常詞彙**：你對學生說的所有中文回饋與延伸問題，請使用簡單、日常的基礎生活詞彙（TOCFL 1～2 級初級詞彙），句子簡短自然（每次 1～2 句短句），避免艱深詞彙、成語或複雜長句。
-4. 除了朗讀指定的英文題目之外，全程請 100% 使用自然的台灣華語（繁體中文、台灣日常用語，例如「聲調、四聲、三聲、餐廳、計程車、公車、早上/晚上」）與學生對話，不要用英文解釋。
+4. 除了朗讀指定的英文題目（或指出學生剛才夾雜的某個英文單字中文怎麼說）之外，全程請使用自然的台灣華語（繁體中文、台灣日常用語，例如「聲調、一聲/二聲/三聲/四聲、餐廳、計程車、公車、早上/晚上」）與學生對話。
 
 【本題預先產生的對照句子與目標詞彙（內部資訊，在學生成功說出前請勿直接洩漏讀音）】
 - 目標詞（繁體）：${word.traditional}
@@ -331,32 +357,29 @@ export function buildWordSystemInstruction(word, priorTurns = []) {
 - 由上述中文原句翻譯出的英文題目（Pre-Generated English Sentence）："${word.english_prompt}"
 - ${synonymsLine}
 
-【四階段對話練習流程（請嚴格按順序執行）】
-- **階段一（朗讀英文題目、比對預先產生的中文原句、給予回饋修正）**：
+【對話練習流程（請嚴格按順序執行）】
+- **階段一（朗讀英文題目、嚴格把關母語者自然度與發音聲調、直到整句完全正確）**：
   1. 對話一開始，請直接用正常英文語速唸出預先產生的英文句子："${word.english_prompt}"，接著用對學習者說話的自然慢速台灣華語簡短說：「請試著把這句話翻成中文。」（千萬不要在開頭把目標詞「${word.traditional}」或中文原句唸出來！）
-  2. 仔細聽學生的中文回答，並與預先產生的台灣華語原句「${referenceMandarin}」對照檢查：
-     - **允許表達與句型上的自然差異（Allow Stylistic Variations — 極重要）**：「${referenceMandarin}」是標準參考原句，但**不是唯一死板標準答案**！只要學生說出的中文句子**語法正確、符合台灣華語自然口語習慣、表達出英文題目的意思、並且正確使用了目標詞「${word.traditional}」**（且發音聲調正確），就算他的措辭、語序、代名詞、時間詞位置、量詞或語氣助詞（如「了、嗎、吧、呢」）與「${referenceMandarin}」有些微風格差異，**請完全視為正確通過**，直接稱讚並進入階段二，不要強迫他一字不差地背出參考句！
-     - 若學生用了近義詞而非「${word.traditional}」：先肯定他的句子很自然，並溫柔提示他換成今天要練習的目標詞（不要直接唸出目標詞讀音，且不計入發音或語法扣分）。
-     - 若學生的「${word.traditional}」或句子其他部分有**聲調錯誤、發音不準、漏掉目標詞、或語法不自然**：請參考「${referenceMandarin}」，用自然慢速的台灣華語清楚給予回饋與糾正（明確指出哪個字幾聲或哪裡語法怎麼改比較自然），清楚示範正確唸法，並請學生**重新完整說一次正確的中文句子**。
-     - 若學生問任何問題：請用簡單慢速的台灣華語清楚回答，然後引導他回到這句話的練習。
-     - 若學生主動要求「提示 / Hint」或「直接給我答案」：可給他提示或直接示範「${referenceMandarin}」，但仍請他跟著親口唸出完整正確的句子一次。
-  3. 持續互動直到學生親口完整說出包含「${word.traditional}」且語法自然、發音正確的句子為止。
+  2. **非常仔細地檢查學生的發音、聲調與語法（Strict Native Speaker Check — 極重要）**：
+     - **允許真正的自然表達差異**：只要台灣母語者真的會這樣自然說話、準確表達英文原意、每個字的聲調發音正確、且正確使用了目標詞「${word.traditional}」，就算措辭與參考句「${referenceMandarin}」有些微差異，也請視為完全正確並進入階段二。
+     - **嚴格把關不自然的說法與發音**：只要有任何地方跟台灣母語者自然的說法不一樣——包含**任何一個字的聲調或發音不準、用詞不道地、量詞錯誤、語序不自然、漏字、漏掉目標詞「${word.traditional}」**——都請務必明確指出來糾正，不要放水帶過！
+     - **學生夾雜英文單字時**：如果學生在句子裡用了任何英文單字（或問某個英文詞怎麼說），請清楚告訴他**那個詞在台灣華語怎麼說**，然後請他把**整句中文句子**重新完整說一次！
+     - **局部錯誤請勿直接洩漏整句答案（極重要）**：
+       - 如果問題**只出在某一個詞、某個字的發音/聲調、或某個短語**（或是夾雜了一個英文詞），請**只針對那個特定的詞、聲調或短語給予糾正與示範**，**盡量不要直接把整句正確答案唸出來**，讓學生自己組合並說出完整句子！
+       - **只有當整句話的整體語法結構或語序都錯了**（或學生主動要求直接給答案）時，才直接示範完整的自然句子「${referenceMandarin}」並請他跟著說一次。
+     - **近義詞引導**：若學生用了合法近義詞而非「${word.traditional}」，先肯定句子自然，並溫柔提示他換成今天要練習的目標詞（不要直接唸出目標詞讀音）。
+  3. **修正後務必停下來等待學生重說「完整句子」（重複修正直到整句完全正確）**：
+     - **關鍵鐵律**：只要你給了**任何糾正、英文詞翻譯、或近義詞提示**，請務必請學生**把修正後的「整句中文」重新完整說一次**，然後**立刻停下來等待學生開口**！**絕對不可以**在同一輪糾正裡直接問階段二的延伸問題！
+     - 如果學生只單獨唸了那一個詞、沒有說完整句話，請肯定那個詞對了，並請他**把整句話完整連起來說一次**。
+     - 如果學生重說時還有其他發音、聲調或語法小錯誤，請**繼續針對錯誤糾正並請他重說整句話**，反覆練習直到他親口完整說出自然、發音正確且包含「${word.traditional}」的整句話為止，才可進入階段二！
 
-- **階段二（老師延伸提問——嚴禁把剛才翻譯的句子直接改成問句重複問！）**：
-  1. 當學生成功說出正確自然的句子後，先簡短肯定他（例如：「說得很好！」或「很自然！」），接著用**簡單、自然慢速的台灣華語**問他一個連結他自己日常生活、個人習慣、喜好或經驗的**延伸問題（follow-up question）**（1 句自然短句，約 8～18 個字，使用 TOCFL 1～2 級日常基礎詞彙）。
-  2. **絕對禁止「原句照抄改問句」（No Direct Restatement — 極重要）**：
-     - **千萬不要**只是把剛才翻譯的原句「${referenceMandarin}」（或學生剛說的那句話）把主詞換成「你」、或只在句尾加上「嗎？／對不對？／是不是？」就當作問題問回去！也不要問和原句幾乎一模一樣的內容。
-     - 錯誤示範（禁止）：若剛才翻譯「我覺得這杯咖啡很好喝。」，**絕對不可以**問「你覺得這杯咖啡好喝嗎？」；若剛才翻譯「明天可能會下雨。」，**絕對不可以**問「明天可能會下雨嗎？」；若剛才翻譯「我以為他回家了。」，**絕對不可以**問「你以為他回家了嗎？」。
-     - 正確示範（請往外延伸一步，改問新的生活角度、個人偏好或二選一／疑問詞問題）：優先使用「什麼、哪裡、哪一種、什麼時候、平常都怎麼…、喜歡…還是…」來開啟新話題，若自然順口可帶入目標詞「${word.traditional}」（不順則不必硬塞）。例如：「你平常早上喜歡喝咖啡還是喝茶？」、「如果週末下雨，你通常會在家做什麼？」、「你以前有沒有認錯人或記錯時間的經驗？」。
+- **階段二（老師延伸提問——盡可能使用目標詞「${word.traditional}」，且嚴禁照抄原句改問句！）**：
+  1. 當學生終於把整句話完全說對後，先簡短肯定他（例如：「說得很好，很自然！」），接著用**簡單、自然慢速的台灣華語**問他一個連結他自己日常生活、習慣、喜好或經驗的**延伸問題（follow-up question）**（1 句自然短句，約 8～18 個字，使用 TOCFL 1～2 級日常基礎詞彙）。
+  2. **盡可能把目標詞「${word.traditional}」自然放進你的延伸問題裡（極重要）**：只要語意自然合理，你的延伸問題**請務必使用本題目標詞「${word.traditional}」**，讓學生在真實問答中再次聽見並運用這個詞！
+  3. **絕對禁止「原句照抄改問句」（No Direct Restatement）**：
+     - **千萬不要**只是把剛才翻譯的原句「${referenceMandarin}」（或學生剛說的那句話）把主詞換成「你」、或只在句尾加上「嗎？／對不對？／是不是？」就當作問題問回去！請換一個新的生活情境、時間點、個人習慣或偏好來提問（同時自然帶入「${word.traditional}」）。
 
-- **階段三（學生回答＋請學生反問老師）**：
-  1. 學生會用中文回答你的問題，並且應該要順便反問你一個相關的問題。
-  2. 如果學生的回答有明顯語法或發音錯誤，請簡短幫他修正一句。
-  3. **關鍵規則**：如果學生只有回答你的問題、還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並等待他提問。如果學生已經反問你問題了，就直接進入階段四。
-
-- **階段四（老師簡短回答並說出固定換題口令）**：
-  當學生提出他的問題後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
-  （注意：在階段一至階段三未完成前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）
+${enableAskBack ? askBackFlowPhases : answerOnlyFlowPhases}
 
 【免持語音控制固定口令（僅在學生主動要求時說出對應句子）】
 - 學生說「跳過 / 下一題 / Skip / Next word」 -> 請直接說：**「好，我們跳過這題！」**
@@ -383,20 +406,17 @@ export class GeminiLiveVoicePipeline {
     this.workletNode = null;
     this.workletLoaded = false;
     this.deviceChangeBound = false;
+    this._micAcquirePromise = null;
 
-    // Car / Android Auto Audio Routing & Broadcast Mastering Chain
-    this.audioRoutingMode = 'media_auto'; // 'media_auto' | 'bluetooth_hfp' | 'voice_comm'
+    // Default Audio Routing: Bluetooth Call / Earbuds (`bluetooth_hfp`) with automatic Speakerphone fallback
+    this.audioRoutingMode = 'bluetooth_hfp'; // 'bluetooth_hfp' | 'voice_comm'
     this.preferredMicDeviceId = 'auto';
-    this.outputVolumeBoost = 2.2;
-    this.outputEntryNode = null;
-    this.outputBoostNode = null;
     this.enumeratedAudioInputs = [];
     this.activeMicInfo = {
       label: 'Not initialized',
-      routingMode: 'media_auto',
-      echoCancellation: false,
-      noiseSuppression: false,
-      outputBoost: 2.2
+      routingMode: 'bluetooth_hfp',
+      echoCancellation: true,
+      noiseSuppression: true
     };
 
     this.ws = null;
@@ -429,12 +449,10 @@ export class GeminiLiveVoicePipeline {
     this.lastVoiceActivityTime = 0;
     this.lastCountdownText = '';
     this.noiseFloor = 0.0035;
-    this.currentInputGain = 1.0;
     this.turnFramesCount = 0;
     this.turnZeroFramesCount = 0;
     this.turnRawMaxRms = 0;
     this.turnRawSumRms = 0;
-    this.turnBoostedMaxRms = 0;
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
     this.currentTurnTutorTranscript = '';
@@ -465,36 +483,23 @@ export class GeminiLiveVoicePipeline {
     this.connectionState = 'idle';
   }
 
-  setAudioConfig({ routingMode, preferredDeviceId, outputVolumeBoost } = {}) {
-    if (routingMode && ['media_auto', 'bluetooth_hfp', 'voice_comm'].includes(routingMode)) {
-      this.audioRoutingMode = routingMode;
+  setAudioConfig({ routingMode, preferredDeviceId } = {}) {
+    if (routingMode === 'voice_comm') {
+      this.audioRoutingMode = 'voice_comm';
+    } else if (routingMode) {
+      // Auto-migrate deprecated `'media_auto'` (and default) to `'bluetooth_hfp'`
+      this.audioRoutingMode = 'bluetooth_hfp';
     }
     if (typeof preferredDeviceId === 'string' && preferredDeviceId.trim()) {
       this.preferredMicDeviceId = preferredDeviceId.trim();
     }
-    if (outputVolumeBoost !== undefined) {
-      this.setOutputVolumeBoost(outputVolumeBoost);
-    } else {
-      this._syncAudioSummaryContext();
-    }
-  }
-
-  setOutputVolumeBoost(boost = 2.2) {
-    const parsed = Number(boost);
-    const clamped = Number.isFinite(parsed) ? Math.max(0.8, Math.min(3.5, parsed)) : 2.2;
-    this.outputVolumeBoost = Number(clamped.toFixed(2));
-    if (this.outputBoostNode && this.audioCtx) {
-      this.outputBoostNode.gain.setValueAtTime(this.outputVolumeBoost, this.audioCtx.currentTime);
-    }
-    this.activeMicInfo.outputBoost = this.outputVolumeBoost;
+    this.activeMicInfo.routingMode = this.audioRoutingMode;
     this._syncAudioSummaryContext();
-    this.onAudioHardwareUpdate(this.activeMicInfo, this.enumeratedAudioInputs);
   }
 
   _routingModeShortLabel(mode = this.audioRoutingMode) {
-    if (mode === 'bluetooth_hfp') return 'BT Call HFP';
-    if (mode === 'voice_comm') return 'Phone Speaker AEC';
-    return 'Media / Android Auto';
+    if (mode === 'voice_comm') return 'Phone Speakerphone';
+    return 'Bluetooth Call / Auto';
   }
 
   _syncAudioSummaryContext() {
@@ -502,56 +507,8 @@ export class GeminiLiveVoicePipeline {
     const micLabel = this.activeMicInfo?.label || 'Not initialized';
     const summary = `${modeLabel} | Mic: "${micLabel}" (AEC=${Boolean(
       this.activeMicInfo?.echoCancellation
-    )}, NS=${Boolean(this.activeMicInfo?.noiseSuppression)}) | OutBoost: ${this.outputVolumeBoost}x`;
+    )}, NS=${Boolean(this.activeMicInfo?.noiseSuppression)})`;
     debugLogger.setContext({ audioSummary: summary });
-  }
-
-  _createSoftLimiterCurve(samples = 2048) {
-    const curve = new Float32Array(samples);
-    for (let i = 0; i < samples; i++) {
-      const x = (i * 2) / (samples - 1) - 1;
-      curve[i] = Math.tanh(x * 1.25) / Math.tanh(1.25);
-    }
-    return curve;
-  }
-
-  _ensureOutputMasteringChain() {
-    if (!this.audioCtx || this.outputEntryNode) return;
-    try {
-      const highpass = this.audioCtx.createBiquadFilter();
-      highpass.type = 'highpass';
-      highpass.frequency.value = 85;
-      highpass.Q.value = 0.707;
-
-      const compressor = this.audioCtx.createDynamicsCompressor();
-      compressor.threshold.value = -22;
-      compressor.knee.value = 12;
-      compressor.ratio.value = 3.5;
-      compressor.attack.value = 0.004;
-      compressor.release.value = 0.18;
-
-      const boostGain = this.audioCtx.createGain();
-      boostGain.gain.value = this.outputVolumeBoost;
-
-      const limiter = this.audioCtx.createWaveShaper();
-      limiter.curve = this._createSoftLimiterCurve(2048);
-      limiter.oversample = '2x';
-
-      highpass.connect(compressor);
-      compressor.connect(boostGain);
-      boostGain.connect(limiter);
-      limiter.connect(this.audioCtx.destination);
-
-      this.outputEntryNode = highpass;
-      this.outputBoostNode = boostGain;
-    } catch (err) {
-      debugLogger.log(
-        'warn',
-        'audio_mastering_fallback',
-        `Mastering chain fallback to direct destination: ${err.message || err}`
-      );
-      this.outputEntryNode = this.audioCtx.destination;
-    }
   }
 
   async enumerateAudioDevices(reason = 'manual') {
@@ -581,16 +538,12 @@ export class GeminiLiveVoicePipeline {
         }));
 
       this.enumeratedAudioInputs = inputs;
-      const hasBluetoothInput = inputs.some((d) =>
-        /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(d.label)
-      );
-      const hasUsbInput = inputs.some((d) => /usb|android auto/i.test(d.label));
+      const hasBluetoothInput = inputs.some((d) => isBluetoothAudioDeviceLabel(d.label));
       const hasSpeakerphoneInput = inputs.some((d) => /speakerphone/i.test(d.label));
 
       debugLogger.log('info', 'audio_devices_enumerated', `Enumerated ${inputs.length} mic(s) (${reason})`, {
         reason,
         hasBluetoothInput,
-        hasUsbInput,
         hasSpeakerphoneInput,
         inputs: inputs.map((i) => ({ id: i.shortId, label: i.label })),
         outputs: outputs.map((o) => ({ id: o.shortId, label: o.label }))
@@ -607,57 +560,26 @@ export class GeminiLiveVoicePipeline {
   _pickAutoDeviceIdForMode(inputs = [], mode = this.audioRoutingMode) {
     if (!Array.isArray(inputs) || inputs.length === 0) return null;
     if (mode === 'bluetooth_hfp') {
-      const bt = inputs.find(
-        (d) =>
-          /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(d.label) &&
-          !/earpiece|wired/i.test(d.label)
-      );
-      return bt ? bt.deviceId : null;
-    }
-    if (mode === 'voice_comm') {
+      // Automatically prefer any connected Bluetooth device (car HFP or Bluetooth earbuds),
+      // and fall back cleanly to Phone Speakerphone (avoiding "Headset earpiece") when offline/indoors!
+      const bt = inputs.find((d) => isBluetoothAudioDeviceLabel(d.label));
+      if (bt) return bt.deviceId;
       const spk = inputs.find((d) => /speakerphone/i.test(d.label));
       return spk ? spk.deviceId : null;
     }
-    // In `media_auto` (Media / Android Auto Far-Field), avoid earpiece; prefer USB/external if present, else default
-    const usb = inputs.find(
-      (d) => /usb|external/i.test(d.label) && !/earpiece/i.test(d.label)
-    );
-    return usb ? usb.deviceId : null;
+    const spk = inputs.find((d) => /speakerphone/i.test(d.label));
+    return spk ? spk.deviceId : null;
   }
 
   _buildAudioConstraints(targetDeviceId = null) {
     const devConstraint =
       targetDeviceId && targetDeviceId !== 'auto' ? { deviceId: { exact: targetDeviceId } } : {};
 
-    if (this.audioRoutingMode === 'bluetooth_hfp') {
-      return {
-        ...devConstraint,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      };
-    }
-    if (this.audioRoutingMode === 'voice_comm') {
-      return {
-        ...devConstraint,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: false,
-        autoGainControl: true
-      };
-    }
-    // Default `media_auto`:
-    // Disables WebRTC `VOICE_COMMUNICATION` (`echoCancellation: false, noiseSuppression: false`) so:
-    // 1. Pixel 9 stays in `AudioManager.MODE_NORMAL` (`STREAM_MUSIC`) -> Volume rocker controls Media Volume!
-    // 2. Android Auto stereo media plays cleanly on Nissan Leaf SV speakers without Bluetooth HFP conflicts.
-    // 3. Far-field driver speech 2–3 ft away is NOT crushed by Android's near-field handset noise gate.
-    // (Safe from echo because our pipeline is strictly half-duplex and gates mic during playback + 280ms decay!)
     return {
       ...devConstraint,
       channelCount: 1,
-      echoCancellation: false,
-      noiseSuppression: false,
+      echoCancellation: true,
+      noiseSuppression: true,
       autoGainControl: true
     };
   }
@@ -726,14 +648,12 @@ export class GeminiLiveVoicePipeline {
       zeroFrames: this.turnZeroFramesCount,
       rawMaxRms: Number(this.turnRawMaxRms.toFixed(4)),
       rawAvgRms: Number(avgRms.toFixed(4)),
-      boostedMaxRms: Number(this.turnBoostedMaxRms.toFixed(4)),
-      inputGain: Number(this.currentInputGain.toFixed(2)),
       noiseFloor: Number(this.noiseFloor.toFixed(4))
     };
   }
 
   /**
-   * Initializes (or hot-swaps) the WebAudio mastering chain and microphone stream.
+   * Initializes (or hot-swaps) WebAudio and the microphone stream.
    */
   async initAudioHardware(forceReacquireMic = false) {
     if (!this.audioCtx) {
@@ -746,11 +666,9 @@ export class GeminiLiveVoicePipeline {
       debugLogger.log('info', 'audio_ctx_init', `Initialized WebAudio (${this.audioCtx.sampleRate}Hz)`, {
         sampleRate: this.audioCtx.sampleRate,
         baseLatency: this.audioCtx.baseLatency ?? null,
-        outputBoost: this.outputVolumeBoost,
         routingMode: this.audioRoutingMode
       });
     }
-    this._ensureOutputMasteringChain();
 
     if (this.audioCtx.state === 'suspended') {
       await this.audioCtx.resume();
@@ -800,17 +718,17 @@ export class GeminiLiveVoicePipeline {
         const { inputs } = await this.enumerateAudioDevices('devicechange_hotplug');
         const activeTrack = this.micStream ? this.micStream.getAudioTracks()[0] : null;
         const trackEnded = !activeTrack || activeTrack.readyState === 'ended';
-        const autoBtTarget =
-          this.audioRoutingMode === 'bluetooth_hfp' && this.preferredMicDeviceId === 'auto'
-            ? this._pickAutoDeviceIdForMode(inputs, 'bluetooth_hfp')
-            : null;
+        const hasBtDeviceNow = inputs.some((d) => isBluetoothAudioDeviceLabel(d.label));
         const shouldSwitchToNewBt =
-          Boolean(autoBtTarget) &&
+          this.audioRoutingMode === 'bluetooth_hfp' &&
+          this.preferredMicDeviceId === 'auto' &&
+          hasBtDeviceNow &&
           activeTrack &&
-          !/bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(activeTrack.label || '');
+          !isBluetoothAudioDeviceLabel(activeTrack.label || '');
 
-        debugLogger.log('info', 'audio_device_changed', 'Audio hardware topology changed (USB/AA/BT)', {
+        debugLogger.log('info', 'audio_device_changed', 'Audio hardware topology changed (Bluetooth / Speaker)', {
           trackEnded,
+          hasBtDeviceNow,
           shouldSwitchToNewBt,
           activeTrackLabel: activeTrack ? activeTrack.label : null,
           inputsCount: inputs.length
@@ -826,6 +744,16 @@ export class GeminiLiveVoicePipeline {
   }
 
   async _acquireAndBindMicrophone(reason = 'init') {
+    if (this._micAcquirePromise) {
+      return this._micAcquirePromise;
+    }
+    this._micAcquirePromise = this._acquireAndBindMicrophoneImpl(reason).finally(() => {
+      this._micAcquirePromise = null;
+    });
+    return this._micAcquirePromise;
+  }
+
+  async _acquireAndBindMicrophoneImpl(reason = 'init') {
     if (this.micSourceNode) {
       try {
         this.micSourceNode.disconnect();
@@ -867,15 +795,13 @@ export class GeminiLiveVoicePipeline {
 
     // Re-enumerate once permission is granted so full device labels (`Bluetooth headset`, `Speakerphone`, etc.) appear!
     const postEnum = await this.enumerateAudioDevices(`${reason}_post`);
-    if (
-      this.preferredMicDeviceId === 'auto' &&
-      (this.audioRoutingMode === 'bluetooth_hfp' || this.audioRoutingMode === 'voice_comm')
-    ) {
+    if (this.preferredMicDeviceId === 'auto') {
       const currentLabel = stream.getAudioTracks()[0]?.label || '';
+      const hasBt = postEnum.inputs.some((d) => isBluetoothAudioDeviceLabel(d.label));
       const desiredAutoId = this._pickAutoDeviceIdForMode(postEnum.inputs, this.audioRoutingMode);
       const alreadyMatched =
-        this.audioRoutingMode === 'bluetooth_hfp'
-          ? /bluetooth|bt|hands-free|headset|hfp|car|leaf|nissan/i.test(currentLabel)
+        this.audioRoutingMode === 'bluetooth_hfp' && hasBt
+          ? isBluetoothAudioDeviceLabel(currentLabel)
           : /speakerphone/i.test(currentLabel);
 
       if (desiredAutoId && !alreadyMatched) {
@@ -897,15 +823,13 @@ export class GeminiLiveVoicePipeline {
     this.activeMicInfo = {
       label: trackLabel,
       routingMode: this.audioRoutingMode,
-      echoCancellation:
-        settings.echoCancellation ?? (this.audioRoutingMode !== 'media_auto'),
-      noiseSuppression:
-        settings.noiseSuppression ?? (this.audioRoutingMode === 'bluetooth_hfp'),
+      isBluetooth: isBluetoothAudioDeviceLabel(trackLabel),
+      echoCancellation: settings.echoCancellation ?? true,
+      noiseSuppression: settings.noiseSuppression ?? true,
       autoGainControl: settings.autoGainControl ?? true,
       sampleRate: settings.sampleRate || this.audioCtx?.sampleRate || 24000,
       muted: Boolean(track?.muted),
-      readyState: track?.readyState || 'live',
-      outputBoost: this.outputVolumeBoost
+      readyState: track?.readyState || 'live'
     };
 
     if (track) {
@@ -946,6 +870,7 @@ export class GeminiLiveVoicePipeline {
       {
         reason,
         label: trackLabel,
+        isBluetooth: Boolean(this.activeMicInfo.isBluetooth),
         routingMode: this.audioRoutingMode,
         preferredMicDeviceId:
           this.preferredMicDeviceId === 'auto'
@@ -959,8 +884,7 @@ export class GeminiLiveVoicePipeline {
           echoCancellation: settings.echoCancellation ?? null,
           noiseSuppression: settings.noiseSuppression ?? null,
           autoGainControl: settings.autoGainControl ?? null
-        },
-        outputVolumeBoost: this.outputVolumeBoost
+        }
       }
     );
 
@@ -990,39 +914,28 @@ export class GeminiLiveVoicePipeline {
     }
     this.turnRawSumRms += rawRms;
 
-    this.currentInputGain = computeAdaptiveInputGain(
-      rawRms,
-      this.noiseFloor,
-      this.currentInputGain
-    );
-    const boostedRms = Math.min(1, rawRms * this.currentInputGain);
-    if (boostedRms > this.turnBoostedMaxRms) {
-      this.turnBoostedMaxRms = boostedRms;
-    }
-    this.onAudioLevel(Math.min(1, boostedRms * 5));
+    this.onAudioLevel(Math.min(1, rawRms * 5));
 
     const inputRate = this.audioCtx ? this.audioCtx.sampleRate : 24000;
-    const pcm16Base64 = this._downsampleAndEncodePcm16(
-      float32Samples,
-      inputRate,
-      16000,
-      this.currentInputGain
-    );
+    const pcm16Base64 = this._downsampleAndEncodePcm16(float32Samples, inputRate, 16000);
 
-    // Far-field car-friendly SNR threshold (floor 0.0075 instead of 0.016 so distant cabin speech triggers reliably!)
-    const speechStartThreshold = Math.max(0.0075, Math.min(0.042, this.noiseFloor * 2.85));
+    // Calibrated for Bluetooth Call HFP & Phone Speakerphone hardware AGC:
+    // Real speech arrives at ~0.12–0.37 RMS while minor car bumps/blinkers sit at ~0.012–0.026 RMS.
+    // Floor of 0.020 (3 frames = 300ms, or 2 frames when >= 0.036) blocks road-noise false triggers!
+    const speechStartThreshold = Math.max(0.020, Math.min(0.045, this.noiseFloor * 3.2));
 
     if (!this.userSpokeInTurn) {
       this._sendAudioChunk(pcm16Base64);
 
       if (rawRms >= speechStartThreshold) {
         this.consecutiveSpeechFrames += 1;
-        const requiredFrames = rawRms >= speechStartThreshold * 1.18 ? 2 : 3;
+        const requiredFrames =
+          rawRms >= Math.max(0.036, speechStartThreshold * 1.4) ? 2 : 3;
         if (this.consecutiveSpeechFrames >= requiredFrames) {
           this.userSpokeInTurn = true;
           this.speechSegmentsInTurn = 1;
           this.turnVoicedMs = requiredFrames * 100;
-          this.turnPeakSpeechRms = Math.max(0.025, Math.min(0.4, rawRms));
+          this.turnPeakSpeechRms = Math.max(0.03, Math.min(0.4, rawRms));
           this.silenceFramesSentInPause = 0;
           this.resumeSpeechFrames = 0;
           this.pausePreRollBuffer = [];
@@ -1030,8 +943,6 @@ export class GeminiLiveVoicePipeline {
           this.lastCountdownText = '';
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
             rawRms: Number(rawRms.toFixed(4)),
-            boostedRms: Number(boostedRms.toFixed(4)),
-            inputGain: Number(this.currentInputGain.toFixed(2)),
             noiseFloor: Number(this.noiseFloor.toFixed(4)),
             threshold: Number(speechStartThreshold.toFixed(4)),
             turnExpectation: this.turnExpectation
@@ -1050,8 +961,8 @@ export class GeminiLiveVoicePipeline {
     }
 
     const speechContinueThreshold = Math.max(
-      0.0055,
-      Math.min(0.036, Math.max(this.noiseFloor * 2.15, this.turnPeakSpeechRms * 0.11))
+      0.010,
+      Math.min(0.038, Math.max(this.noiseFloor * 2.4, this.turnPeakSpeechRms * 0.14))
     );
     const silenceBeforeFrame = now - this.lastVoiceActivityTime;
 
@@ -1070,8 +981,6 @@ export class GeminiLiveVoicePipeline {
     }
 
     if (isVoicedSpeech) {
-      // If user was in a real pause (>= 450ms) and resumed speaking (e.g. asking their follow-up question),
-      // flush the 200ms pre-roll buffer so the onset consonant is never clipped!
       if (silenceBeforeFrame >= 450) {
         this.speechSegmentsInTurn += 1;
         for (const bufferedChunk of this.pausePreRollBuffer) {
@@ -1097,6 +1006,35 @@ export class GeminiLiveVoicePipeline {
     const { thresholdMs, reason } = this._getCurrentDynamicSilenceTarget();
 
     if (silenceElapsed >= thresholdMs) {
+      // Transient road-bump / blinker guard: if a tiny <=300ms low-energy impulse triggered speech_start
+      // and produced zero ASR text, reset to listening immediately in 0ms instead of locking out the mic!
+      if (
+        !this._getCombinedLiveUserTranscript() &&
+        this.turnVoicedMs <= 300 &&
+        this.turnPeakSpeechRms < 0.055
+      ) {
+        debugLogger.log(
+          'info',
+          'transient_noise_ignored',
+          'Ignored brief non-speech impulse without locking out microphone',
+          {
+            voicedMs: this.turnVoicedMs,
+            peakRms: Number(this.turnPeakSpeechRms.toFixed(4)),
+            noiseFloor: Number(this.noiseFloor.toFixed(4))
+          }
+        );
+        this.userSpokeInTurn = false;
+        this.consecutiveSpeechFrames = 0;
+        this.resumeSpeechFrames = 0;
+        this.speechSegmentsInTurn = 0;
+        this.turnVoicedMs = 0;
+        this.silenceFramesSentInPause = 0;
+        this.pausePreRollBuffer = [];
+        this.lastCountdownText = '';
+        this._emitState('listening', this._defaultListeningLabel());
+        return;
+      }
+
       this.commitUserSpeechTurn(`smart_${reason}`, {
         thresholdMs,
         silenceElapsedMs: Math.round(silenceElapsed),
@@ -1110,7 +1048,7 @@ export class GeminiLiveVoicePipeline {
     // - Frames 3–5 (300ms): send clean digital-zero PCM so server ASR emits `inputTranscription` promptly
     //   while total silence sent (500ms) remains safely below server `silenceDurationMs` (950ms)!
     // - Frames >= 6: hold silence locally (keeping a 200ms pre-roll ring buffer) so server VAD never cuts
-    //   the student off early while thinking mid-sentence or formulating their follow-up question!
+    //   the student off early while thinking mid-sentence!
     if (this.silenceFramesSentInPause < 2) {
       this._sendAudioChunk(pcm16Base64);
       this.silenceFramesSentInPause += 1;
@@ -1189,9 +1127,7 @@ export class GeminiLiveVoicePipeline {
     }
 
     // Burst clean digital-zero 16kHz PCM frames so server automaticActivityDetection (`silenceDurationMs: 950`)
-    // deterministically sees >= 1200ms of clean silence and fires end-of-turn immediately (both on smart
-    // endpointing AND when tapping `Done Speaking`, even if car cabin speech stayed below local VAD!),
-    // completely immune to car road noise!
+    // deterministically sees >= 1200ms of clean silence and fires end-of-turn immediately!
     const shouldSendZeroBurst =
       this.listeningForUser &&
       (hadUserSpeech || (reason === 'manual_done' && this.sentAudioChunksInTurn > 0));
@@ -1238,7 +1174,7 @@ export class GeminiLiveVoicePipeline {
       clearTimeout(this.noReplyRecoveryTimer);
     }
 
-    const recoveryWaitMs = hadUserSpeech || liveTranscriptSnapshot ? 5000 : 3200;
+    const recoveryWaitMs = hadUserSpeech || liveTranscriptSnapshot ? 3200 : 2400;
     this.noReplyRecoveryTimer = setTimeout(() => {
       this.noReplyRecoveryTimer = null;
       if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -1265,19 +1201,40 @@ export class GeminiLiveVoicePipeline {
           this.ws.send(
             JSON.stringify({
               realtimeInput: {
-                text: `（學生剛才回答：「${latestTranscript}」，請直接依目前練習階段用自然慢速台灣華語簡短回應。）`
+                text: `（學生剛才說：「${latestTranscript}」，請直接依目前練習階段用自然慢速台灣華語回應。）`
               }
             })
           );
         } catch (_) {}
+
+        // Safety net: if socket is half-dead and still produces zero output 4.5s after text nudge, auto-reconnect!
+        this.noReplyRecoveryTimer = setTimeout(() => {
+          this.noReplyRecoveryTimer = null;
+          if (
+            this.isActive &&
+            !this.wordTerminalActionLocked &&
+            !this.pendingActionAfterPlayback &&
+            !this.tutorTurnActive &&
+            !this.isTutorPlayingAudio()
+          ) {
+            debugLogger.log(
+              'warn',
+              'no_reply_after_nudge_reconnect',
+              'Socket remained silent 4500ms after text nudge; reconnecting word session',
+              { latestTranscript }
+            );
+            this._closeRawSocketOnly();
+            this._attemptAutoReconnect(1006, 'no_reply_after_nudge');
+          }
+        }, 4500);
       } else {
         debugLogger.log(
           'info',
           'no_reply_timer_fired',
-          `No speech transcribed after ${recoveryWaitMs}ms (ambient noise or quiet mic); resuming listening`,
+          `No speech transcribed after ${recoveryWaitMs}ms (ambient noise or quiet mic); resuming listening immediately`,
           { micStats }
         );
-        this._beginListeningTurn();
+        this._beginListeningTurn(null, true);
       }
     }, recoveryWaitMs);
   }
@@ -1298,7 +1255,7 @@ export class GeminiLiveVoicePipeline {
       const osc = this.audioCtx.createOscillator();
       const gain = this.audioCtx.createGain();
       osc.connect(gain);
-      gain.connect(this.outputEntryNode || this.audioCtx.destination);
+      gain.connect(this.audioCtx.destination);
 
       if (type === 'start') {
         osc.frequency.setValueAtTime(523.25, now); // C5
@@ -1868,7 +1825,20 @@ export class GeminiLiveVoicePipeline {
     });
   }
 
-  _beginListeningTurn(customLabel = null) {
+  _defaultListeningLabel() {
+    if (this.turnExpectation === 'answer_followup') {
+      return 'Your turn — answer in Mandarin';
+    }
+    if (this.turnExpectation === 'reply_and_ask_back') {
+      return 'Your turn — answer & ask a question back';
+    }
+    if (this.turnExpectation === 'ask_question_only') {
+      return 'Your turn — ask the tutor a question in Mandarin';
+    }
+    return 'Your turn — speak in Mandarin';
+  }
+
+  _beginListeningTurn(customLabel = null, skipCooldown = false) {
     if (!this.isActive || this.wordTerminalActionLocked) return;
     this.tutorTurnActive = false;
     this.listeningForUser = true;
@@ -1883,25 +1853,15 @@ export class GeminiLiveVoicePipeline {
     this.turnZeroFramesCount = 0;
     this.turnRawMaxRms = 0;
     this.turnRawSumRms = 0;
-    this.turnBoostedMaxRms = 0;
     this.silenceFramesSentInPause = 0;
     this.pausePreRollBuffer = [];
     this.sentAudioChunksInTurn = 0;
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
     this.lastCountdownText = '';
-    // 280ms post-playback decay in `media_auto` ensures car cabin speaker reverb dies out completely
-    // before the mic opens, giving rock-solid zero-echo half-duplex without WebRTC VOICE_COMMUNICATION!
-    const cooldownMs = this.audioRoutingMode === 'media_auto' ? 280 : 180;
-    this.postPlaybackCooldownUntil = performance.now() + cooldownMs;
+    this.postPlaybackCooldownUntil = skipCooldown ? 0 : performance.now() + 180;
 
-    let defaultLabel = 'Your turn — speak in Mandarin';
-    if (this.turnExpectation === 'reply_and_ask_back') {
-      defaultLabel = 'Your turn — answer & ask a question back';
-    } else if (this.turnExpectation === 'ask_question_only') {
-      defaultLabel = 'Your turn — ask the tutor a question in Mandarin';
-    }
-    this._emitState('listening', customLabel || defaultLabel);
+    this._emitState('listening', customLabel || this._defaultListeningLabel());
   }
 
   _executeTerminalCue(cue, triggerSource = 'turn_complete') {
@@ -2101,7 +2061,7 @@ export class GeminiLiveVoicePipeline {
 
         const pendingCue = detectSpokenTerminalCue(completedTutorText);
 
-        // Guard 1: Detect completely silent tutor turn (0 audio chunks or all-zero `AAA=` chunks, e.g. Word #3 `可能`)
+        // Guard 1: Detect completely silent tutor turn (0 audio chunks or all-zero `AAA=` chunks)
         if (
           this.isActive &&
           !this.wordTerminalActionLocked &&
@@ -2182,7 +2142,6 @@ export class GeminiLiveVoicePipeline {
         }
 
         // Guard 2: Detect Phase 1 greeting where English sentence was skipped or Chinese instruction truncated
-        // (e.g. Word #2 `正常`: 2.96s audio & truncated at `請試著`, or Word #1 try 1: 3.04s missing English audio)
         if (
           this.isActive &&
           !this.wordTerminalActionLocked &&
@@ -2261,7 +2220,10 @@ export class GeminiLiveVoicePipeline {
 
         const tutorTurnsSoFar = this.wordTurns.filter((t) => t.role === 'tutor').length;
         this.turnExpectation = classifyNextUserTurnExpectation(completedTutorText, tutorTurnsSoFar);
-        if (this.turnExpectation === 'reply_and_ask_back') {
+        if (
+          this.turnExpectation === 'answer_followup' ||
+          this.turnExpectation === 'reply_and_ask_back'
+        ) {
           debugLogger.setContext({ phase: 2 });
           this.onPhaseHint(2);
         } else if (this.turnExpectation === 'ask_question_only') {
@@ -2343,7 +2305,7 @@ export class GeminiLiveVoicePipeline {
 
     const src = this.audioCtx.createBufferSource();
     src.buffer = audioBuffer;
-    src.connect(this.outputEntryNode || this.audioCtx.destination);
+    src.connect(this.audioCtx.destination);
 
     const now = this.audioCtx.currentTime;
     if (this.nextPlayTime < now) {
@@ -2428,8 +2390,6 @@ export class GeminiLiveVoicePipeline {
       this.micStream.getTracks().forEach((t) => t.stop());
       this.micStream = null;
     }
-    this.outputEntryNode = null;
-    this.outputBoostNode = null;
     this.workletNode = null;
     this.workletLoaded = false;
     if (this.audioCtx) {
@@ -2458,7 +2418,7 @@ export class GeminiLiveVoicePipeline {
     return rms;
   }
 
-  _downsampleAndEncodePcm16(buffer, inputRate, outputRate, inputGain = 1.0) {
+  _downsampleAndEncodePcm16(buffer, inputRate, outputRate) {
     let samples = buffer;
     if (inputRate !== outputRate) {
       const ratio = inputRate / outputRate;
@@ -2479,12 +2439,9 @@ export class GeminiLiveVoicePipeline {
       }
     }
 
-    const usePreAmp = Number.isFinite(inputGain) && inputGain > 1.01;
     const bytes = new Uint8Array(samples.length * 2);
     for (let i = 0; i < samples.length; i++) {
-      const rawSample = samples[i];
-      const boosted = usePreAmp ? Math.tanh(rawSample * inputGain) : rawSample;
-      const s = Math.max(-1, Math.min(1, boosted));
+      const s = Math.max(-1, Math.min(1, samples[i]));
       const int16 = s < 0 ? s * 0x8000 : s * 0x7fff;
       bytes[i * 2] = int16 & 0xff;
       bytes[i * 2 + 1] = (int16 >> 8) & 0xff;

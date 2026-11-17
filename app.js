@@ -14,34 +14,96 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=17';
-import { GeminiLiveVoicePipeline } from './live-audio.js?v=17';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=18';
+import {
+  ENABLE_USER_ASK_BACK_FLOW,
+  GeminiLiveVoicePipeline
+} from './live-audio.js?v=18';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
+function escapeRegExp(str = '') {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Inspects completed tutor feedback turns (excluding the initial Phase 1 prompt) to separate:
- * - Benign synonym redirects (e.g. student used valid synonym `平常` while target `經常` was hidden,
- *   then cleanly used `經常` on try #2) -> MUST NOT be penalized!
- * - Real pronunciation / tone corrections
- * - Real grammar / sentence-structure corrections
+ * Inspects completed dialogue turns to separate:
+ * - Benign synonym redirects (student used a valid synonym while target word was hidden, then used target word cleanly)
+ * - Corrections on NON-target words (tone/pronunciation fixes, measure-word/grammar tweaks, or English-to-Mandarin
+ *   word translations on OTHER words in the sentence after the student already recalled & used `targetTraditional`)
+ *   -> MUST NOT penalize the FSRS score for the target word!
+ * - Real pronunciation/tone or grammar corrections on the TARGET word itself (`targetTraditional`).
  */
-export function analyzeTurnCorrections(wordTurns = []) {
+export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
   const turns = Array.isArray(wordTurns) ? wordTurns : [];
-  const tutorTurns = turns.filter((t) => t && t.role === 'tutor' && t.text);
-  const feedbackTutorTurns = tutorTurns.slice(1);
+  const target = String(targetTraditional || '').trim();
+  const targetChars = target ? Array.from(new Set([...target])) : [];
 
   let synonymRedirects = 0;
+  let nonTargetCorrections = 0;
   let pronunciationCorrections = 0;
   let grammarCorrections = 0;
+  let tutorRevealedTargetWord = false;
+  let seenTutorTurns = 0;
+  let studentProducedTargetSoFar = false;
 
-  for (const t of feedbackTutorTurns) {
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (!t || !t.text) continue;
+
+    if (t.role === 'user') {
+      if (target && t.text.includes(target) && !tutorRevealedTargetWord) {
+        studentProducedTargetSoFar = true;
+      }
+      continue;
+    }
+
+    if (t.role !== 'tutor') continue;
+    seenTutorTurns += 1;
+    if (seenTutorTurns === 1) continue; // Skip initial Phase 1 English prompt turn
+
     const txt = t.text;
+    let prevUserTxt = '';
+    for (let j = i - 1; j >= 0; j--) {
+      if (turns[j] && turns[j].role === 'user' && turns[j].text) {
+        prevUserTxt = turns[j].text;
+        break;
+      }
+    }
+
+    const prevUserHadTarget = target ? prevUserTxt.includes(target) : false;
     const strippedPraise = txt.replace(/發音很(標準|好|清楚|自然|正確)|發音沒問題/g, '');
+
+    // Strip clauses that explicitly praise the target word (e.g. `「經常」用得很好，不過...`)
+    const strippedTargetPraise = target
+      ? strippedPraise.replace(
+          new RegExp(
+            `「?${escapeRegExp(target)}」?[^。！？!?，,；;]{0,10}(很好|很自然|很標準|對了|沒問題|正確)`,
+            'g'
+          ),
+          ''
+        )
+      : strippedPraise;
 
     const isSynonymRedirect =
       /也可以|意思差不多|意思很接近|意思一樣|近義詞|同義詞|要練習的詞是|今天要練的詞是|換成我們今天/.test(
         txt
-      ) && /再說一次|試著用|換成/.test(txt);
+      ) && /再說一次|試著用|換成|整句/.test(txt);
+
+    const isEnglishWordLookup =
+      /[A-Za-z]{2,}/.test(prevUserTxt) ||
+      /中文(我們)?(可以)?(說|叫|是)|在台灣我們(常)?說/.test(txt);
+
+    // Did the tutor have to translate an English word INTO the target word itself before student ever recalled it?
+    if (
+      target &&
+      !studentProducedTargetSoFar &&
+      !prevUserHadTarget &&
+      !isSynonymRedirect &&
+      isEnglishWordLookup &&
+      txt.includes(target)
+    ) {
+      tutorRevealedTargetWord = true;
+    }
 
     const hasToneOrPronFix =
       /聲調|幾聲|一聲|二聲|三聲|四聲|輕聲|唸成|唸錯|讀音|發音不|發音有誤|發音要|注意.*發音/.test(
@@ -49,20 +111,46 @@ export function analyzeTurnCorrections(wordTurns = []) {
       );
 
     const hasRealGrammarFix =
-      /語法|語序|不通順|漏了|少了|句子可以改成|不能這樣用/.test(txt) ||
-      (!isSynonymRedirect && /比較自然.*再說一次|再完整說一次|重新說一次/.test(txt));
+      /語法|語序|量詞|不通順|漏了|少了|句子可以改成|不能這樣用/.test(txt) ||
+      (!isSynonymRedirect &&
+        !hasToneOrPronFix &&
+        /比較自然|再完整說一次|重新說一次|整句話再說一次|把整句話/.test(txt));
+
+    if (isSynonymRedirect && !hasToneOrPronFix) {
+      synonymRedirects += 1;
+      continue;
+    }
 
     if (hasToneOrPronFix) {
+      if (target) {
+        const mentionsTargetCharInError =
+          strippedTargetPraise.includes(target) ||
+          targetChars.some((ch) => strippedTargetPraise.includes(ch));
+        if (!mentionsTargetCharInError && (prevUserHadTarget || studentProducedTargetSoFar)) {
+          nonTargetCorrections += 1;
+          continue;
+        }
+      }
       pronunciationCorrections += 1;
-    } else if (hasRealGrammarFix) {
+      continue;
+    }
+
+    if (hasRealGrammarFix || (isEnglishWordLookup && /再說一次|整句/.test(txt))) {
+      if (target) {
+        const mentionsTargetInError = strippedTargetPraise.includes(target);
+        if ((prevUserHadTarget || studentProducedTargetSoFar) && !mentionsTargetInError) {
+          nonTargetCorrections += 1;
+          continue;
+        }
+      }
       grammarCorrections += 1;
-    } else if (isSynonymRedirect) {
-      synonymRedirects += 1;
     }
   }
 
   return {
     synonymRedirects,
+    nonTargetCorrections,
+    tutorRevealedTargetWord,
     pronunciationCorrections,
     grammarCorrections,
     totalFixes: pronunciationCorrections + grammarCorrections
@@ -81,24 +169,38 @@ export function deriveHeuristicTelemetryFromTurns(
   peeked = false
 ) {
   const turns = Array.isArray(wordTurns) ? wordTurns : [];
+  const target = String(word.traditional || '').trim();
   const userTurns = turns.filter((t) => t && t.role === 'user' && t.text);
   const tutorTurns = turns.filter((t) => t && t.role === 'tutor' && t.text);
 
-  const userAskedForHint = userTurns.some((t) =>
-    /提示|\bhint\b|不知道怎麼說|給我答案|直接告訴我/i.test(t.text)
-  );
+  // Asking how to say a non-target English word when the student already produced `word.traditional` is NOT a target hint!
+  const userAskedForTargetHint = userTurns.some((t) => {
+    if (/給我提示|\bhint\b|給我答案|直接告訴我/i.test(t.text)) return true;
+    if (/不知道怎麼說|怎麼說/i.test(t.text)) {
+      return !(target && t.text.includes(target));
+    }
+    return false;
+  });
   const tutorGaveExplicitAnswerHint = tutorTurns
     .slice(1)
     .some((t) => /給你一點提示|提示你一下/.test(t.text));
 
-  const neededHint = Boolean(usedHintButton || peeked || userAskedForHint || tutorGaveExplicitAnswerHint);
-
   const {
     synonymRedirects,
+    nonTargetCorrections,
+    tutorRevealedTargetWord,
     pronunciationCorrections,
     grammarCorrections,
     totalFixes
-  } = analyzeTurnCorrections(turns);
+  } = analyzeTurnCorrections(turns, target);
+
+  const neededHint = Boolean(
+    usedHintButton ||
+      peeked ||
+      userAskedForTargetHint ||
+      tutorGaveExplicitAnswerHint ||
+      tutorRevealedTargetWord
+  );
 
   const pronunciationAttempts = 1 + pronunciationCorrections;
   const fluency =
@@ -110,15 +212,23 @@ export function deriveHeuristicTelemetryFromTurns(
 
   let notes = 'Clean recall & natural conversation';
   if (neededHint) {
-    notes = usedHintButton ? 'Used Hint button' : peeked ? 'Peeked target word' : 'Requested hint';
+    notes = usedHintButton
+      ? 'Used Hint button'
+      : peeked
+      ? 'Peeked target word'
+      : tutorRevealedTargetWord
+      ? 'Needed Mandarin for target word'
+      : 'Requested hint';
   } else if (pronunciationCorrections > 0 && grammarCorrections > 0) {
-    notes = 'Practiced tones & phrasing';
+    notes = 'Practiced target tones & usage';
   } else if (pronunciationCorrections > 0) {
-    notes = 'Practiced pronunciation / tones';
+    notes = 'Practiced target word tones';
   } else if (grammarCorrections > 0) {
-    notes = 'Refined sentence grammar';
+    notes = 'Refined target word usage';
   } else if (synonymRedirects > 0) {
     notes = 'Used synonym first, then target word cleanly';
+  } else if (nonTargetCorrections > 0) {
+    notes = 'Target word clean (polished other words)';
   }
 
   return {
@@ -133,33 +243,48 @@ export function deriveHeuristicTelemetryFromTurns(
 
 /**
  * Deterministic post-normalization of the AI JSON grader output:
- * Ensures that if the student only used a valid synonym on Attempt 1 (while the target word was hidden)
- * and then cleanly produced the target word on Attempt 2 with zero real tone/grammar corrections,
- * it is NEVER penalized as `pronunciation_attempts: 2` or `grammar_errors: 1` — guaranteeing Score 4 (`Easy`)!
+ * Ensures that:
+ * 1. Benign synonym redirects on Attempt 1 -> Score 4 (`Easy`).
+ * 2. Pronunciation, grammar, or English-word corrections strictly on OTHER words besides `targetTraditional`
+ *    NEVER penalize the target word's FSRS score -> Score 4 (`Easy`)!
  */
 export function normalizeAiGradingTelemetry(
   parsed = {},
   wordTurns = [],
   fallbackTelemetry = {},
-  forceNeededHint = false
+  forceNeededHint = false,
+  targetTraditional = ''
 ) {
-  const neededHint = Boolean(forceNeededHint || parsed.needed_hint);
-  const turnAnalysis = analyzeTurnCorrections(wordTurns);
+  const turnAnalysis = analyzeTurnCorrections(wordTurns, targetTraditional);
+  const neededHint = Boolean(
+    forceNeededHint ||
+      (parsed.needed_hint && !parsed.non_target_corrections_only) ||
+      turnAnalysis.tutorRevealedTargetWord
+  );
+
   const isCleanSynonymRedirectOnly =
     !neededHint &&
     (parsed.synonym_redirect_only === true ||
       (turnAnalysis.synonymRedirects > 0 && turnAnalysis.totalFixes === 0));
 
-  if (isCleanSynonymRedirectOnly) {
+  const isNonTargetCorrectionsOnly =
+    !neededHint &&
+    (parsed.non_target_corrections_only === true ||
+      (Boolean(targetTraditional) &&
+        turnAnalysis.nonTargetCorrections > 0 &&
+        turnAnalysis.totalFixes === 0));
+
+  if (isCleanSynonymRedirectOnly || isNonTargetCorrectionsOnly) {
+    const defaultNote = isNonTargetCorrectionsOnly
+      ? 'Target word clean (polished other words)'
+      : 'Used synonym first, then target word cleanly';
     return {
       target_word_recalled: true,
       needed_hint: false,
       pronunciation_attempts: 1,
       grammar_errors: 0,
       conversation_fluency: 'natural',
-      notes: String(
-        parsed.notes || fallbackTelemetry.notes || 'Used synonym first, then target word cleanly'
-      ).slice(0, 60)
+      notes: String(parsed.notes || fallbackTelemetry.notes || defaultNote).slice(0, 60)
     };
   }
 
@@ -186,8 +311,7 @@ const STORAGE_KEYS = {
   VOICE_NAME: 'tw_tutor_voice_name',
   PREFERRED_LIVE_MODEL: 'tw_tutor_preferred_live_model',
   AUDIO_ROUTING_MODE: 'tw_tutor_audio_routing_mode',
-  MIC_DEVICE_ID: 'tw_tutor_mic_device_id',
-  VOLUME_BOOST: 'tw_tutor_volume_boost'
+  MIC_DEVICE_ID: 'tw_tutor_mic_device_id'
 };
 
 class MandarinTutorApp {
@@ -235,13 +359,15 @@ class MandarinTutorApp {
       }
     });
 
-    const savedRouting = localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE) || 'media_auto';
+    const rawRouting = localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE);
+    const savedRouting = rawRouting === 'voice_comm' ? 'voice_comm' : 'bluetooth_hfp';
+    if (rawRouting !== savedRouting) {
+      localStorage.setItem(STORAGE_KEYS.AUDIO_ROUTING_MODE, savedRouting);
+    }
     const savedMicId = localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) || 'auto';
-    const savedBoost = Number(localStorage.getItem(STORAGE_KEYS.VOLUME_BOOST) || '2.2');
     this.pipeline.setAudioConfig({
       routingMode: savedRouting,
-      preferredDeviceId: savedMicId,
-      outputVolumeBoost: savedBoost
+      preferredDeviceId: savedMicId
     });
 
     this.bindDom();
@@ -253,8 +379,7 @@ class MandarinTutorApp {
     debugLogger.log('info', 'app_boot', `Mandarin Driving Tutor ${APP_VERSION} booted`, {
       preferredLiveModel: this.liveAuth.preferredLiveModel,
       voiceName: this.liveAuth.voiceName,
-      audioRoutingMode: savedRouting,
-      volumeBoost: savedBoost
+      audioRoutingMode: savedRouting
     });
     this.refreshBackendStatus();
   }
@@ -327,7 +452,6 @@ class MandarinTutorApp {
       inputVoiceName: document.getElementById('input-voice-name'),
       inputLiveModel: document.getElementById('input-live-model'),
       inputAudioRouting: document.getElementById('input-audio-routing'),
-      inputVolumeBoost: document.getElementById('input-volume-boost'),
       inputMicDevice: document.getElementById('input-mic-device'),
       btnRefreshMics: document.getElementById('btn-refresh-mics'),
       activeMicStatusHint: document.getElementById('active-mic-status-hint'),
@@ -435,13 +559,6 @@ class MandarinTutorApp {
     this.els.btnOpenImport.addEventListener('click', () => this.els.drawerImport.classList.remove('hidden'));
     this.els.btnCloseImport.addEventListener('click', () => this.els.drawerImport.classList.add('hidden'));
 
-    if (this.els.inputVolumeBoost) {
-      this.els.inputVolumeBoost.addEventListener('change', () => {
-        const boostVal = Number(this.els.inputVolumeBoost.value || '2.2');
-        localStorage.setItem(STORAGE_KEYS.VOLUME_BOOST, String(boostVal));
-        this.pipeline.setOutputVolumeBoost(boostVal);
-      });
-    }
     if (this.els.btnRefreshMics) {
       this.els.btnRefreshMics.addEventListener('click', async () => {
         try {
@@ -505,29 +622,31 @@ class MandarinTutorApp {
 
   handleAudioHardwareUpdate(micInfo = {}, inputs = []) {
     const modeLabel =
-      micInfo.routingMode === 'bluetooth_hfp'
-        ? 'BT Call HFP'
-        : micInfo.routingMode === 'voice_comm'
-        ? 'Phone Speaker AEC'
-        : 'Media / Android Auto';
+      micInfo.routingMode === 'voice_comm'
+        ? 'Phone Speaker'
+        : micInfo.isBluetooth
+        ? 'Bluetooth Call'
+        : 'Bluetooth / Auto';
     const micLabel = micInfo.label || 'Not initialized';
-    const boost = micInfo.outputBoost || this.pipeline.outputVolumeBoost || 2.2;
 
     if (this.els && this.els.activeAudioPill) {
-      const shortMic =
-        micLabel === 'Not initialized'
-          ? 'Ready'
-          : micLabel.length > 22
-          ? `${micLabel.slice(0, 21)}…`
-          : micLabel;
-      this.els.activeAudioPill.textContent = `Audio: ${modeLabel} · ${shortMic} · ${boost}x`;
+      if (micLabel === 'Not initialized') {
+        this.els.activeAudioPill.textContent =
+          micInfo.routingMode === 'voice_comm'
+            ? 'Audio: Phone Speakerphone Only'
+            : 'Audio: Bluetooth Call / Earbuds (Auto)';
+      } else {
+        const shortMic =
+          micLabel.length > 24 ? `${micLabel.slice(0, 23)}…` : micLabel;
+        this.els.activeAudioPill.textContent = `Audio: ${modeLabel} · ${shortMic}`;
+      }
     }
 
     if (this.els && this.els.activeMicStatusHint) {
       this.els.activeMicStatusHint.textContent =
         micLabel === 'Not initialized'
-          ? `Mode: ${modeLabel} · Mic acquired when session starts`
-          : `Active mic: "${micLabel}" (AEC=${Boolean(micInfo.echoCancellation)}, Boost=${boost}x)`;
+          ? `Mode: ${modeLabel} · Auto-connects Bluetooth when session starts`
+          : `Active mic: "${micLabel}" (AEC=${Boolean(micInfo.echoCancellation)}, NS=${Boolean(micInfo.noiseSuppression)})`;
     }
 
     if (this.els && this.els.inputMicDevice && Array.isArray(inputs)) {
@@ -535,7 +654,7 @@ class MandarinTutorApp {
         localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) ||
         this.pipeline.preferredMicDeviceId ||
         'auto';
-      const currentOptions = [{ value: 'auto', text: 'Auto (Best for Routing Mode)' }];
+      const currentOptions = [{ value: 'auto', text: 'Auto (Bluetooth First, Speaker Fallback)' }];
       for (const inp of inputs) {
         if (inp.deviceId) {
           currentOptions.push({
@@ -569,11 +688,8 @@ class MandarinTutorApp {
       this.els.inputLiveModel.value = localStorage.getItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL) || 'auto';
     }
     if (this.els.inputAudioRouting) {
-      this.els.inputAudioRouting.value =
-        localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE) || 'media_auto';
-    }
-    if (this.els.inputVolumeBoost) {
-      this.els.inputVolumeBoost.value = localStorage.getItem(STORAGE_KEYS.VOLUME_BOOST) || '2.2';
+      const savedMode = localStorage.getItem(STORAGE_KEYS.AUDIO_ROUTING_MODE);
+      this.els.inputAudioRouting.value = savedMode === 'voice_comm' ? 'voice_comm' : 'bluetooth_hfp';
     }
     if (this.els.inputMicDevice) {
       this.els.inputMicDevice.value = localStorage.getItem(STORAGE_KEYS.MIC_DEVICE_ID) || 'auto';
@@ -590,10 +706,10 @@ class MandarinTutorApp {
     const tocflLevel = this.els.inputTocflLevel.value.trim() || '2';
     const voiceName = this.els.inputVoiceName.value.trim() || 'Aoede';
     const preferredLiveModel = this.els.inputLiveModel ? this.els.inputLiveModel.value : 'auto';
-    const audioRoutingMode = this.els.inputAudioRouting
-      ? this.els.inputAudioRouting.value
-      : 'media_auto';
-    const volumeBoost = this.els.inputVolumeBoost ? this.els.inputVolumeBoost.value : '2.2';
+    const audioRoutingMode =
+      this.els.inputAudioRouting && this.els.inputAudioRouting.value === 'voice_comm'
+        ? 'voice_comm'
+        : 'bluetooth_hfp';
     const micDeviceId = this.els.inputMicDevice ? this.els.inputMicDevice.value : 'auto';
 
     const routingOrMicChanged =
@@ -609,13 +725,11 @@ class MandarinTutorApp {
     localStorage.setItem(STORAGE_KEYS.VOICE_NAME, voiceName);
     localStorage.setItem(STORAGE_KEYS.PREFERRED_LIVE_MODEL, preferredLiveModel);
     localStorage.setItem(STORAGE_KEYS.AUDIO_ROUTING_MODE, audioRoutingMode);
-    localStorage.setItem(STORAGE_KEYS.VOLUME_BOOST, volumeBoost);
     localStorage.setItem(STORAGE_KEYS.MIC_DEVICE_ID, micDeviceId);
 
     this.pipeline.setAudioConfig({
       routingMode: audioRoutingMode,
-      preferredDeviceId: micDeviceId,
-      outputVolumeBoost: Number(volumeBoost)
+      preferredDeviceId: micDeviceId
     });
 
     if (routingOrMicChanged && this.pipeline.micStream) {
@@ -639,7 +753,6 @@ class MandarinTutorApp {
       voiceName,
       preferredLiveModel,
       audioRoutingMode,
-      volumeBoost: Number(volumeBoost),
       micDeviceId: micDeviceId === 'auto' ? 'auto' : micDeviceId.slice(0, 10)
     });
 
@@ -1048,7 +1161,7 @@ class MandarinTutorApp {
         .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
         .join('\n');
 
-      const gradingPrompt = `Evaluate this completed Taiwanese Mandarin voice tutor dialogue for spaced-repetition (FSRS v5) scoring and return ONLY a JSON object with these exact keys:
+      const gradingPrompt = `Evaluate this completed Taiwanese Mandarin voice tutor dialogue for spaced-repetition (FSRS v5) scoring OF THE TARGET WORD ONLY and return ONLY a JSON object with these exact keys:
 {
   "target_word_recalled": boolean,
   "needed_hint": boolean,
@@ -1056,6 +1169,7 @@ class MandarinTutorApp {
   "grammar_errors": integer (>=0),
   "conversation_fluency": "natural" | "good" | "struggled",
   "synonym_redirect_only": boolean,
+  "non_target_corrections_only": boolean,
   "notes": "short English note <= 8 words"
 }
 
@@ -1063,11 +1177,15 @@ Grading rules:
 - Target word: "${word.traditional}" (${word.pinyin || ''}, meaning "${word.english_gloss || ''}")
 - English prompt: "${word.english_prompt || ''}"
 - Reference Mandarin: "${word.mandarin_sentence || word.sample_mandarin || ''}"
-- IMPORTANT: The student ("學生") lines come from speech-to-text ASR, which may contain minor homophones or segmentation quirks (e.g. 餐館/餐廳, 設一個/是個). Always trust the tutor's ("老師") spoken reaction! If the tutor immediately praised the student ("說得很好！", etc.) without correcting tones or grammar, set target_word_recalled=true, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural".
-- SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT): Because the target word is hidden on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "平常" or "常常" when the hidden target is "經常"). When the tutor acknowledges the synonym is natural ("「平常」也可以，不過我們今天要練習的詞是「經常」。你可以試著用「經常」再說一次嗎？") and the student then cleanly produces the sentence with the target word on the next try without tone or grammar errors, DO NOT penalize them! You MUST set: target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
-- Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation.
-- Only set grammar_errors > 0 if the tutor explicitly corrected ungrammatical phrasing or wrong word order (NEVER count a valid synonym on try #1 as a grammar error).
-- Set needed_hint=true ONLY if the student didn't know how to translate and asked for a hint/answer, or the tutor had to give a clue before the student could form a sentence.
+- IMPORTANT: The student ("學生") lines come from speech-to-text ASR, which may contain minor homophones or segmentation quirks (e.g. 餐館/餐廳, 設一個/是個). Always trust the tutor's ("老師") spoken reaction! If the tutor immediately praised the student ("說得很好！", etc.) without correcting the target word, set target_word_recalled=true, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural".
+- TARGET-WORD-ONLY SCORING RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT):
+  Grammar corrections, pronunciation/tone corrections, measure-word fixes, or English-to-Mandarin word translations on OTHER words in the sentence besides "${word.traditional}" MUST NOT impact the score for "${word.traditional}"!
+  * If the student recalled "${word.traditional}" on their own (or after a valid synonym redirect), pronounced "${word.traditional}" with accurate tones, and used "${word.traditional}" grammatically, THEN EVEN IF the tutor corrected tones, pronunciation, phrasing, or translated an English word on OTHER words in the sentence across one or more retries, you MUST set:
+    target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", non_target_corrections_only=true!
+- SYNONYM RULE (CRITICAL — MUST STILL SCORE 4 / PERFECT): Because the target word is hidden on screen while the student hears the English sentence, the student may naturally use a valid Mandarin synonym on their first try (e.g. saying "平常" or "常常" when the hidden target is "經常"). When the tutor prompts them to swap in today's target word and the student cleanly produces "${word.traditional}" without target-word tone/grammar errors, set: target_word_recalled=true, needed_hint=false, pronunciation_attempts=1, grammar_errors=0, conversation_fluency="natural", synonym_redirect_only=true!
+- Only set pronunciation_attempts > 1 if the tutor explicitly corrected wrong tones or mispronunciation ON THE TARGET WORD "${word.traditional}" ITSELF.
+- Only set grammar_errors > 0 if the student misused or misplaced THE TARGET WORD "${word.traditional}" ITSELF (or failed to include it without a valid synonym).
+- Set needed_hint=true ONLY if the student did not know "${word.traditional}" (e.g. asked for a hint for the target word, used an English word FOR "${word.traditional}" itself, or needed the tutor to reveal "${word.traditional}" before producing it).
 
 Dialogue:
 ${dialogueText}`;
@@ -1113,7 +1231,8 @@ ${dialogueText}`;
         parsed,
         wordTurns,
         fallbackTelemetry,
-        forceNeededHint
+        forceNeededHint,
+        word.traditional
       );
 
       debugLogger.log(
@@ -1165,7 +1284,7 @@ ${dialogueText}`;
   }
 
   /**
-   * Called deterministically when the tutor speaks `「好，我們看下一題！」` at the end of Phase 4.
+   * Called deterministically when the tutor speaks `「好，我們看下一題！」` at the end of Phase 3/4.
    * 1. Computes an instant 0ms score preview and advances immediately to the next word's clean WebSocket!
    * 2. Runs background REST JSON transcript grading + Google Sheet FSRS v5 persistence without blocking audio!
    */
@@ -1334,14 +1453,15 @@ ${dialogueText}`;
 
     const latest = this.transcriptHistory[this.transcriptHistory.length - 1];
     if (role === 'tutor' && latest) {
-      if (latest.text.includes('？') || latest.text.includes('?')) {
+      const isPhase1RetryPrompt = /再說一次|整句話|完整的句子|翻成中文/.test(latest.text);
+      if (!isPhase1RetryPrompt && (latest.text.includes('？') || latest.text.includes('?'))) {
         this.setPhaseIndicator(2);
       }
-      if (latest.text.includes('問我') || latest.text.includes('問題')) {
+      if (ENABLE_USER_ASK_BACK_FLOW && /換你問我|問我一個問題/.test(latest.text)) {
         this.setPhaseIndicator(3);
       }
     } else if (role === 'user' && latest && debugLogger.context.phase === 2) {
-      if (/[？?嗎呢什麼誰哪怎麼幾]/.test(latest.text)) {
+      if (!ENABLE_USER_ASK_BACK_FLOW || /[？?嗎呢什麼誰哪怎麼幾]/.test(latest.text)) {
         this.setPhaseIndicator(3);
       }
     }

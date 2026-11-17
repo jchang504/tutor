@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=17" />
+  <link rel="stylesheet" href="./index.css?v=18" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -77,17 +77,17 @@
           <div class="progress-track">
             <div id="stage-progress-fill" class="progress-fill"></div>
           </div>
-          <button id="active-audio-pill" class="audio-pill-btn" type="button" title="Tap to configure Car / Android Auto Audio &amp; Volume Boost">
-            Audio: Media / Android Auto · Boost 2.2x
+          <button id="active-audio-pill" class="audio-pill-btn" type="button" title="Tap to configure Bluetooth / Speakerphone Audio">
+            Audio: Bluetooth Call / Earbuds (Auto)
           </button>
         </div>
       </div>
 
-      <!-- 4-Step Deterministic Conversation Loop Stepper -->
-      <div class="phase-stepper" aria-label="4-Phase Practice Loop">
+      <!-- Deterministic Conversation Loop Stepper -->
+      <div class="phase-stepper" aria-label="Practice Loop">
         <div id="phase-step-1" class="phase-step active">1. Translate Sentence</div>
         <div id="phase-step-2" class="phase-step">2. Tutor Follow-Up</div>
-        <div id="phase-step-3" class="phase-step">3. Reply &amp; Ask Back</div>
+        <div id="phase-step-3" class="phase-step">3. Your Reply</div>
         <div id="phase-step-4" class="phase-step">4. Score &amp; Next</div>
       </div>
 
@@ -126,7 +126,7 @@
       <!-- Live Voice Transcript Feed -->
       <div id="live-transcript-feed" class="transcript-feed" aria-live="polite">
         <p class="transcript-placeholder">
-          Hands-free voice transcript appears here. Smart turn detection responds in ~1s when your Mandarin sentence sounds complete, while giving extra thinking time (~2.7s) on Reply &amp; Ask Back turns.
+          Hands-free voice transcript appears here. Tutor reads the English sentence, coaches your Mandarin until native-natural, and asks a follow-up question using the target word.
         </p>
       </div>
 
@@ -244,39 +244,25 @@
         <div class="divider-line"></div>
 
         <div class="field-group">
-          <label for="input-audio-routing">Car &amp; Android Auto Audio Routing Mode</label>
+          <label for="input-audio-routing">Audio Routing Mode</label>
           <select id="input-audio-routing">
-            <option value="media_auto" selected>Media / Android Auto Far-Field (Default — Fixes Media Volume &amp; AA Stereo)</option>
-            <option value="bluetooth_hfp">Bluetooth Call / Car HFP Mic (For Bluetooth-Only Without Android Auto)</option>
-            <option value="voice_comm">Phone Speakerphone AEC (Indoor Desk Mode)</option>
+            <option value="bluetooth_hfp" selected>Bluetooth Call / Earbuds (Default — Auto-Uses Bluetooth, Falls Back to Speaker)</option>
+            <option value="voice_comm">Phone Speakerphone Only (Ignore Bluetooth)</option>
           </select>
           <span class="field-hint">
-            <strong>Android Auto (Nissan Leaf USB/Wireless):</strong> Keep on <em>Media / Android Auto Far-Field</em> — Pixel volume buttons control Media Volume, stereo audio plays over car speakers, and the adaptive 4.8x far-field pre-amp picks up your voice from your dash/console.<br />
-            <strong>Bluetooth-Only (No Android Auto):</strong> Switch to <em>Bluetooth Call / Car HFP Mic</em> if your phone is in a pocket/bag and you want to force the car's overhead Bluetooth call mic.
+            Automatically connects to your car's Bluetooth hands-free mic/speakers or Bluetooth earbuds (with steering-wheel &amp; phone call volume controls), and falls back to the Pixel speakerphone when no Bluetooth device is connected.
           </span>
         </div>
 
-        <div class="form-row-2col">
-          <div class="field-group">
-            <label for="input-volume-boost">Tutor Speech Loudness Boost</label>
-            <select id="input-volume-boost">
-              <option value="1.0">1.0x (Unboosted Raw)</option>
-              <option value="1.6">1.6x (+4 dB Mild Boost)</option>
-              <option value="2.2" selected>2.2x (+7 dB Podcast / Maps Match)</option>
-              <option value="3.0">3.0x (+9.5 dB Highway / Loud Cabin)</option>
+        <div class="field-group">
+          <label for="input-mic-device">Microphone Input Override</label>
+          <div style="display:flex; gap:6px;">
+            <select id="input-mic-device" style="flex:1;">
+              <option value="auto" selected>Auto (Bluetooth First, Speaker Fallback)</option>
             </select>
-            <span class="field-hint">Uses compressor + soft limiter so loud boosts never clip.</span>
+            <button id="btn-refresh-mics" class="btn-secondary" type="button" style="padding:0 10px;">Scan</button>
           </div>
-          <div class="field-group">
-            <label for="input-mic-device">Microphone Input Override</label>
-            <div style="display:flex; gap:6px;">
-              <select id="input-mic-device" style="flex:1;">
-                <option value="auto" selected>Auto (Best for Routing Mode)</option>
-              </select>
-              <button id="btn-refresh-mics" class="btn-secondary" type="button" style="padding:0 10px;">Scan</button>
-            </div>
-            <span id="active-mic-status-hint" class="field-hint">Active mic: Not started yet</span>
-          </div>
+          <span id="active-mic-status-hint" class="field-hint">Active mic: Not started yet</span>
         </div>
 
         <div class="divider-line"></div>
@@ -426,7 +412,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=17"></script>
+  <script type="module" src="./app.js?v=18"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -438,7 +424,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=17').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=18').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });
