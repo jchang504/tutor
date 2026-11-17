@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Noto+Sans+TC:wght@500;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./index.css?v=21" />
+  <link rel="stylesheet" href="./index.css?v=22" />
 </head>
 <body>
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
@@ -317,7 +317,7 @@
 
         <div class="field-group">
           <label for="textarea-hanping-csv" id="label-preview-count">Filtered Preview (Tab-Separated Notes to Import)</label>
-          <textarea id="textarea-hanping-csv" placeholder="#separator:tab&#10;#html:false&#10;#tags column:12&#10;平常&#9;平常&#9;ping2 chang2&#9;&#9;ordinary • common&#9;&#9;&#9;&#9;x&#9;&#9;&#9;everyday"></textarea>
+          <textarea id="textarea-hanping-csv" placeholder="#separator:tab&#10;#html:false&#10;#tags column:12&#10;平常&#9;平常&#9;píng cháng&#9;&#9;ordinary • common&#9;&#9;&#9;&#9;x&#9;&#9;&#9;everyday"></textarea>
         </div>
 
         <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; color:var(--text-secondary); cursor:pointer;">
@@ -362,13 +362,18 @@
         <div class="divider-line"></div>
 
         <div class="field-group">
-          <label>3. Pre-Generate / Refresh Mandarin &rarr; English Sentences in Sheet</label>
+          <label>3. Pre-Generate / Refresh Mandarin &rarr; English Sentences &amp; Tone-Mark Pinyin</label>
           <span class="field-hint">
-            Apps Script composes a natural Taiwanese Mandarin sentence first and translates it into simple everyday English whenever words are imported or reviewed, saving incrementally every ~90 words so sessions start immediately. Tap below to pre-generate or refresh all Sheet sentences:
+            Apps Script composes a natural Taiwanese Mandarin sentence first and translates it into simple everyday English whenever words are imported or reviewed, and converts numbered Pinyin (<code>ping2 chang2</code>) into standard tone marks (<code>píng cháng</code>):
           </span>
-          <button id="btn-pregenerate-prompts" class="btn-secondary" type="button" style="margin-top:6px;">
-            Generate / Refresh Mandarin &rarr; English Sentences
-          </button>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:6px;">
+            <button id="btn-pregenerate-prompts" class="btn-secondary" type="button" style="flex:1; min-width:210px;">
+              Generate / Refresh Mandarin &rarr; English Sentences
+            </button>
+            <button id="btn-normalize-pinyin" class="btn-secondary" type="button" style="flex:1; min-width:210px;">
+              Convert Sheet Pinyin to Tone Marks (ā á ǎ à)
+            </button>
+          </div>
         </div>
 
         <div id="import-result-box" class="info-callout hidden"></div>
@@ -412,7 +417,7 @@
     </div>
   </div>
 
-  <script type="module" src="./app.js?v=21"></script>
+  <script type="module" src="./app.js?v=22"></script>
   <script>
     if ('serviceWorker' in navigator) {
       let refreshing = false;
@@ -424,7 +429,7 @@
         }
       });
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js?v=21').then((reg) => {
+        navigator.serviceWorker.register('./sw.js?v=22').then((reg) => {
           reg.update().catch(() => {});
         }).catch(() => {});
       });

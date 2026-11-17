@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v21):
+ * Key architectural guarantees (v22):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -14,21 +14,56 @@
  *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
  * 5. Smart context- & sentence-completeness-aware endpointing (~850–1100ms on completed sentences,
  *    ~1950ms on incomplete mid-sentence pauses) + 400ms real mic tail + transient noise rejection.
- * 6. Clean Unboosted Bluetooth Call / Earbuds Default Audio (`bluetooth_hfp` default):
- *    - Automatically uses connected Bluetooth car hands-free or Bluetooth earbuds (`VOICE_COMMUNICATION`
- *      with hardware AEC + NS + car/phone hardware call volume buttons), seamlessly falling back to
- *      Phone Speakerphone when no Bluetooth device is connected or when Bluetooth disconnects.
- *    - Pure `1.0x` linear 16kHz PCM input and direct `1.0x` 24kHz PCM output (zero software boost,
- *      compressor, or waveshaper distortion over Bluetooth SCO/HFP).
+ * 6. Clean Unboosted Bluetooth Call / Earbuds Default Audio (`bluetooth_hfp` default) + Persistent
+ *    12s `<audio>` MediaSession Anchor so Android OS & Bluetooth AVRCP route steering-wheel / earbud
+ *    Previous (restart word) & Next (skip word) buttons to `navigator.mediaSession`.
  */
 
-import { debugLogger } from './debug-logger.js?v=21';
+import { debugLogger } from './debug-logger.js?v=22';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=22';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
 // 1600 samples @ 16kHz (3200 zero bytes) = exact 100ms frame of pure digital silence
 const ZERO_PCM16_100MS_BASE64 = btoa('\0'.repeat(3200));
+
+/**
+ * Generates an in-memory 16-bit mono PCM WAV buffer (`durationSec >= 5` seconds for Chromium Android
+ * `MediaContentType::Persistent`) with alternating ±1 LSB (`-90.3 dBFS`, completely inaudible to
+ * human ears yet non-zero so Android/Chromium silence detectors keep `MediaSessionCompat` active
+ * for car steering-wheel & Bluetooth AVRCP `previoustrack` / `nexttrack` buttons).
+ */
+export function buildSilentWavBytes(durationSec = 12, sampleRate = 8000) {
+  const numSamples = Math.max(sampleRate * 6, Math.floor(durationSec * sampleRate));
+  const dataSize = numSamples * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeAscii = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeAscii(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, 'WAVE');
+  writeAscii(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // AudioFormat = 1 (PCM)
+  view.setUint16(22, 1, true); // NumChannels = 1 (Mono)
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // ByteRate
+  view.setUint16(32, 2, true); // BlockAlign
+  view.setUint16(34, 16, true); // BitsPerSample
+  writeAscii(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  for (let i = 0; i < numSamples; i++) {
+    view.setInt16(44 + i * 2, (i & 1) === 0 ? 1 : -1, true);
+  }
+  return new Uint8Array(buffer);
+}
 
 /**
  * Feature flag for the Phase 3 "student asks tutor a follow-up question back" step.
@@ -393,7 +428,7 @@ export function buildWordSystemInstruction(
 
 【本題預先產生的對照句子與目標詞彙（內部資訊，在學生成功說出前請勿直接洩漏讀音）】
 - 目標詞（繁體）：${word.traditional}
-- 拼音 / 注音：${word.pinyin || ''} ${word.zhuyin ? '(' + word.zhuyin + ')' : ''}
+- 拼音 / 注音：${numberedPinyinToToneMarks(word.pinyin || '')} ${word.zhuyin ? '(' + word.zhuyin + ')' : ''}
 - 英文詞義：${word.english_gloss || ''}
 - 預先產生的自然台灣華語原句（Pre-Generated Mandarin Reference）：「${referenceMandarin}」
 - 由上述中文原句翻譯出的英文題目（Pre-Generated English Sentence）："${word.english_prompt}"
@@ -450,6 +485,8 @@ export class GeminiLiveVoicePipeline {
     this.deviceChangeBound = false;
     this._micAcquirePromise = null;
     this.trackEndedRecoveryTimer = null;
+    this.mediaAnchorAudio = null;
+    this.mediaAnchorBlobUrl = null;
 
     // Default Audio Routing: Bluetooth Call / Earbuds (`bluetooth_hfp`) with automatic Speakerphone fallback
     this.audioRoutingMode = 'bluetooth_hfp'; // 'bluetooth_hfp' | 'voice_comm'
@@ -2641,8 +2678,97 @@ export class GeminiLiveVoicePipeline {
     this.stopPlaybackImmediately();
   }
 
+  /**
+   * Starts a persistent, inaudible (`-90.3 dBFS` ±1 LSB) 12-second looping `<audio>` element.
+   * On Chrome for Android, `WebAudio` (`AudioContext`) alone NEVER registers an Android OS
+   * `MediaSessionCompat` or Bluetooth AVRCP listener — Chromium requires an active `HTMLMediaElement`
+   * of duration >= 5 seconds (`MediaContentType::Persistent`) to route car steering-wheel & earbud
+   * `previoustrack` / `nexttrack` / `play` / `pause` buttons to `navigator.mediaSession`.
+   */
+  async startMediaSessionAnchor() {
+    if (
+      typeof document === 'undefined' ||
+      typeof Blob === 'undefined' ||
+      typeof URL === 'undefined' ||
+      typeof URL.createObjectURL !== 'function'
+    ) {
+      return false;
+    }
+    try {
+      if (!this.mediaAnchorBlobUrl) {
+        const wavBytes = buildSilentWavBytes(12, 8000);
+        const blob = new Blob([wavBytes], { type: 'audio/wav' });
+        this.mediaAnchorBlobUrl = URL.createObjectURL(blob);
+      }
+      let created = false;
+      if (!this.mediaAnchorAudio) {
+        const el = document.createElement('audio');
+        el.loop = true;
+        el.preload = 'auto';
+        el.volume = 1.0;
+        el.muted = false;
+        el.setAttribute('playsinline', '');
+        el.setAttribute('aria-hidden', 'true');
+        el.style.display = 'none';
+        el.src = this.mediaAnchorBlobUrl;
+        if (document.body) {
+          document.body.appendChild(el);
+        }
+        this.mediaAnchorAudio = el;
+        created = true;
+      }
+      if (this.mediaAnchorAudio.paused) {
+        await this.mediaAnchorAudio.play();
+      }
+      if (created) {
+        debugLogger.log(
+          'info',
+          'media_session_anchor_started',
+          'Started 12s persistent MediaSession audio anchor for car/Bluetooth controls'
+        );
+      }
+      return true;
+    } catch (err) {
+      debugLogger.log(
+        'warn',
+        'media_session_anchor_warn',
+        `MediaSession anchor play deferred: ${err.message || err}`
+      );
+      return false;
+    }
+  }
+
+  pauseMediaSessionAnchor() {
+    if (this.mediaAnchorAudio && !this.mediaAnchorAudio.paused) {
+      try {
+        this.mediaAnchorAudio.pause();
+      } catch (_) {}
+    }
+  }
+
+  stopMediaSessionAnchor() {
+    if (this.mediaAnchorAudio) {
+      try {
+        this.mediaAnchorAudio.pause();
+        this.mediaAnchorAudio.removeAttribute('src');
+        this.mediaAnchorAudio.load();
+        if (this.mediaAnchorAudio.parentNode) {
+          this.mediaAnchorAudio.parentNode.removeChild(this.mediaAnchorAudio);
+        }
+      } catch (_) {}
+      this.mediaAnchorAudio = null;
+    }
+    if (this.mediaAnchorBlobUrl) {
+      try {
+        URL.revokeObjectURL(this.mediaAnchorBlobUrl);
+      } catch (_) {}
+      this.mediaAnchorBlobUrl = null;
+    }
+  }
+
   async destroyAll() {
     this.closeCurrentWordSocket();
+    this.stopMediaSessionAnchor();
     if (this.trackEndedRecoveryTimer) {
       clearTimeout(this.trackEndedRecoveryTimer);
       this.trackEndedRecoveryTimer = null;

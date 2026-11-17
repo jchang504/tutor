@@ -88,6 +88,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Mandarin Tutor')
     .addItem('Initialize / Verify Sheet Tabs', 'setupSheet')
+    .addItem('Convert All Pinyin to Tone Marks (ā á ǎ à)', 'menuNormalizePinyin')
     .addItem('Generate Missing Mandarin -> English Sentences (Fast / Resume)', 'menuPregenerateMissingPrompts')
     .addItem('Regenerate All Mandarin -> English Sentences (Refresh All)', 'menuPregeneratePrompts')
     .addItem('Pull 50 Words from PSeitz/tocfl (Target Level)', 'menuPullTocflWords')
@@ -97,7 +98,9 @@ function onOpen() {
 /**
  * Initializes the 3 tabs (`Vocab`, `ReviewLog`, `Settings`) if they don't exist,
  * upgrades `Vocab` headers in-place (`english_prompt`, `mandarin_sentence`),
- * and migrates retired Gemini 2.5 batch model IDs to `gemini-3.5-flash-lite`.
+ * migrates retired Gemini 2.5 batch model IDs to `gemini-3.5-flash-lite`,
+ * and automatically converts any numbered Pinyin (`ping2 chang2`) in `Vocab` and `ReviewLog`
+ * to standard tone-marked Pinyin (`píng cháng`).
  */
 function setupSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -164,7 +167,12 @@ function setupSheet() {
     }
   }
 
-  return { ok: true, message: 'Sheets initialized.' };
+  const pinyinStats = normalizeSheetPinyinToToneMarks_();
+  return {
+    ok: true,
+    message: 'Sheets initialized.',
+    pinyinUpdated: pinyinStats
+  };
 }
 
 /**
@@ -213,6 +221,9 @@ function doPost(e) {
 
       case 'pregenerate_prompts':
         return jsonResponse(handlePregeneratePrompts_(body));
+
+      case 'normalize_pinyin':
+        return jsonResponse(handleNormalizePinyin_());
 
       case 'update_settings':
         return jsonResponse(handleUpdateSettings_(body));
@@ -316,6 +327,7 @@ function readAllVocab_() {
     // Normalize both new and legacy header names seamlessly
     const enPrompt = String(obj.english_prompt || obj.last_prompt || row[18] || '').trim();
     const zhSent = String(obj.mandarin_sentence || obj.sample_mandarin || row[20] || '').trim();
+    obj.pinyin = numberedPinyinToToneMarks_(String(obj.pinyin || row[3] || '').trim());
     obj.english_prompt = enPrompt;
     obj.last_prompt = enPrompt;
     obj.mandarin_sentence = zhSent;
@@ -1576,7 +1588,7 @@ function handleImportHanping_(body) {
       rowId,
       trad,
       entry.simplified || '',
-      entry.pinyin || tocflHit.pinyin || '',
+      numberedPinyinToToneMarks_(entry.pinyin || tocflHit.pinyin || ''),
       entry.zhuyin || tocflHit.zhuyin || '',
       entry.english_gloss || '',
       'ankidroid',
@@ -1604,6 +1616,9 @@ function handleImportHanping_(body) {
     sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, VOCAB_HEADERS.length).setValues(newRows);
     SpreadsheetApp.flush();
   }
+
+  // Ensure any existing rows in Vocab & ReviewLog also have tone-marked Pinyin
+  normalizeSheetPinyinToToneMarks_();
 
   // Pre-generate natural Mandarin -> English sentence pairs during import (with safe 40s HTTP budget
   // so large imports never time out; any remaining rows are immediately filled by the PWA's follow-up waves)
@@ -1674,7 +1689,7 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
       results.push({
         traditional: cedictMatch[1].trim(),
         simplified: (cedictMatch[2] || '').trim(),
-        pinyin: cedictMatch[3].trim(),
+        pinyin: numberedPinyinToToneMarks_(cedictMatch[3].trim()),
         english_gloss: cleanAnkiHtml_(cedictMatch[4].replace(/\//g, '; '))
       });
       continue;
@@ -1752,7 +1767,7 @@ function parseHanpingText_(rawText, tocflMap, tagFilter) {
 
       // Detect Pinyin column (tone marks or tone numbers, short length)
       if (!pinyin && val.length <= 60 && isLikelyPinyin_(val)) {
-        pinyin = val;
+        pinyin = numberedPinyinToToneMarks_(val);
         continue;
       }
 
@@ -1824,7 +1839,7 @@ function isLikelyPinyin_(str) {
   // Contains Pinyin tone diacritics
   if (/[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]/i.test(s)) return true;
   // Or syllable + tone number pattern like `can1 guan3` or `shun4 bian4`
-  if (/^[a-zA-ZüÜvV]{1,6}[1-5](\s+[a-zA-ZüÜvV]{1,6}[1-5])*$/.test(s)) return true;
+  if (/^[a-zA-ZüÜvV:]{1,7}[0-5](\s+[a-zA-ZüÜvV:]{1,7}[0-5])*$/.test(s)) return true;
   return false;
 }
 
@@ -1928,7 +1943,7 @@ function supplementFromTocflInternal_(level, limit, options) {
       'tocfl_' + entry.id,
       entry.text,
       '',
-      entry.pinyin || '',
+      numberedPinyinToToneMarks_(entry.pinyin || ''),
       entry.zhuyin || '',
       '', // English gloss is auto-populated below alongside the pre-generated sentence
       'tocfl',
@@ -1961,7 +1976,7 @@ function supplementFromTocflInternal_(level, limit, options) {
       return {
         _rowIndex: startRow + idx,
         traditional: entry.text,
-        pinyin: entry.pinyin || '',
+        pinyin: numberedPinyinToToneMarks_(entry.pinyin || ''),
         zhuyin: entry.zhuyin || '',
         tocfl_level: entry.tocfl_level || level,
         english_gloss: '',
@@ -2008,3 +2023,182 @@ function fetchTocflLookupMap_() {
   }
   return map;
 }
+
+/**
+ * Standard Hanyu Pinyin tone-mark conversion (`ping2 chang2` -> `píng cháng`, `kao3 lv4` -> `kǎo lǜ`, `wei4 shen2 me5` -> `wèi shén me`).
+ */
+const PINYIN_TONE_VOWEL_MAP_ = {
+  a: ['ā', 'á', 'ǎ', 'à'],
+  A: ['Ā', 'Á', 'Ǎ', 'À'],
+  e: ['ē', 'é', 'ě', 'è'],
+  E: ['Ē', 'É', 'Ě', 'È'],
+  i: ['ī', 'í', 'ǐ', 'ì'],
+  I: ['Ī', 'Í', 'Ǐ', 'Ì'],
+  o: ['ō', 'ó', 'ǒ', 'ò'],
+  O: ['Ō', 'Ó', 'Ǒ', 'Ò'],
+  u: ['ū', 'ú', 'ǔ', 'ù'],
+  U: ['Ū', 'Ú', 'Ǔ', 'Ù'],
+  'ü': ['ǖ', 'ǘ', 'ǚ', 'ǜ'],
+  'Ü': ['Ǖ', 'Ǘ', 'Ǚ', 'Ǜ']
+};
+
+const PINYIN_NASAL_TONE_MAP_ = {
+  m: [null, 'ḿ', null, null],
+  M: [null, 'Ḿ', null, null],
+  n: ['n̄', 'ń', 'ň', 'ǹ'],
+  N: ['N̄', 'Ń', 'Ň', 'Ǹ']
+};
+
+function applyToneToPinyinSyllable_(rawLetters, toneNum) {
+  let s = String(rawLetters || '')
+    .replace(/u:/g, 'ü')
+    .replace(/U:/g, 'Ü')
+    .replace(/v/g, 'ü')
+    .replace(/V/g, 'Ü');
+
+  s = s.replace(/^([jqxy])ü/i, function(_, init) {
+    return init + (s.charAt(1) === 'Ü' ? 'U' : 'u');
+  });
+
+  if (toneNum < 1 || toneNum > 4) {
+    return s;
+  }
+
+  const lower = s.toLowerCase();
+  let targetIdx = -1;
+  const aIdx = lower.indexOf('a');
+  const eIdx = lower.indexOf('e');
+  const ouIdx = lower.indexOf('ou');
+
+  if (aIdx !== -1) {
+    targetIdx = aIdx;
+  } else if (eIdx !== -1) {
+    targetIdx = eIdx;
+  } else if (ouIdx !== -1) {
+    targetIdx = ouIdx;
+  } else {
+    for (let i = s.length - 1; i >= 0; i--) {
+      if ('aeiouüAEIOUÜ'.indexOf(s.charAt(i)) !== -1) {
+        targetIdx = i;
+        break;
+      }
+    }
+  }
+
+  if (targetIdx !== -1) {
+    const ch = s.charAt(targetIdx);
+    const table = PINYIN_TONE_VOWEL_MAP_[ch];
+    if (table && table[toneNum - 1]) {
+      return s.slice(0, targetIdx) + table[toneNum - 1] + s.slice(targetIdx + 1);
+    }
+  }
+
+  for (let n = 0; n < s.length; n++) {
+    const nTable = PINYIN_NASAL_TONE_MAP_[s.charAt(n)];
+    if (nTable && nTable[toneNum - 1]) {
+      return s.slice(0, n) + nTable[toneNum - 1] + s.slice(n + 1);
+    }
+  }
+
+  return s;
+}
+
+const PINYIN_SYLLABLE_WITH_TONE_RE_ =
+  /((?:zh|ch|sh|[bpmfdtnlgkhjqxzcsryw])?(?:u:|[aeiouvü]){1,3}(?:ng|n)?r?|h?(?:ng|m|n)|r)([0-5])(?![0-9])/gi;
+
+function numberedPinyinToToneMarks_(input) {
+  if (input === null || input === undefined) return '';
+  const str = String(input);
+  if (!str) return '';
+  return str.replace(PINYIN_SYLLABLE_WITH_TONE_RE_, function(_, letters, digit) {
+    return applyToneToPinyinSyllable_(letters, Number(digit));
+  });
+}
+
+/**
+ * In-place batch migration of column 4 (`pinyin`) across both `Vocab` and `ReviewLog` tabs.
+ * Only writes to a tab when at least 1 cell had numbered Pinyin that changed.
+ */
+function normalizeSheetPinyinToToneMarks_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let vocabUpdated = 0;
+  let logUpdated = 0;
+  let totalVocab = 0;
+
+  const vocabSheet = ss.getSheetByName(TAB_VOCAB);
+  if (vocabSheet && vocabSheet.getLastRow() > 1) {
+    const numVocab = vocabSheet.getLastRow() - 1;
+    totalVocab = numVocab;
+    const vRange = vocabSheet.getRange(2, 4, numVocab, 1);
+    const vVals = vRange.getValues();
+    let vChanged = false;
+    for (let i = 0; i < vVals.length; i++) {
+      const raw = String(vVals[i][0] || '');
+      if (raw && /[0-5]/.test(raw)) {
+        const converted = numberedPinyinToToneMarks_(raw);
+        if (converted !== raw) {
+          vVals[i][0] = converted;
+          vocabUpdated++;
+          vChanged = true;
+        }
+      }
+    }
+    if (vChanged) {
+      vRange.setValues(vVals);
+    }
+  }
+
+  const logSheet = ss.getSheetByName(TAB_LOG);
+  if (logSheet && logSheet.getLastRow() > 1) {
+    const numLog = logSheet.getLastRow() - 1;
+    const lRange = logSheet.getRange(2, 4, numLog, 1);
+    const lVals = lRange.getValues();
+    let lChanged = false;
+    for (let j = 0; j < lVals.length; j++) {
+      const rawLog = String(lVals[j][0] || '');
+      if (rawLog && /[0-5]/.test(rawLog)) {
+        const convLog = numberedPinyinToToneMarks_(rawLog);
+        if (convLog !== rawLog) {
+          lVals[j][0] = convLog;
+          logUpdated++;
+          lChanged = true;
+        }
+      }
+    }
+    if (lChanged) {
+      lRange.setValues(lVals);
+    }
+  }
+
+  if (vocabUpdated > 0 || logUpdated > 0) {
+    SpreadsheetApp.flush();
+  }
+
+  return {
+    vocabUpdated: vocabUpdated,
+    reviewLogUpdated: logUpdated,
+    logUpdated: logUpdated,
+    totalVocab: totalVocab
+  };
+}
+
+function handleNormalizePinyin_() {
+  const stats = normalizeSheetPinyinToToneMarks_();
+  return {
+    ok: true,
+    vocabUpdated: stats.vocabUpdated,
+    reviewLogUpdated: stats.reviewLogUpdated,
+    logUpdated: stats.logUpdated,
+    totalVocab: stats.totalVocab
+  };
+}
+
+function menuNormalizePinyin() {
+  const stats = normalizeSheetPinyinToToneMarks_();
+  SpreadsheetApp.getUi().alert(
+    'Converted Pinyin to standard tone marks:\n' +
+    '• Vocab rows updated: ' + stats.vocabUpdated + '\n' +
+    '• ReviewLog rows updated: ' + stats.logUpdated
+  );
+}
+

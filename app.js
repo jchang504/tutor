@@ -14,11 +14,12 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=21';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=22';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=21';
+} from './live-audio.js?v=22';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=22';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
@@ -478,7 +479,7 @@ const STORAGE_KEYS = {
   MIC_DEVICE_ID: 'tw_tutor_mic_device_id'
 };
 
-class MandarinTutorApp {
+export class MandarinTutorApp {
   constructor() {
     this.batch = [];
     this.currentIndex = 0;
@@ -491,6 +492,8 @@ class MandarinTutorApp {
     this.isPageUnloading = false;
     this.cachedGradingCandidates = null;
     this.lastScoredWordId = null;
+    this.lastMediaKeyPerfMs = -1000;
+    this.mediaKeydownBound = false;
 
     window.addEventListener('beforeunload', () => {
       this.isPageUnloading = true;
@@ -636,6 +639,7 @@ class MandarinTutorApp {
       inputSupplementCount: document.getElementById('input-supplement-count'),
       btnPullTocfl: document.getElementById('btn-pull-tocfl'),
       btnPregeneratePrompts: document.getElementById('btn-pregenerate-prompts'),
+      btnNormalizePinyin: document.getElementById('btn-normalize-pinyin'),
       importResultBox: document.getElementById('import-result-box'),
 
       toastContainer: document.getElementById('toast-container')
@@ -791,6 +795,9 @@ class MandarinTutorApp {
     this.els.btnPullTocfl.addEventListener('click', () => this.pullTocflSupplemental());
     if (this.els.btnPregeneratePrompts) {
       this.els.btnPregeneratePrompts.addEventListener('click', () => this.pregenerateSheetPrompts());
+    }
+    if (this.els.btnNormalizePinyin) {
+      this.els.btnNormalizePinyin.addEventListener('click', () => this.normalizeSheetPinyin());
     }
   }
 
@@ -1070,6 +1077,7 @@ class MandarinTutorApp {
 
       await this.requestWakeLock();
       await this.pipeline.initAudioHardware();
+      await this.pipeline.startMediaSessionAnchor();
 
       await this.loadNextBatch();
 
@@ -1093,6 +1101,7 @@ class MandarinTutorApp {
 
       await this.launchCurrentWord();
     } catch (err) {
+      this.pipeline.stopMediaSessionAnchor();
       this.els.btnStartDriving.disabled = false;
       this.handlePipelineState('idle', 'Tap Start to begin');
       this.showToast(err.message || String(err), 'error');
@@ -1116,7 +1125,9 @@ class MandarinTutorApp {
         tocflLevel
       });
 
-      this.batch = res.batch || [];
+      this.batch = (res.batch || []).map((w) =>
+        Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') })
+      );
       if (res.liveAuth && res.liveAuth.apiKey) {
         this.liveAuth = Object.assign({}, this.liveAuth, res.liveAuth, {
           preferredLiveModel:
@@ -1137,7 +1148,9 @@ class MandarinTutorApp {
       );
     } else if (directKey) {
       this.liveAuth.apiKey = directKey;
-      this.batch = SAMPLE_TAIWAN_BATCH.map((w) => Object.assign({}, w));
+      this.batch = SAMPLE_TAIWAN_BATCH.map((w) =>
+        Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') })
+      );
       debugLogger.log('info', 'batch_loaded_sample', 'Loaded 5 sample words (Direct Key Mode)');
       this.showToast('Loaded 5 sample Taiwanese Mandarin words (Direct Key Mode).', 'info');
     } else {
@@ -1199,9 +1212,10 @@ class MandarinTutorApp {
       .join(' · ');
 
     if (this.revealTarget) {
+      const displayPinyin = numberedPinyinToToneMarks(word.pinyin || '');
       this.els.targetWordBox.classList.remove('spoiler-masked');
       this.els.targetHanzi.textContent = word.traditional;
-      this.els.targetPhonetics.textContent = [word.pinyin, word.zhuyin].filter(Boolean).join(' · ');
+      this.els.targetPhonetics.textContent = [displayPinyin, word.zhuyin].filter(Boolean).join(' · ');
       const refMandarin = (word.mandarin_sentence || word.sample_mandarin || '').trim();
       this.els.targetGloss.textContent = [word.english_gloss, refMandarin ? `Ref: ${refMandarin}` : '']
         .filter(Boolean)
@@ -1220,8 +1234,9 @@ class MandarinTutorApp {
     if (!this.els.lastScoreBanner) return;
     this.els.lastScoreBanner.classList.remove('hidden');
     const cleanNotes = notes ? ` · ${this.escapeHtml(notes)}` : '';
+    const displayPinyin = numberedPinyinToToneMarks(word.pinyin || '');
     this.els.lastScoreBanner.innerHTML = `
-      <strong>${this.escapeHtml(word.traditional)} (${this.escapeHtml(word.pinyin || '')})</strong> →
+      <strong>${this.escapeHtml(word.traditional)} (${this.escapeHtml(displayPinyin)})</strong> →
       <span class="score-pill score-${score}">${scoreLabel(score)}</span>
       <span class="next-due-note">Next review in ${intervalDays}d${cleanNotes}</span>
     `;
@@ -1552,11 +1567,59 @@ ${dialogueText}`;
     await this.skipCurrentWord(action);
   }
 
-  async skipCurrentWord(reason = 'skip') {
+  /**
+   * Restarts the entire practice flow for the CURRENT word from the very beginning (Phase 1 English prompt),
+   * triggered by the car steering-wheel / Bluetooth earbud `Previous` (`previoustrack` / `seekbackward`) button.
+   */
+  async restartCurrentWord(reason = 'steering_wheel_prev') {
+    if (!this.sessionActive || !Array.isArray(this.batch) || !this.batch[this.currentIndex]) {
+      return;
+    }
+    const word = this.batch[this.currentIndex];
+    if (this.sessionPaused) {
+      this.sessionPaused = false;
+      if (this.els && this.els.btnPauseResume) {
+        this.els.btnPauseResume.textContent = 'Pause';
+      }
+      this.pipeline.startMediaSessionAnchor().catch(() => {});
+    }
+
     this.pipeline.closeCurrentWordSocket();
+    this.pipeline.playChime('start');
+
+    debugLogger.log(
+      'info',
+      'word_restarted',
+      `Restarted ${word.traditional} from Phase 1 (${reason})`,
+      {
+        wordIndex: this.currentIndex + 1,
+        traditional: word.traditional,
+        reason
+      }
+    );
+    // Keep toast spoiler-free while translating eyes-free
+    this.showToast(`Restarting Word #${this.currentIndex + 1} from beginning`, 'info');
+    await this.launchCurrentWord();
+  }
+
+  async skipCurrentWord(reason = 'skip') {
+    if (this.sessionActive && this.sessionPaused) {
+      this.sessionPaused = false;
+      if (this.els && this.els.btnPauseResume) {
+        this.els.btnPauseResume.textContent = 'Pause';
+      }
+      this.pipeline.startMediaSessionAnchor().catch(() => {});
+    }
+
+    this.pipeline.closeCurrentWordSocket();
+    this.pipeline.playChime('skip');
+
     const word = this.batch[this.currentIndex];
     if (word) {
-      debugLogger.log('info', 'word_skipped', `Skipped ${word.traditional} (${reason})`);
+      debugLogger.log('info', 'word_skipped', `Skipped ${word.traditional} (${reason})`, {
+        wordIndex: this.currentIndex + 1,
+        reason
+      });
       this.showToast(`Skipped ${word.traditional}`, 'info');
     }
     this.currentIndex += 1;
@@ -1571,10 +1634,14 @@ ${dialogueText}`;
 
     if (this.sessionPaused) {
       this.pipeline.closeCurrentWordSocket();
+      this.pipeline.pauseMediaSessionAnchor();
+      this._setMediaSessionPlaybackState('paused');
       this.els.btnPauseResume.textContent = 'Resume Driving';
       this.handlePipelineState('paused', 'Paused — Tap Orb or Steering Play to Resume');
     } else {
       this.els.btnPauseResume.textContent = 'Pause';
+      this.pipeline.startMediaSessionAnchor().catch(() => {});
+      this._setMediaSessionPlaybackState('playing');
       this.launchCurrentWord();
     }
   }
@@ -1583,6 +1650,8 @@ ${dialogueText}`;
     this.sessionActive = false;
     this.sessionPaused = false;
     this.pipeline.closeCurrentWordSocket();
+    this.pipeline.stopMediaSessionAnchor();
+    this._setMediaSessionPlaybackState('none');
     this.releaseWakeLock();
 
     this.els.btnStartDriving.disabled = false;
@@ -1746,6 +1815,7 @@ ${dialogueText}`;
         if (this.pipeline.audioCtx && this.pipeline.audioCtx.state === 'suspended') {
           this.pipeline.audioCtx.resume().catch(() => {});
         }
+        this.pipeline.startMediaSessionAnchor().catch(() => {});
         if (this.pipeline.isDisconnected()) {
           this.pipeline.reconnectCurrentWord().catch(() => {});
         }
@@ -1759,36 +1829,137 @@ ${dialogueText}`;
     });
   }
 
+  _setMediaSessionPlaybackState(state = 'none') {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState = state;
+      if (state === 'playing' && typeof navigator.mediaSession.setPositionState === 'function') {
+        navigator.mediaSession.setPositionState({
+          duration: 12,
+          playbackRate: 1,
+          position: 0
+        });
+      }
+    } catch (_) {}
+  }
+
+  _handleHardwareMediaAction(actionName, source = 'mediaSession') {
+    if (!this.sessionActive) return;
+
+    const isTrackSeek =
+      actionName === 'previoustrack' ||
+      actionName === 'seekbackward' ||
+      actionName === 'nexttrack' ||
+      actionName === 'seekforward';
+
+    if (isTrackSeek) {
+      const now =
+        typeof performance !== 'undefined' && typeof performance.now === 'function'
+          ? performance.now()
+          : Date.now();
+      if (now - (this.lastMediaKeyPerfMs || -1000) < 350) {
+        return;
+      }
+      this.lastMediaKeyPerfMs = now;
+    }
+
+    debugLogger.log(
+      'tool',
+      'steering_media_button',
+      `Hardware media control: ${actionName} (${source})`,
+      {
+        action: actionName,
+        source,
+        wordIndex: this.currentIndex + 1,
+        paused: Boolean(this.sessionPaused)
+      }
+    );
+
+    if (actionName === 'previoustrack' || actionName === 'seekbackward') {
+      this.restartCurrentWord(`steering_${actionName}`);
+      return;
+    }
+    if (actionName === 'nexttrack' || actionName === 'seekforward') {
+      this.skipCurrentWord(`steering_${actionName}`);
+      return;
+    }
+    if (actionName === 'play') {
+      if (this.sessionPaused) this.togglePauseSession(false);
+      return;
+    }
+    if (actionName === 'pause') {
+      if (!this.sessionPaused) this.togglePauseSession(true);
+      return;
+    }
+    if (actionName === 'toggle_play_pause') {
+      this.togglePauseSession();
+      return;
+    }
+    if (actionName === 'stop') {
+      this.stopDrivingSession();
+    }
+  }
+
   /**
-   * MediaSession API so steering wheel Play/Pause/Next/Previous buttons control the tutor!
+   * MediaSession API + Hardware Media Key (`keydown`) listeners so car steering-wheel and
+   * Bluetooth earbud Previous / Next / Play / Pause buttons control the tutor hands-free:
+   * - Previous (`previoustrack`, `seekbackward`, `MediaTrackPrevious`) -> Restart current word from Phase 1
+   * - Next (`nexttrack`, `seekforward`, `MediaTrackNext`) -> Skip to next word
    */
   setupMediaSessionControls() {
-    if (!('mediaSession' in navigator)) return;
-    navigator.mediaSession.setActionHandler('play', () => {
-      if (this.sessionActive && this.sessionPaused) this.togglePauseSession(false);
-    });
-    navigator.mediaSession.setActionHandler('pause', () => {
-      if (this.sessionActive && !this.sessionPaused) this.togglePauseSession(true);
-    });
-    navigator.mediaSession.setActionHandler('nexttrack', () => {
-      if (this.sessionActive) this.skipCurrentWord('steering_wheel_next');
-    });
-    navigator.mediaSession.setActionHandler('previoustrack', () => {
-      if (this.sessionActive) {
-        this.pipeline.sendTextCommand('請再清楚唸一次這題的英文句子。');
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      const actions = [
+        'play',
+        'pause',
+        'stop',
+        'previoustrack',
+        'nexttrack',
+        'seekbackward',
+        'seekforward'
+      ];
+      for (const action of actions) {
+        try {
+          navigator.mediaSession.setActionHandler(action, () => {
+            this._handleHardwareMediaAction(action, 'mediaSession');
+          });
+        } catch (_) {}
       }
-    });
+    }
+
+    if (typeof window !== 'undefined' && !this.mediaKeydownBound) {
+      this.mediaKeydownBound = true;
+      window.addEventListener('keydown', (e) => {
+        if (!this.sessionActive || !e) return;
+        const tag = e.target && e.target.tagName ? String(e.target.tagName).toUpperCase() : '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+        if (e.key === 'MediaTrackPrevious' || e.key === 'MediaRewind') {
+          e.preventDefault();
+          this._handleHardwareMediaAction('previoustrack', `keydown:${e.key}`);
+        } else if (e.key === 'MediaTrackNext' || e.key === 'MediaFastForward') {
+          e.preventDefault();
+          this._handleHardwareMediaAction('nexttrack', `keydown:${e.key}`);
+        } else if (e.key === 'MediaPlayPause') {
+          e.preventDefault();
+          this._handleHardwareMediaAction('toggle_play_pause', `keydown:${e.key}`);
+        }
+      });
+    }
   }
 
   updateMediaSessionMetadata(word) {
-    if (!('mediaSession' in navigator) || !word) return;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || !word) return;
     try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: word.english_prompt,
-        artist: 'Mandarin Driving Tutor',
-        album: `Word ${this.currentIndex + 1} of ${this.batch.length}`
-      });
+      if (typeof MediaMetadata !== 'undefined') {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: word.english_prompt,
+          artist: 'Mandarin Driving Tutor',
+          album: `Word ${this.currentIndex + 1} of ${this.batch.length}`,
+          artwork: [{ src: './icons/icon.svg', sizes: '512x512', type: 'image/svg+xml' }]
+        });
+      }
     } catch (_) {}
+    this._setMediaSessionPlaybackState(this.sessionPaused ? 'paused' : 'playing');
   }
 
   /**
@@ -2025,12 +2196,15 @@ ${dialogueText}`;
       if (cols.length >= 5 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test((cols[0] || '').trim())) {
         const trad = (cols[0] || '').trim();
         const simp = /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test((cols[1] || '').trim()) ? (cols[1] || '').trim() : '';
-        const pinyin = (cols[2] || '').trim();
+        const pinyin = numberedPinyinToToneMarks((cols[2] || '').trim());
         const gloss = ((cols[4] || cols[3] || '').replace(/%27/gi, "'")).trim();
         const tagsStr = row.tags.join(' ');
         cleanLines.push([trad, simp, pinyin, gloss, tagsStr].join('\t'));
       } else {
-        cleanLines.push(row.rawLine);
+        const convertedCols = cols.map((c, idx) =>
+          idx >= 1 && idx <= 2 && !/[\u4e00-\u9fff]/.test(c) ? numberedPinyinToToneMarks(c) : c
+        );
+        cleanLines.push(convertedCols.join(parsed.separator));
       }
     }
 
@@ -2178,6 +2352,42 @@ ${dialogueText}`;
     } finally {
       this.els.btnPregeneratePrompts.disabled = false;
       this.els.btnPregeneratePrompts.textContent = 'Generate / Refresh Mandarin → English Sentences';
+    }
+  }
+
+  async normalizeSheetPinyin() {
+    if (!this.els.btnNormalizePinyin) return;
+    try {
+      this.els.btnNormalizePinyin.disabled = true;
+      this.els.btnNormalizePinyin.textContent = 'Converting Sheet Pinyin to Tone Marks...';
+      const res = await this.callBackend('normalize_pinyin');
+      const vocabUpdated = Number(res.vocabUpdated || 0);
+      const reviewLogUpdated = Number(res.reviewLogUpdated || 0);
+      const totalVocab = Number(res.totalVocab || 0);
+
+      this.els.importResultBox.classList.remove('hidden');
+      if (vocabUpdated > 0 || reviewLogUpdated > 0) {
+        this.els.importResultBox.textContent =
+          `Converted ${vocabUpdated} Vocab rows (out of ${totalVocab}) and ${reviewLogUpdated} ReviewLog rows in your Google Sheet to standard tone-mark Pinyin (ā á ǎ à)!`;
+        this.showToast(`Converted ${vocabUpdated} words in Sheet to tone-mark Pinyin!`, 'success');
+      } else {
+        this.els.importResultBox.textContent =
+          `All ${totalVocab} words in your Google Sheet already use standard tone-mark Pinyin (ā á ǎ à).`;
+        this.showToast('All Sheet Pinyin is already using tone marks!', 'info');
+      }
+    } catch (err) {
+      const msg = String(err.message || err);
+      if (/Unknown action:\s*normalize_pinyin/i.test(msg)) {
+        this.els.importResultBox.classList.remove('hidden');
+        this.els.importResultBox.textContent =
+          'Your Google Sheet Web App is running an older Code.gs deployment. Paste the updated apps-script/Code.gs into Extensions → Apps Script → Deploy → Manage deployments → Edit → New version (or run Mandarin Tutor → Convert All Pinyin to Tone Marks in your Sheet) to rewrite all Sheet rows in-place!';
+        this.showToast('Update Code.gs in Apps Script to rewrite Sheet cells (app already shows tone marks!).', 'info');
+      } else {
+        this.showToast(msg, 'error');
+      }
+    } finally {
+      this.els.btnNormalizePinyin.disabled = false;
+      this.els.btnNormalizePinyin.textContent = 'Convert Sheet Pinyin to Tone Marks (ā á ǎ à)';
     }
   }
 

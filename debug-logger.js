@@ -10,7 +10,7 @@
  * - Formats a paste-ready Markdown diagnostic bundle for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v21';
+export const APP_VERSION = 'v22';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
@@ -360,13 +360,16 @@ class DebugLogger {
         e.level === 'tool' ||
         e.event === 'ws_close_unexpected' ||
         e.event === 'word_completed' ||
+        e.event === 'word_restarted' ||
+        e.event === 'word_skipped' ||
         e.event === 'word_graded_ai' ||
         e.event === 'word_graded_heuristic_fallback' ||
         e.event === 'no_reply_timer_fired' ||
         e.event === 'mic_acquired' ||
         e.event === 'audio_devices_enumerated' ||
         e.event === 'audio_device_changed' ||
-        e.event === 'mic_track_event'
+        e.event === 'mic_track_event' ||
+        e.event.startsWith('media_session_')
     );
 
     if (highlights.length > 0) {
