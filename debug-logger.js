@@ -10,7 +10,7 @@
  * - Formats a paste-ready Markdown diagnostic bundle for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v20';
+export const APP_VERSION = 'v21';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
@@ -325,7 +325,7 @@ class DebugLogger {
   /**
    * Formats a comprehensive, LLM-friendly Markdown diagnostic bundle ready to paste into Gemini.
    */
-  formatForGemini(maxTimelineEntries = 100) {
+  formatForGemini(maxTimelineEntries = 90, maxTotalChars = 17800) {
     const stats = this.getSummaryStats();
     const ua = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown';
 
@@ -372,18 +372,44 @@ class DebugLogger {
     if (highlights.length > 0) {
       lines.push('', '### Key Diagnostic Highlights (Scores, Errors, WS Closes & Audio)');
       lines.push('```text');
-      for (const h of highlights.slice(-35)) {
-        lines.push(this._formatSingleEntryLine(h));
+      const maxHighlightBudget = Math.floor(maxTotalChars * 0.42);
+      const selectedHighlights = [];
+      let highlightChars = 0;
+      const candidateHighlights = highlights.slice(-28);
+      for (let i = candidateHighlights.length - 1; i >= 0; i--) {
+        const formatted = this._formatSingleEntryLine(candidateHighlights[i]);
+        if (selectedHighlights.length > 0 && highlightChars + formatted.length + 1 > maxHighlightBudget) {
+          break;
+        }
+        selectedHighlights.push(formatted);
+        highlightChars += formatted.length + 1;
       }
+      selectedHighlights.reverse();
+      lines.push(...selectedHighlights);
       lines.push('```');
     }
 
-    const timeline = this.entries.slice(-maxTimelineEntries);
-    lines.push('', `### Chronological Protocol Timeline (Last ${timeline.length} of ${this.entries.length} Events)`);
-    lines.push('```text');
-    for (const e of timeline) {
-      lines.push(this._formatSingleEntryLine(e));
+    const headerSoFarLen = lines.join('\n').length + 120;
+    const remainingBudget = Math.max(1200, maxTotalChars - headerSoFarLen);
+    const candidateTimeline = this.entries.slice(-maxTimelineEntries);
+    const selectedTimeline = [];
+    let timelineChars = 0;
+    for (let i = candidateTimeline.length - 1; i >= 0; i--) {
+      const formatted = this._formatSingleEntryLine(candidateTimeline[i]);
+      if (selectedTimeline.length > 0 && timelineChars + formatted.length + 1 > remainingBudget) {
+        break;
+      }
+      selectedTimeline.push(formatted);
+      timelineChars += formatted.length + 1;
     }
+    selectedTimeline.reverse();
+
+    lines.push(
+      '',
+      `### Chronological Protocol Timeline (Last ${selectedTimeline.length} of ${this.entries.length} Events)`
+    );
+    lines.push('```text');
+    lines.push(...selectedTimeline);
     lines.push('```');
 
     return lines.join('\n');
