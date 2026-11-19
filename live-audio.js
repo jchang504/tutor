@@ -1,26 +1,25 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v22):
+ * Key architectural guarantees (v23):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
  *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading runs asynchronously
  *    over standard REST JSON in the background after the word ends!
- * 3. Model-aware cold-start `clientContent` (`turnComplete: true` on 2.5) + clean same-model
- *    continuation on stalled turns / manual "Done Speaking" + late-ASR preservation into `wordTurns`.
- * 4. Mid-sentence crash recovery: if a cellular drop or server `1011` interrupts the tutor
- *    BEFORE `turnComplete`, auto-reconnect rotates to the next healthy Live model immediately
- *    and prompts the tutor to finish its interrupted sentence instead of freezing in `listening`.
- * 5. Smart context- & sentence-completeness-aware endpointing (~850–1100ms on completed sentences,
- *    ~1950ms on incomplete mid-sentence pauses) + 400ms real mic tail + transient noise rejection.
- * 6. Clean Unboosted Bluetooth Call / Earbuds Default Audio (`bluetooth_hfp` default) + Persistent
- *    12s `<audio>` MediaSession Anchor so Android OS & Bluetooth AVRCP route steering-wheel / earbud
- *    Previous (restart word) & Next (skip word) buttons to `navigator.mediaSession`.
+ * 3. Driving Cellular Resilience:
+ *    - 500ms local pre-roll ring buffer (zero idle uplink bandwidth while thinking).
+ *    - Full local 16kHz PCM utterance capture + automatic audio replay on fresh WebSocket whenever
+ *      a cellular handoff / half-open TCP zombie socket (`ws.bufferedAmount` stall) / `1006` drop
+ *      loses ASR on real speech — so drivers don't have to repeat themselves!
+ *    - Captures speech continuously in memory even while a dropped socket is mid-reconnect.
+ * 4. Context-preserving Repeat (`repeatLastTutorPrompt`): repeats ONLY the tutor's last spoken prompt
+ *    or follow-up question and continues from the current phase rather than resetting to Phase 1.
+ * 5. Smart context- & sentence-completeness-aware endpointing + Clean Bluetooth Call / MediaSession Anchor.
  */
 
-import { debugLogger } from './debug-logger.js?v=22';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=22';
+import { debugLogger } from './debug-logger.js?v=23';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=23';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -182,8 +181,8 @@ export function classifyNextUserTurnExpectation(
     return 'ask_question_only';
   }
 
-  // Explicit Phase 1 translation instruction (e.g. repeating English sentence on request)
-  if (/把這句話翻成中文|翻成中文/.test(txt)) {
+  // Explicit Phase 1 translation instruction only keeps/sets `'translate'` when already in Phase 1
+  if (/把這句話翻成中文|翻成中文/.test(txt) && prev === 'translate') {
     return 'translate';
   }
 
@@ -218,7 +217,7 @@ export function deriveTurnExpectationFromHistory(
   let expectation = 'translate';
   let tutorCount = 0;
   for (const t of Array.isArray(wordTurns) ? wordTurns : []) {
-    if (t && t.role === 'tutor' && t.text) {
+    if (t && t.role === 'tutor' && String(t.text || '').trim()) {
       tutorCount += 1;
       expectation = classifyNextUserTurnExpectation(t.text, tutorCount, {
         enableAskBack,
@@ -287,7 +286,7 @@ export function computeSmartSilenceThresholdMs({
   // 1. Instant voice control commands
   if (
     raw &&
-    /^(跳過|下一題|下一個|換下一題|暫停|先暫停|結束練習|停止練習|再說一次|再唸一次|再說一次英文|提示|給我提示|skip|next|pause|repeat|hint)[。！!？?\s]*$/i.test(
+    /^(跳過|下一題|下一個|換下一題|暫停|先暫停|結束練習|停止練習|再說一次|再講一次|再唸一次|請再說一次|請重複一次|重複一次|沒聽清楚|再說一次英文|提示|給我提示|skip|next|pause|repeat|say that again|hint)[。！!？?\s]*$/i.test(
       raw
     )
   ) {
@@ -360,7 +359,9 @@ export function computeSmartSilenceThresholdMs({
     if (hanziCount >= minCompleteHanzi && voicedMs >= 950) {
       return { thresholdMs: 1100, reason: 'sentence_complete_length' };
     }
-    return { thresholdMs: 1500, reason: 'short_partial_transcript' };
+    // Under spotty cellular latency, ASR may have only emitted the first 1-2 characters (`有`)
+    // of a longer spoken sentence — give 1900ms so we don't cut the driver off mid-thought!
+    return { thresholdMs: 1900, reason: 'short_partial_transcript' };
   }
 
   // Acoustic fallback when interim/final transcript has not arrived yet (e.g. mobile cellular latency in car):
@@ -381,8 +382,11 @@ export function buildWordSystemInstruction(
     : '若學生使用了其他合法的近義詞，請先肯定句子自然，並請他「換成我們今天要練習的另一個近義詞」再把整句話說一次，不要直接唸出目標詞的發音，也不扣分。';
 
   let resumeSection = '';
-  if (Array.isArray(priorTurns) && priorTurns.length > 0) {
-    const formattedTurns = priorTurns
+  const cleanPriorTurns = Array.isArray(priorTurns)
+    ? priorTurns.filter((t) => t && String(t.text || '').trim())
+    : [];
+  if (cleanPriorTurns.length > 0) {
+    const formattedTurns = cleanPriorTurns
       .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
       .join('\n');
     const resumeEndHint = enableAskBack
@@ -459,9 +463,10 @@ export function buildWordSystemInstruction(
 ${enableAskBack ? askBackFlowPhases : answerOnlyFlowPhases}
 
 【免持語音控制固定口令（僅在學生主動要求時說出對應句子）】
+- 學生說「再說一次 / 再講一次 / 再唸一次 / 請重複一次 / 沒聽清楚 / Repeat / Say that again」 -> **請只清楚重複你「上一輪最後剛對學生說的那句話或問題」**（例如：若剛才是問階段二的延伸問題，就只重複那個延伸問題；若剛才是給發音、聲調或語法修正提示，就只重複剛才的修正提示；只有在目前本來就還在階段一且尚未進入延伸問題時，才重唸英文題目與翻譯提示），**重複完後直接從目前的練習階段繼續，絕對不要退回第一階段從頭開始！**
+- 學生明確說「再說一次英文 / Repeat the English sentence」 -> 重新清楚唸一次英文題目："${word.english_prompt}"，並維持目前的練習進度繼續。
 - 學生說「跳過 / 下一題 / Skip / Next word」 -> 請直接說：**「好，我們跳過這題！」**
 - 學生說「這題怪怪的 / 標記問題卡片 / Flag card」 -> 請直接說：**「好，已標記問題卡片，我們跳過這題！」**
-- 學生說「再說一次英文 / Repeat the English sentence」 -> 重新清楚唸一次英文題目："${word.english_prompt}"
 - 學生說「暫停 / Pause」 -> 請直接說：**「好，我們先暫停練習。」**
 - 學生說「結束練習 / 停止 / End session」 -> 請直接說：**「好，今天的練習結束囉！」**${resumeSection}`;
 }
@@ -511,7 +516,7 @@ export class GeminiLiveVoicePipeline {
     this.activeSources = new Set();
     this.pendingActionAfterPlayback = null;
 
-    // Smart Context- & Sentence-Completeness-Aware Endpointing + Clean Zero-PCM Silence Gating
+    // Smart Context- & Sentence-Completeness-Aware Endpointing + Local Utterance Capture & Replay
     this.silenceWaitMs = 1100;
     this.turnExpectation = 'translate';
     this.listeningForUser = false;
@@ -526,7 +531,15 @@ export class GeminiLiveVoicePipeline {
     this.lastCommittedVoicedMs = 0;
     this.turnPeakSpeechRms = 0.04;
     this.silenceFramesSentInPause = 0;
+    this.idlePreRollBuffer = [];
     this.pausePreRollBuffer = [];
+    this.currentTurnPcmChunks = [];
+    this.unsentLivePcmQueue = [];
+    this.lastCommittedPcmChunks = null;
+    this.pendingCommittedReplayChunks = null;
+    this.utteranceReplayAttempts = 0;
+    this.consecutiveWedgedRefreshes = 0;
+    this.pendingCustomPromptOnConnect = null;
     this.lastVoiceActivityTime = 0;
     this.lastCountdownText = '';
     this.noiseFloor = 0.0035;
@@ -540,6 +553,7 @@ export class GeminiLiveVoicePipeline {
     this.interruptedTutorPartialText = '';
     this.activeUserTurnIndex = -1;
     this.noReplyRecoveryTimer = null;
+    this.uplinkMonitorTimer = null;
     this.reconnectTimer = null;
     this.postPlaybackCooldownUntil = 0;
 
@@ -560,7 +574,7 @@ export class GeminiLiveVoicePipeline {
     this.lastLiveConfig = null;
     this.wordTurns = [];
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 3;
+    this.maxReconnectAttempts = 4;
     this.isReconnecting = false;
     this.connectionState = 'idle';
   }
@@ -813,7 +827,7 @@ export class GeminiLiveVoicePipeline {
     if (!this.workletNode) {
       this.workletNode = new AudioWorkletNode(this.audioCtx, 'pcm-recorder-processor');
       this.workletNode.port.onmessage = (event) => {
-        if (!this.isActive || this.isMuted || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        if (!this.isActive || this.isMuted) {
           return;
         }
         const float32Samples = event.data;
@@ -1077,7 +1091,12 @@ export class GeminiLiveVoicePipeline {
     const speechStartThreshold = Math.max(0.020, Math.min(0.045, this.noiseFloor * 3.2));
 
     if (!this.userSpokeInTurn) {
-      this._sendAudioChunk(pcm16Base64);
+      // Keep a local 500ms (5-frame) PCM16 pre-roll ring buffer in memory instead of streaming
+      // continuous idle road noise over cellular while the driver is thinking!
+      this.idlePreRollBuffer.push(pcm16Base64);
+      if (this.idlePreRollBuffer.length > 5) {
+        this.idlePreRollBuffer.shift();
+      }
 
       if (rawRms >= speechStartThreshold) {
         this.consecutiveSpeechFrames += 1;
@@ -1085,19 +1104,27 @@ export class GeminiLiveVoicePipeline {
           rawRms >= Math.max(0.036, speechStartThreshold * 1.4) ? 2 : 3;
         if (this.consecutiveSpeechFrames >= requiredFrames) {
           this.userSpokeInTurn = true;
+          this.utteranceReplayAttempts = 0;
           this.speechSegmentsInTurn = 1;
           this.turnVoicedMs = requiredFrames * 100;
           this.turnPeakSpeechRms = Math.max(0.03, Math.min(0.4, rawRms));
           this.silenceFramesSentInPause = 0;
           this.resumeSpeechFrames = 0;
           this.pausePreRollBuffer = [];
+          this.currentTurnPcmChunks = [];
+          this.unsentLivePcmQueue = [];
+          for (const preChunk of this.idlePreRollBuffer) {
+            this._recordAndSendAudioChunk(preChunk);
+          }
+          this.idlePreRollBuffer = [];
           this.lastVoiceActivityTime = now;
           this.lastCountdownText = '';
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
             rawRms: Number(rawRms.toFixed(4)),
             noiseFloor: Number(this.noiseFloor.toFixed(4)),
             threshold: Number(speechStartThreshold.toFixed(4)),
-            turnExpectation: this.turnExpectation
+            turnExpectation: this.turnExpectation,
+            wsOpen: Boolean(this.ws && this.ws.readyState === WebSocket.OPEN)
           });
           this._emitState('listening', 'Hearing your Mandarin...');
         }
@@ -1136,7 +1163,7 @@ export class GeminiLiveVoicePipeline {
       if (silenceBeforeFrame >= 450) {
         this.speechSegmentsInTurn += 1;
         for (const bufferedChunk of this.pausePreRollBuffer) {
-          this._sendAudioChunk(bufferedChunk);
+          this._recordAndSendAudioChunk(bufferedChunk);
         }
       }
       this.pausePreRollBuffer = [];
@@ -1145,7 +1172,7 @@ export class GeminiLiveVoicePipeline {
       this.lastVoiceActivityTime = now;
       this.turnVoicedMs += 100;
       this.turnPeakSpeechRms = Math.min(0.4, Math.max(this.turnPeakSpeechRms * 0.98, rawRms));
-      this._sendAudioChunk(pcm16Base64);
+      this._recordAndSendAudioChunk(pcm16Base64);
 
       if (this.lastCountdownText !== '') {
         this.lastCountdownText = '';
@@ -1181,7 +1208,10 @@ export class GeminiLiveVoicePipeline {
         this.speechSegmentsInTurn = 0;
         this.turnVoicedMs = 0;
         this.silenceFramesSentInPause = 0;
+        this.idlePreRollBuffer = [];
         this.pausePreRollBuffer = [];
+        this.currentTurnPcmChunks = [];
+        this.unsentLivePcmQueue = [];
         this.lastCountdownText = '';
         this._emitState('listening', this._defaultListeningLabel());
         return;
@@ -1202,10 +1232,10 @@ export class GeminiLiveVoicePipeline {
     //   while keeping the 100ms stream continuously clocked below server `silenceDurationMs` (1500ms)!
     // - Frames >= 12: hold silence locally (keeping a 300ms pre-roll ring buffer) during longer pauses.
     if (this.silenceFramesSentInPause < 4) {
-      this._sendAudioChunk(pcm16Base64);
+      this._recordAndSendAudioChunk(pcm16Base64);
       this.silenceFramesSentInPause += 1;
     } else if (this.silenceFramesSentInPause < 11) {
-      this._sendAudioChunk(ZERO_PCM16_100MS_BASE64);
+      this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
       this.silenceFramesSentInPause += 1;
     } else {
       this.pausePreRollBuffer.push(pcm16Base64);
@@ -1227,19 +1257,14 @@ export class GeminiLiveVoicePipeline {
     }
   }
 
-  _sendAudioChunk(pcm16Base64) {
-    if (
-      !this.ws ||
-      this.ws.readyState !== WebSocket.OPEN ||
-      !this.listeningForUser ||
-      this.wordTerminalActionLocked
-    ) {
-      return;
+  _sendRawAudioChunkOnSocket(ws, pcm16Base64) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || this.wordTerminalActionLocked) {
+      return false;
     }
     this.hasUnflushedAudio = true;
     this.hasSentRealtimeAudioOnSocket = true;
     this.sentAudioChunksInTurn += 1;
-    this.ws.send(
+    ws.send(
       JSON.stringify({
         realtimeInput: {
           audio: {
@@ -1249,13 +1274,37 @@ export class GeminiLiveVoicePipeline {
         }
       })
     );
+    return true;
   }
 
-  _flushAudioStreamEnd() {
-    if (!this.hasUnflushedAudio || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  _recordAndSendAudioChunk(pcm16Base64) {
+    if (!this.listeningForUser || this.wordTerminalActionLocked) {
+      return;
+    }
+    // Cap buffered utterance at 300 chunks (30 seconds of 16kHz PCM)
+    if (this.currentTurnPcmChunks.length < 300) {
+      this.currentTurnPcmChunks.push(pcm16Base64);
+    }
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (this.unsentLivePcmQueue.length > 0) {
+        const queued = this.unsentLivePcmQueue.splice(0, this.unsentLivePcmQueue.length);
+        for (const qChunk of queued) {
+          this._sendRawAudioChunkOnSocket(this.ws, qChunk);
+        }
+      }
+      this._sendRawAudioChunkOnSocket(this.ws, pcm16Base64);
+    } else if (this.unsentLivePcmQueue.length < 300) {
+      // Socket is mid-reconnect while the driver is speaking -> queue locally so 0ms of speech is lost!
+      this.unsentLivePcmQueue.push(pcm16Base64);
+    }
+  }
+
+  _flushAudioStreamEnd(targetWs = this.ws) {
+    if (!this.hasUnflushedAudio || !targetWs || targetWs.readyState !== WebSocket.OPEN) return;
     this.hasUnflushedAudio = false;
     try {
-      this.ws.send(
+      targetWs.send(
         JSON.stringify({
           realtimeInput: {
             audioStreamEnd: true
@@ -1266,30 +1315,72 @@ export class GeminiLiveVoicePipeline {
     } catch (_) {}
   }
 
+  _clearTurnTimers() {
+    if (this.noReplyRecoveryTimer) {
+      clearTimeout(this.noReplyRecoveryTimer);
+      this.noReplyRecoveryTimer = null;
+    }
+    if (this.uplinkMonitorTimer) {
+      clearTimeout(this.uplinkMonitorTimer);
+      this.uplinkMonitorTimer = null;
+    }
+  }
+
+  _armNoReplyTimer(waitMs, reasonTag, micStats) {
+    if (this.noReplyRecoveryTimer) {
+      clearTimeout(this.noReplyRecoveryTimer);
+    }
+    this.noReplyRecoveryTimer = setTimeout(() => {
+      this.noReplyRecoveryTimer = null;
+      if (!this.isActive) return;
+      if (
+        this.wordTerminalActionLocked ||
+        this.pendingActionAfterPlayback ||
+        this.tutorTurnActive ||
+        this.serverAckedCurrentUserTurn ||
+        this.isTutorPlayingAudio()
+      ) {
+        return;
+      }
+      this._recoverStalledTurnOnFreshSocket(reasonTag, micStats);
+    }, waitMs);
+  }
+
   commitUserSpeechTurn(reason = 'auto_silence', telemetryExtra = {}) {
-    if (!this.isActive || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    if (this.tutorTurnActive || this.wordTerminalActionLocked) return;
+    if (!this.isActive || this.tutorTurnActive || this.wordTerminalActionLocked) return;
 
     const hadUserSpeech = this.userSpokeInTurn;
     if (reason === 'manual_done' && this.listeningForUser && this.pausePreRollBuffer.length > 0) {
       for (const bufferedChunk of this.pausePreRollBuffer) {
-        this._sendAudioChunk(bufferedChunk);
+        this._recordAndSendAudioChunk(bufferedChunk);
       }
       this.pausePreRollBuffer = [];
     }
 
-    // Pad at most 2 clean 100ms zero frames before `audioStreamEnd` (avoiding 12-packet 0ms bursts
-    // that previously caused duplicate empty `turnComplete` frames on Gemini 2.5 Native Audio).
+    // Pad at most 2 clean 100ms zero frames before `audioStreamEnd`
     if (this.listeningForUser && hadUserSpeech && this.silenceFramesSentInPause < 2) {
       const padCount = 2 - this.silenceFramesSentInPause;
       for (let i = 0; i < padCount; i++) {
-        this._sendAudioChunk(ZERO_PCM16_100MS_BASE64);
+        this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
       }
     }
 
+    const wsOpen = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
+    const recordedChunks = this.currentTurnPcmChunks.slice();
     const chunksSent = this.sentAudioChunksInTurn;
     const liveTranscriptSnapshot = this._getCombinedLiveUserTranscript();
     const micStats = this._buildTurnMicTelemetry();
+
+    // Preserve clean 16kHz PCM snapshot in RAM so if cellular drops or the socket is half-open,
+    // we can replay the driver's exact spoken sentence on a fresh socket automatically!
+    if (
+      recordedChunks.length >= 4 &&
+      (hadUserSpeech || (micStats && micStats.rawMaxRms >= 0.055))
+    ) {
+      this.lastCommittedPcmChunks = recordedChunks;
+    } else {
+      this.lastCommittedPcmChunks = null;
+    }
 
     this.lastCommittedVoicedMs = this.turnVoicedMs;
     this.lastCommittedMicStats = micStats;
@@ -1303,12 +1394,43 @@ export class GeminiLiveVoicePipeline {
     this.consecutiveSpeechFrames = 0;
     this.resumeSpeechFrames = 0;
     this.silenceFramesSentInPause = 0;
+    this.idlePreRollBuffer = [];
     this.pausePreRollBuffer = [];
+    this.currentTurnPcmChunks = [];
+    this.unsentLivePcmQueue = [];
     this.sentAudioChunksInTurn = 0;
     this.lastCountdownText = '';
     this.turnCommitPerfMs = performance.now();
 
     debugLogger.finalizeStreamingEntries('input_transcript');
+
+    // If the driver finished speaking while the WebSocket was offline / mid-reconnect:
+    // Queue `pendingCommittedReplayChunks` so `setupComplete` immediately replays their utterance!
+    if (!wsOpen) {
+      if (this.lastCommittedPcmChunks && this.lastCommittedPcmChunks.length > 0) {
+        this.pendingCommittedReplayChunks = this.lastCommittedPcmChunks;
+        this.lastCommittedPcmChunks = null;
+      }
+      debugLogger.log('info', 'user_turn_committed', `Committed user turn offline (${reason}); queued for replay`, {
+        reason,
+        wsOpen: false,
+        queuedReplayChunks: this.pendingCommittedReplayChunks
+          ? this.pendingCommittedReplayChunks.length
+          : 0,
+        voicedMs: this.lastCommittedVoicedMs,
+        transcriptSoFar: liveTranscriptSnapshot,
+        micStats
+      });
+      this._emitState('connecting', 'Reconnecting & sending your speech...');
+      if (!this.isReconnecting) {
+        this._attemptAutoReconnect(1006, 'commit_while_offline');
+      }
+      return;
+    }
+
+    this._flushAudioStreamEnd(this.ws);
+    const wsBufferedBytes = this.ws ? this.ws.bufferedAmount || 0 : 0;
+
     debugLogger.log('info', 'user_turn_committed', `Committed user turn (${reason})`, {
       reason,
       turnExpectation: this.turnExpectation,
@@ -1316,51 +1438,68 @@ export class GeminiLiveVoicePipeline {
       voicedMs: this.lastCommittedVoicedMs,
       ...telemetryExtra,
       audioChunksSent: chunksSent,
+      wsBufferedBytes,
       transcriptSoFar: liveTranscriptSnapshot,
       micStats
     });
 
     this._emitState('connecting', 'Processing your Mandarin...');
-    this._flushAudioStreamEnd();
+    this._clearTurnTimers();
 
-    if (this.noReplyRecoveryTimer) {
-      clearTimeout(this.noReplyRecoveryTimer);
-    }
-
+    const recoveryReasonTag =
+      reason === 'manual_done' ? 'manual_done_no_reply' : 'no_reply_auto_continue';
     const recoveryWaitMs =
       reason === 'manual_done'
-        ? 1400
+        ? 1500
         : hadUserSpeech || liveTranscriptSnapshot
-        ? 2600
+        ? 2800
         : 1800;
 
-    this.noReplyRecoveryTimer = setTimeout(() => {
-      this.noReplyRecoveryTimer = null;
-      if (!this.isActive) return;
-      if (
-        this.wordTerminalActionLocked ||
-        this.pendingActionAfterPlayback ||
-        this.tutorTurnActive ||
-        this.serverAckedCurrentUserTurn ||
-        this.isTutorPlayingAudio()
-      ) {
-        return;
-      }
-      this._recoverStalledTurnOnFreshSocket(
-        reason === 'manual_done' ? 'manual_done_no_reply' : 'no_reply_auto_continue',
-        micStats
-      );
-    }, recoveryWaitMs);
+    this._armNoReplyTimer(recoveryWaitMs, recoveryReasonTag, micStats);
+
+    // Half-open cellular TCP detector: if Chrome's WebSocket send buffer still holds >24KB of
+    // un-ACKed audio frames, check after 1450ms whether packets are draining (weak LTE -> extend timer)
+    // or completely stuck (blackholed cell handoff -> abort zombie socket & replay immediately!).
+    if (wsBufferedBytes > 24000) {
+      const monitoredWs = this.ws;
+      this.uplinkMonitorTimer = setTimeout(() => {
+        this.uplinkMonitorTimer = null;
+        if (
+          !this.isActive ||
+          this.ws !== monitoredWs ||
+          this.tutorTurnActive ||
+          this.serverAckedCurrentUserTurn ||
+          this.wordTerminalActionLocked
+        ) {
+          return;
+        }
+        const curBuffered = monitoredWs.bufferedAmount || 0;
+        if (curBuffered >= wsBufferedBytes * 0.85) {
+          debugLogger.log(
+            'warn',
+            'zombie_uplink_stalled',
+            `WebSocket TCP send buffer stalled (${curBuffered}/${wsBufferedBytes} bytes un-ACKed); switching socket & replaying speech`,
+            { initialBuffered: wsBufferedBytes, currentBuffered: curBuffered }
+          );
+          this._recoverStalledTurnOnFreshSocket('zombie_uplink_stalled', micStats);
+        } else if (curBuffered > 0) {
+          // Weak cellular signal is actively draining bytes — allow extra time so upload completes!
+          this._armNoReplyTimer(2400, recoveryReasonTag, micStats);
+        }
+      }, 1450);
+    }
   }
 
   /**
-   * Deterministic recovery when `audioStreamEnd` stalls on the server (or when the user taps
-   * "Done Speaking" while waiting on a stalled turn):
-   * - If the user's Mandarin speech WAS transcribed (`activeUserTurnIndex >= 0`), opens a fresh
-   *   same-model (`rotationOffset = 0`) WebSocket with `this.wordTurns` seeded and triggers `Case 2`
-   *   (`clientContent` with `turnComplete: true`), avoiding `realtimeInput.text` 0-audio `turnComplete` loops!
-   * - If loud speech occurred with ZERO ASR text (wedged server audio recognizer), refreshes the
-   *   WebSocket via `Case 3` (`reconnect_resume_listening`) so the very next utterance is heard cleanly!
+   * Deterministic recovery when `audioStreamEnd` stalls on the server, hits a cellular dead spot,
+   * or when the user taps "Done Speaking" while waiting on a stalled turn:
+   * 1. If Mandarin speech WAS transcribed (`committedTurn.text.trim()`), advances via `Case 2A`
+   *    (`clientContent` with `turnComplete: true`) on a clean socket.
+   * 2. If audible speech was recorded locally (`lastCommittedPcmChunks`) with ZERO server ASR text
+   *    (`utteranceReplayAttempts < 1`), automatically replays the recorded 16kHz PCM audio on a
+   *    fresh socket (`Case 2B`) so the driver does NOT have to repeat themselves!
+   * 3. If replay was already attempted and still produced 0 ASR text (e.g. wind/cough), refreshes
+   *    the socket (`Case 3`) while keeping local mic capture live so the next attempt is heard cleanly.
    */
   _recoverStalledTurnOnFreshSocket(triggerReason = 'no_reply_auto_continue', micStats = null) {
     if (
@@ -1371,22 +1510,29 @@ export class GeminiLiveVoicePipeline {
     ) {
       return false;
     }
-    if (this.noReplyRecoveryTimer) {
-      clearTimeout(this.noReplyRecoveryTimer);
-      this.noReplyRecoveryTimer = null;
-    }
-
+    this._clearTurnTimers();
     this._commitPendingUserTranscriptToTurns();
+    this._pruneBlankTurns();
 
     const stats = micStats || this.lastCommittedMicStats || this._buildTurnMicTelemetry();
+    const lastIdx = this.wordTurns.length - 1;
     const committedTurn =
       this.activeUserTurnIndex >= 0 &&
       this.wordTurns[this.activeUserTurnIndex] &&
-      this.wordTurns[this.activeUserTurnIndex].role === 'user'
+      this.wordTurns[this.activeUserTurnIndex].role === 'user' &&
+      this.wordTurns[this.activeUserTurnIndex].text.trim()
         ? this.wordTurns[this.activeUserTurnIndex]
+        : lastIdx >= 0 &&
+          this.wordTurns[lastIdx].role === 'user' &&
+          this.wordTurns[lastIdx].text.trim()
+        ? this.wordTurns[lastIdx]
         : null;
 
     if (committedTurn && committedTurn.text.trim() && this.currentWord && this.lastLiveConfig) {
+      this.lastCommittedPcmChunks = null;
+      this.pendingCommittedReplayChunks = null;
+      this.consecutiveWedgedRefreshes = 0;
+
       debugLogger.log(
         'warn',
         'stalled_turn_socket_continue',
@@ -1416,18 +1562,77 @@ export class GeminiLiveVoicePipeline {
       return true;
     }
 
-    const hadAudibleSpeechAttempt =
-      triggerReason === 'manual_done_force' ||
-      triggerReason === 'manual_done_no_reply' ||
-      Boolean(stats && stats.rawMaxRms >= 0.085 && this.lastCommittedVoicedMs >= 500);
+    const canReplaySavedAudio =
+      Array.isArray(this.lastCommittedPcmChunks) &&
+      this.lastCommittedPcmChunks.length >= 4 &&
+      this.utteranceReplayAttempts < 1 &&
+      (triggerReason === 'zombie_uplink_stalled' ||
+        triggerReason === 'manual_done_no_reply' ||
+        triggerReason === 'manual_done_force' ||
+        Boolean(stats && stats.rawMaxRms >= 0.055 && this.lastCommittedVoicedMs >= 300));
 
-    if (hadAudibleSpeechAttempt && this.currentWord && this.lastLiveConfig) {
+    if (canReplaySavedAudio && this.currentWord && this.lastLiveConfig) {
+      this.pendingCommittedReplayChunks = this.lastCommittedPcmChunks;
+      this.lastCommittedPcmChunks = null;
+      this.consecutiveWedgedRefreshes += 1;
+      const rotationOffset = this.consecutiveWedgedRefreshes >= 2 ? 1 : 0;
+
       debugLogger.log(
         'warn',
         'wedged_asr_socket_refresh',
-        `Loud speech produced 0 ASR text (${triggerReason}); refreshing clean audio socket`,
+        `Audible speech produced 0 ASR text (${triggerReason}); replaying ${this.pendingCommittedReplayChunks.length} buffered chunks on clean socket`,
         {
           triggerReason,
+          replayChunks: this.pendingCommittedReplayChunks.length,
+          rotationOffset,
+          voicedMs: this.lastCommittedVoicedMs,
+          micStats: stats
+        }
+      );
+
+      this.listeningForUser = false;
+      this.isReconnecting = true;
+      this._closeRawSocketOnly();
+      this._emitState('connecting', 'Resending your speech...');
+
+      this._openSocketWithFallbacks(
+        this.currentWord,
+        this.lastLiveConfig,
+        this.wordTurns.length > 0,
+        rotationOffset
+      )
+        .then(() => {
+          this.isReconnecting = false;
+        })
+        .catch((err) => {
+          this.isReconnecting = false;
+          debugLogger.log('error', 'wedged_asr_replay_failed', err.message || String(err));
+          this._attemptAutoReconnect(1006, triggerReason);
+        });
+      return true;
+    }
+
+    const hadAudibleSpeechAttempt =
+      triggerReason === 'manual_done_force' ||
+      triggerReason === 'manual_done_no_reply' ||
+      triggerReason === 'replay_no_reply' ||
+      Boolean(stats && stats.rawMaxRms >= 0.055 && this.lastCommittedVoicedMs >= 300);
+
+    this.lastCommittedPcmChunks = null;
+    this.pendingCommittedReplayChunks = null;
+    this.utteranceReplayAttempts = 0;
+
+    if (hadAudibleSpeechAttempt && this.currentWord && this.lastLiveConfig) {
+      this.consecutiveWedgedRefreshes += 1;
+      const rotationOffset = this.consecutiveWedgedRefreshes >= 2 ? 1 : 0;
+
+      debugLogger.log(
+        'warn',
+        'wedged_asr_socket_refresh',
+        `Speech still had 0 ASR text after replay (${triggerReason}); refreshing audio socket`,
+        {
+          triggerReason,
+          rotationOffset,
           voicedMs: this.lastCommittedVoicedMs,
           micStats: stats
         }
@@ -1435,17 +1640,19 @@ export class GeminiLiveVoicePipeline {
       this.playChime('relisten');
       this.isReconnecting = true;
       this._closeRawSocketOnly();
-      this._emitState('connecting', 'Refreshing mic link...');
+      // Keep local microphone capture active EVEN while the new socket connects so if the driver
+      // immediately repeats their sentence, zero syllables are lost during handshake!
+      this._beginListeningTurn('Refreshing link — please say that again', true);
 
       this._openSocketWithFallbacks(
         this.currentWord,
         this.lastLiveConfig,
         this.wordTurns.length > 0,
-        0
+        rotationOffset
       )
         .then(() => {
           this.isReconnecting = false;
-          if (this.listeningForUser) {
+          if (this.listeningForUser && !this.userSpokeInTurn) {
             this._emitState('listening', 'Ready — please say that again');
           }
         })
@@ -1471,7 +1678,7 @@ export class GeminiLiveVoicePipeline {
     if (!this.isActive || this.wordTerminalActionLocked || this.pendingActionAfterPlayback) {
       return false;
     }
-    if (this.listeningForUser && this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.listeningForUser) {
       this.commitUserSpeechTurn('manual_done');
       return true;
     }
@@ -1541,6 +1748,15 @@ export class GeminiLiveVoicePipeline {
     this.currentTurnTutorTranscript = '';
     this.interruptedTutorPartialText = '';
     this.activeUserTurnIndex = -1;
+    this.idlePreRollBuffer = [];
+    this.pausePreRollBuffer = [];
+    this.currentTurnPcmChunks = [];
+    this.unsentLivePcmQueue = [];
+    this.lastCommittedPcmChunks = null;
+    this.pendingCommittedReplayChunks = null;
+    this.utteranceReplayAttempts = 0;
+    this.consecutiveWedgedRefreshes = 0;
+    this.pendingCustomPromptOnConnect = null;
     this.lastCommittedVoicedMs = 0;
     this.lastCommittedMicStats = null;
     this.serverAckedCurrentUserTurn = false;
@@ -1589,12 +1805,20 @@ export class GeminiLiveVoicePipeline {
       wordTurnsCount: this.wordTurns.length,
       interruptedTutorPartialText: this.interruptedTutorPartialText
     });
-    await this._openSocketWithFallbacks(this.currentWord, this.lastLiveConfig, true, 0);
+    await this._openSocketWithFallbacks(this.currentWord, this.lastLiveConfig, this.wordTurns.length > 0, 0);
+  }
+
+  _pruneBlankTurns() {
+    if (!Array.isArray(this.wordTurns) || this.wordTurns.length === 0) return;
+    this.wordTurns = this.wordTurns.filter((t) => t && String(t.text || '').trim());
+    if (this.activeUserTurnIndex >= this.wordTurns.length) {
+      this.activeUserTurnIndex = -1;
+    }
   }
 
   _commitPendingUserTranscriptToTurns() {
     const pendingUser = this._getCombinedLiveUserTranscript();
-    if (pendingUser) {
+    if (pendingUser && pendingUser.trim()) {
       if (
         this.activeUserTurnIndex >= 0 &&
         this.wordTurns[this.activeUserTurnIndex] &&
@@ -1617,9 +1841,14 @@ export class GeminiLiveVoicePipeline {
       this.wordTurns[this.activeUserTurnIndex] &&
       this.wordTurns[this.activeUserTurnIndex].role === 'user'
     ) {
-      this.wordTurns[this.activeUserTurnIndex].text += text;
+      if (text.trim() || this.wordTurns[this.activeUserTurnIndex].text.trim()) {
+        this.wordTurns[this.activeUserTurnIndex].text += text;
+      }
       return;
     }
+    // Never create a brand-new blank/whitespace-only user turn (`"U: "`)!
+    if (!text.trim()) return;
+
     const lastIdx = this.wordTurns.length - 1;
     if (lastIdx >= 0 && this.wordTurns[lastIdx].role === 'tutor' && !this.tutorTurnActive) {
       // Tutor turn already committed right before trailing user ASR arrived -> splice chronologically before tutor turn!
@@ -1645,16 +1874,49 @@ export class GeminiLiveVoicePipeline {
 
   /**
    * Distinguishes between a COMPLETED tutor turn (`turnComplete` already arrived) vs. an
-   * INTERRUPTED mid-sentence tutor turn (`tutorTurnActive === true` when the socket dropped!).
-   * Never marks an interrupted tutor utterance as a finished turn, so reconnect immediately
-   * finishes speaking instead of freezing in `listening`!
+   * INTERRUPTED mid-sentence tutor turn (`tutorTurnActive === true` when the socket dropped!),
+   * AND preserves any uncommitted/un-transcribed local user PCM speech for automatic replay!
    */
   _capturePreDisconnectState() {
-    this._commitPendingUserTranscriptToTurns();
+    if (
+      this.listeningForUser &&
+      this.userSpokeInTurn &&
+      Array.isArray(this.currentTurnPcmChunks) &&
+      this.currentTurnPcmChunks.length > 0
+    ) {
+      // Socket dropped while the driver is STILL mid-sentence!
+      // Do NOT commit a truncated half-sentence (`我考試`) to `wordTurns` — instead re-queue the
+      // ENTIRE utterance (`currentTurnPcmChunks` from the 500ms pre-roll onward) into `unsentLivePcmQueue`
+      // so the reconnected socket hears 100% of the sentence from syllable #1!
+      if (this.currentTurnUserTranscript.trim()) {
+        this.onTranscript('discard_last_user', '');
+      }
+      this.currentTurnUserTranscript = '';
+      this.currentTurnInterimUserTranscript = '';
+      this.unsentLivePcmQueue = this.currentTurnPcmChunks.slice();
+    } else {
+      this._commitPendingUserTranscriptToTurns();
+    }
+
+    this._pruneBlankTurns();
     const partialTutor = this.currentTurnTutorTranscript.trim();
     if (partialTutor) {
       this.interruptedTutorPartialText = partialTutor;
       this.currentTurnTutorTranscript = '';
+    }
+
+    const lastTurn = this.wordTurns.length > 0 ? this.wordTurns[this.wordTurns.length - 1] : null;
+    if (
+      !this.tutorTurnActive &&
+      !this.interruptedTutorPartialText &&
+      !this.listeningForUser &&
+      (!lastTurn || lastTurn.role !== 'user') &&
+      Array.isArray(this.lastCommittedPcmChunks) &&
+      this.lastCommittedPcmChunks.length >= 4 &&
+      this.utteranceReplayAttempts < 1
+    ) {
+      this.pendingCommittedReplayChunks = this.lastCommittedPcmChunks;
+      this.lastCommittedPcmChunks = null;
     }
   }
 
@@ -1743,7 +2005,7 @@ export class GeminiLiveVoicePipeline {
         await this._openSocketWithFallbacks(
           this.currentWord,
           this.lastLiveConfig,
-          true,
+          this.wordTurns.length > 0,
           modelRotationOffset
         );
         this.isReconnecting = false;
@@ -1796,18 +2058,22 @@ export class GeminiLiveVoicePipeline {
         return;
       } catch (errExt) {
         lastErr = errExt;
-        try {
-          await this._connectSingleModelSocket(word, apiKey, modelId, voiceName, false, isReconnect);
-          return;
-        } catch (errMin) {
-          lastErr = errMin;
-          debugLogger.log(
-            'warn',
-            'model_setup_fallback',
-            `Model ${modelId} failed setup; trying next candidate`,
-            { error: errMin.message || String(errMin) }
-          );
+        // Only retry the same model with `useExtendedConfig = false` if the server explicitly rejected
+        // the setup schema (`1007` / `1008`) — NOT when cellular timed out or dropped with `1006`!
+        if (errExt && errExt.isSetupSchemaRejection) {
+          try {
+            await this._connectSingleModelSocket(word, apiKey, modelId, voiceName, false, isReconnect);
+            return;
+          } catch (errMin) {
+            lastErr = errMin;
+          }
         }
+        debugLogger.log(
+          'warn',
+          'model_setup_fallback',
+          `Model ${modelId} failed setup; trying next candidate`,
+          { error: lastErr ? lastErr.message || String(lastErr) : 'unknown' }
+        );
       }
     }
     throw lastErr || new Error('Unable to establish Gemini Live WebSocket connection.');
@@ -1883,6 +2149,7 @@ export class GeminiLiveVoicePipeline {
         isReconnect
       });
 
+      const setupTimeoutMs = isReconnect ? 5000 : 7000;
       const setupTimeout = setTimeout(() => {
         if (!setupCompleted) {
           debugLogger.log('warn', 'ws_setup_timeout', `Timeout waiting for setupComplete on ${modelId}`);
@@ -1891,7 +2158,7 @@ export class GeminiLiveVoicePipeline {
           } catch (_) {}
           reject(new Error(`Timeout waiting for setupComplete on ${modelId}`));
         }
-      }, 8500);
+      }, setupTimeoutMs);
 
       ws.onopen = () => {
         const generationConfig = {
@@ -1910,6 +2177,8 @@ export class GeminiLiveVoicePipeline {
             thinkingBudget: 0
           };
         }
+
+        this._pruneBlankTurns();
 
         // Pure Speech-to-Speech setup: NO `tools` array!
         // Prevents 100% of Live API `1011 Internal error occurred` and `1007` tool-call crashes.
@@ -1963,7 +2232,22 @@ export class GeminiLiveVoicePipeline {
               isReconnect
             });
 
+            this._pruneBlankTurns();
             const lastTurn = this.wordTurns.length > 0 ? this.wordTurns[this.wordTurns.length - 1] : null;
+
+            // Case 0: Explicit button action queued on a clean socket (Repeat Last Prompt / Hint)
+            if (this.pendingCustomPromptOnConnect) {
+              const custom = this.pendingCustomPromptOnConnect;
+              this.pendingCustomPromptOnConnect = null;
+              this.isPhase1InitialTurn = false;
+              this.tutorTurnActive = true;
+              this.listeningForUser = false;
+              this.turnCommitPerfMs = performance.now();
+              this._emitState('speaking', custom.statusText || 'Tutor speaking...');
+              this._sendPromptTurn(ws, modelId, custom.text, custom.tag || 'custom_prompt', custom.extra || {});
+              resolve();
+              return;
+            }
 
             // Case 1: Reconnecting after the tutor crashed MID-SENTENCE before `turnComplete`!
             if (isReconnect && this.interruptedTutorPartialText) {
@@ -1982,8 +2266,10 @@ export class GeminiLiveVoicePipeline {
               return;
             }
 
-            // Case 2: Reconnecting after the user spoke (tutor hadn't started speaking yet)
-            if (isReconnect && lastTurn && lastTurn.role === 'user') {
+            // Case 2A: Reconnecting after the user's Mandarin speech WAS already transcribed
+            if (isReconnect && lastTurn && lastTurn.role === 'user' && lastTurn.text.trim()) {
+              this.pendingCommittedReplayChunks = null;
+              this.lastCommittedPcmChunks = null;
               this.isPhase1InitialTurn = false;
               this.tutorTurnActive = true;
               this.listeningForUser = false;
@@ -1997,14 +2283,78 @@ export class GeminiLiveVoicePipeline {
               return;
             }
 
+            // Case 2B: Automatic Utterance Audio Replay — user spoke during a cellular drop / zombie socket
+            // where server ASR received 0 text, so we replay their locally buffered 16kHz PCM automatically!
+            if (
+              Array.isArray(this.pendingCommittedReplayChunks) &&
+              this.pendingCommittedReplayChunks.length > 0
+            ) {
+              const replayChunks = this.pendingCommittedReplayChunks;
+              this.pendingCommittedReplayChunks = null;
+              this.utteranceReplayAttempts += 1;
+              this.isPhase1InitialTurn = false;
+              this.tutorTurnActive = false;
+              this.listeningForUser = false;
+              this.serverAckedCurrentUserTurn = false;
+              this.sentAudioChunksInTurn = 0;
+              this.turnCommitPerfMs = performance.now();
+
+              debugLogger.log(
+                'warn',
+                'utterance_audio_replayed',
+                `Replaying ${replayChunks.length} buffered 16kHz PCM chunks (${(
+                  replayChunks.length * 0.1
+                ).toFixed(1)}s) on fresh socket`,
+                {
+                  chunks: replayChunks.length,
+                  replayAttempt: this.utteranceReplayAttempts,
+                  modelId
+                }
+              );
+
+              this._emitState('connecting', 'Processing your Mandarin...');
+              for (const chunk of replayChunks) {
+                this._sendRawAudioChunkOnSocket(ws, chunk);
+              }
+              this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
+              this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
+              this._flushAudioStreamEnd(ws);
+              this._armNoReplyTimer(3400, 'replay_no_reply', this.lastCommittedMicStats);
+              resolve();
+              return;
+            }
+
             // Case 3: Reconnecting after a COMPLETED tutor turn (user's turn to speak)
             if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
               this.isPhase1InitialTurn = false;
               this.turnExpectation = deriveTurnExpectationFromHistory(this.wordTurns);
+
+              // If the driver ALREADY started speaking while the socket was mid-reconnect,
+              // flush their queued live PCM chunks without resetting their in-progress utterance!
+              if (
+                this.listeningForUser &&
+                (this.userSpokeInTurn || this.unsentLivePcmQueue.length > 0)
+              ) {
+                const queuedCount = this.unsentLivePcmQueue.length;
+                const queued = this.unsentLivePcmQueue.splice(0, queuedCount);
+                for (const qChunk of queued) {
+                  this._sendRawAudioChunkOnSocket(ws, qChunk);
+                }
+                debugLogger.log(
+                  'info',
+                  'reconnect_flushed_live_speech',
+                  `Flushed ${queuedCount} live speech chunks captured during reconnect`,
+                  { queuedCount, turnExpectation: this.turnExpectation }
+                );
+                this._emitState('listening', 'Hearing your Mandarin...');
+                resolve();
+                return;
+              }
+
               debugLogger.log('info', 'reconnect_resume_listening', 'Tutor turn was already complete; resuming user listening', {
                 turnExpectation: this.turnExpectation
               });
-              this._beginListeningTurn();
+              this._beginListeningTurn(null, true);
               resolve();
               return;
             }
@@ -2060,7 +2410,11 @@ export class GeminiLiveVoicePipeline {
             `WebSocket closed during setup (${code}: ${reason || 'setup rejected'}) on ${modelId}`,
             { code, reason, wasClean, modelId, useExtendedConfig }
           );
-          reject(new Error(`WebSocket closed (${code}: ${reason || 'setup rejected'}) on ${modelId}`));
+          const setupErr = new Error(
+            `WebSocket closed (${code}: ${reason || 'setup rejected'}) on ${modelId}`
+          );
+          setupErr.isSetupSchemaRejection = code === 1007 || code === 1008;
+          reject(setupErr);
           return;
         }
 
@@ -2124,7 +2478,10 @@ export class GeminiLiveVoicePipeline {
     this.turnRawMaxRms = 0;
     this.turnRawSumRms = 0;
     this.silenceFramesSentInPause = 0;
+    this.idlePreRollBuffer = [];
     this.pausePreRollBuffer = [];
+    this.currentTurnPcmChunks = [];
+    this.unsentLivePcmQueue = [];
     this.sentAudioChunksInTurn = 0;
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
@@ -2152,6 +2509,7 @@ export class GeminiLiveVoicePipeline {
     // Close WebSocket cleanly right away while WebAudio plays out the remaining farewell speech!
     this._closeRawSocketOnly();
 
+    this._pruneBlankTurns();
     const turnsSnapshot = this.wordTurns.map((t) => ({ role: t.role, text: t.text }));
     const usedHint = this.usedHintInWord;
 
@@ -2174,10 +2532,12 @@ export class GeminiLiveVoicePipeline {
 
   _markTutorTurnStartedFromServer() {
     this.serverAckedCurrentUserTurn = true;
-    if (this.noReplyRecoveryTimer) {
-      clearTimeout(this.noReplyRecoveryTimer);
-      this.noReplyRecoveryTimer = null;
-    }
+    this._clearTurnTimers();
+    this.lastCommittedPcmChunks = null;
+    this.pendingCommittedReplayChunks = null;
+    this.utteranceReplayAttempts = 0;
+    this.consecutiveWedgedRefreshes = 0;
+
     if (!this.tutorTurnActive) {
       if (this.listeningForUser) {
         // Server-side automatic VAD committed the user's turn
@@ -2247,31 +2607,41 @@ export class GeminiLiveVoicePipeline {
       }
 
       if (sc.interimInputTranscription && sc.interimInputTranscription.text) {
-        this.currentTurnInterimUserTranscript = sc.interimInputTranscription.text;
+        if (
+          sc.interimInputTranscription.text.trim() ||
+          this.currentTurnInterimUserTranscript.trim()
+        ) {
+          this.currentTurnInterimUserTranscript = sc.interimInputTranscription.text;
+        }
       }
 
       if (sc.inputTranscription && sc.inputTranscription.text) {
         const text = sc.inputTranscription.text;
+        const hasNonSpace = Boolean(text.trim());
         this.currentTurnInterimUserTranscript = '';
-        debugLogger.appendStream('info', 'input_transcript', text);
+        if (hasNonSpace) {
+          debugLogger.appendStream('info', 'input_transcript', text);
+        }
 
         if (this.listeningForUser) {
-          this.currentTurnUserTranscript += text;
-          this.onTranscript('user', text);
-          // IMPORTANT: Do NOT reset `lastVoiceActivityTime` if `userSpokeInTurn` is already true!
-          // `inputTranscription` chunks arrive 800-1800ms AFTER acoustic speech pauses, which previously
-          // restarted the post-speech silence timer and added ~1.5-2.0s of extra lag on every turn.
-          if (!this.userSpokeInTurn) {
+          // Ignore standalone whitespace-only tokens (`" "`) when no words have been transcribed yet
+          // so ambient noise never creates fake `"U: "` turns or hijacks `userSpokeInTurn`!
+          if (hasNonSpace || this.currentTurnUserTranscript.trim()) {
+            this.currentTurnUserTranscript += text;
+            this.onTranscript('user', text);
+          }
+          if (hasNonSpace && !this.userSpokeInTurn) {
             this.userSpokeInTurn = true;
             this.speechSegmentsInTurn = Math.max(1, this.speechSegmentsInTurn);
             this.lastVoiceActivityTime = performance.now();
           }
         } else {
           // Late `inputTranscription` arriving AFTER `commitUserSpeechTurn` / during tutor reply:
-          // Append directly onto the active user turn in `this.wordTurns` so trailing characters
-          // (e.g. `子` in `這樣子`) are never lost when `_beginListeningTurn()` resets the live buffer!
+          // Append directly onto the active user turn in `this.wordTurns` (ignoring standalone spaces).
           this._appendLateUserTranscriptToTurns(text);
-          this.onTranscript('late_user_append', text);
+          if (hasNonSpace) {
+            this.onTranscript('late_user_append', text);
+          }
         }
       }
 
@@ -2536,32 +2906,124 @@ export class GeminiLiveVoicePipeline {
   }
 
   /**
-   * Sends a text command into the active Live session (e.g., if the user taps "Repeat" or "Hint")
+   * Repeats ONLY the tutor's most recent completed prompt/question/correction and continues
+   * from the current conversation phase — NEVER resetting back to Phase 1 unless the session
+   * is currently at the initial Phase 1 English prompt!
+   */
+  repeatLastTutorPrompt(source = 'button') {
+    if (!this.isActive || this.wordTerminalActionLocked || !this.currentWord) {
+      return false;
+    }
+
+    this._pruneBlankTurns();
+    let lastTutorText = '';
+    let tutorTurnsCount = 0;
+    for (const t of this.wordTurns) {
+      if (t && t.role === 'tutor' && String(t.text || '').trim()) {
+        tutorTurnsCount += 1;
+        lastTutorText = String(t.text).trim();
+      }
+    }
+
+    debugLogger.log(
+      'info',
+      'repeat_last_prompt',
+      `Repeating last tutor prompt (${source}, tutorTurns=${tutorTurnsCount})`,
+      {
+        source,
+        tutorTurnsCount,
+        phase: debugLogger.context.phase || 1,
+        turnExpectation: this.turnExpectation,
+        lastTutorPreview: lastTutorText ? lastTutorText.slice(0, 80) : null
+      }
+    );
+
+    const isBeyondInitialPrompt =
+      Boolean(lastTutorText) &&
+      (tutorTurnsCount > 1 ||
+        this.turnExpectation !== 'translate' ||
+        (debugLogger.context.phase || 1) >= 2);
+
+    const repeatInstruction = isBeyondInitialPrompt
+      ? `請直接用自然慢速的台灣華語，清楚重複你剛才最後對我說的那句話或問題：「${lastTutorText}」。絕對不要退回第一階段重新唸英文題目，重複完後請維持目前的練習進度繼續等待我回答！`
+      : `請再用正常英文語速與自然慢速台灣華語，清楚重複一次這題的英文句子與提示：\n${this.currentWord.english_prompt} 請試著把這句話翻成中文。`;
+
+    this.sendTextCommand(repeatInstruction, {
+      tag: 'repeat_last_prompt',
+      statusText: 'Repeating last prompt...',
+      discardPendingUser: true
+    });
+    return true;
+  }
+
+  /**
+   * Sends a text command into the active Live session (e.g., if the user taps "Repeat" or "Hint").
+   * Automatically opens a clean same-model socket when `realtimeInput.audio` has already streamed
+   * on Gemini 2.5 or when the current socket is disconnected/backed-up, guaranteeing 100% audible output.
    */
   sendTextCommand(text, options = {}) {
-    if (this.wordTerminalActionLocked) return;
+    if (!this.isActive || this.wordTerminalActionLocked) return;
     if (options.isHint) {
       this.usedHintInWord = true;
     }
-    if (this.noReplyRecoveryTimer) {
-      clearTimeout(this.noReplyRecoveryTimer);
-      this.noReplyRecoveryTimer = null;
+    this._clearTurnTimers();
+
+    if (options.discardPendingUser) {
+      this.currentTurnUserTranscript = '';
+      this.currentTurnInterimUserTranscript = '';
+      this.idlePreRollBuffer = [];
+      this.pausePreRollBuffer = [];
+      this.currentTurnPcmChunks = [];
+      this.unsentLivePcmQueue = [];
+      this.lastCommittedPcmChunks = null;
+      this.pendingCommittedReplayChunks = null;
+      this._pruneBlankTurns();
+    } else {
+      this._commitPendingUserTranscriptToTurns();
     }
-    this._commitPendingUserTranscriptToTurns();
+
+    this.stopPlaybackImmediately();
     this.isPhase1InitialTurn = false;
     this.silentTurnRetries = 0;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      if (this.isDisconnected() && this.currentWord) {
-        this.reconnectCurrentWord().catch(() => {});
-      }
-      return;
-    }
-    this._flushAudioStreamEnd();
     this.listeningForUser = false;
+    this.userSpokeInTurn = false;
     this.tutorTurnActive = true;
     this.turnCommitPerfMs = performance.now();
-    this._emitState('connecting', 'Requesting from tutor...');
-    this._sendPromptTurn(this.ws, this.activeModelId, text, 'user_button_command');
+
+    const tag = options.tag || 'user_button_command';
+    const statusText = options.statusText || 'Requesting from tutor...';
+
+    const socketHealthyForDirectPrompt =
+      Boolean(this.ws && this.ws.readyState === WebSocket.OPEN) &&
+      (this.ws.bufferedAmount || 0) === 0 &&
+      !(String(this.activeModelId || '').includes('2.5') && this.hasSentRealtimeAudioOnSocket);
+
+    if (socketHealthyForDirectPrompt) {
+      this._emitState('connecting', statusText);
+      this._sendPromptTurn(this.ws, this.activeModelId, text, tag);
+      return;
+    }
+
+    if (this.currentWord && this.lastLiveConfig) {
+      this.pendingCustomPromptOnConnect = { text, tag, statusText };
+      this.isReconnecting = true;
+      this._closeRawSocketOnly();
+      this._emitState('connecting', statusText);
+      this._openSocketWithFallbacks(
+        this.currentWord,
+        this.lastLiveConfig,
+        this.wordTurns.length > 0,
+        0
+      )
+        .then(() => {
+          this.isReconnecting = false;
+        })
+        .catch((err) => {
+          this.isReconnecting = false;
+          debugLogger.log('error', 'button_command_socket_failed', err.message || String(err));
+          this._attemptAutoReconnect(1006, tag);
+        });
+    }
   }
 
   _enqueuePcm24kAudio(base64Data) {
@@ -2645,10 +3107,7 @@ export class GeminiLiveVoicePipeline {
   }
 
   _closeRawSocketOnly() {
-    if (this.noReplyRecoveryTimer) {
-      clearTimeout(this.noReplyRecoveryTimer);
-      this.noReplyRecoveryTimer = null;
-    }
+    this._clearTurnTimers();
     this.hasUnflushedAudio = false;
     if (this.ws) {
       try {
@@ -2670,6 +3129,13 @@ export class GeminiLiveVoicePipeline {
     this.userSpokeInTurn = false;
     this.pendingActionAfterPlayback = null;
     this.interruptedTutorPartialText = '';
+    this.idlePreRollBuffer = [];
+    this.pausePreRollBuffer = [];
+    this.currentTurnPcmChunks = [];
+    this.unsentLivePcmQueue = [];
+    this.lastCommittedPcmChunks = null;
+    this.pendingCommittedReplayChunks = null;
+    this.pendingCustomPromptOnConnect = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

@@ -14,12 +14,12 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=22';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=23';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=22';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=22';
+} from './live-audio.js?v=23';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=23';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
@@ -47,13 +47,17 @@ function hasMorphologicalRootOfTarget(userTxt = '', target = '') {
  * - Real spoiler hints / surrenders or real pronunciation/tone/grammar corrections on `targetTraditional` itself.
  */
 export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
-  const turns = Array.isArray(wordTurns) ? wordTurns : [];
+  const turns = (Array.isArray(wordTurns) ? wordTurns : []).filter(
+    (item) => item && String(item.text || '').trim()
+  );
   const target = String(targetTraditional || '').trim();
   const targetChars = target ? Array.from(new Set([...target])) : [];
   const escapedCharClass = targetChars.map((ch) => escapeRegExp(ch)).join('');
 
   const surrenderRe =
     /給我提示|\bhint\b|給我答案|直接告訴我|我不知道|不知道怎麼翻|整句怎麼說|想不起來|忘了怎麼說/i;
+  const repeatRequestRe =
+    /^(再說一次|再講一次|再唸一次|請再說一次|請再講一次|請重複一次|重複一次|可以再說一次嗎|沒聽清楚|聽不清楚|再聽一次|再說一次英文|repeat|say that again|repeat that|can you repeat that)[。！？!?\s]*$/i;
 
   let synonymRedirects = 0;
   let nonTargetCorrections = 0;
@@ -93,6 +97,13 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
     seenTutorTurns += 1;
     if (seenTutorTurns === 1) continue; // Skip initial Phase 1 English prompt turn
 
+    // If the user pressed the Repeat button (two consecutive tutor turns with no user turn in between),
+    // never double-count the repeated prompt as an extra error!
+    const immediatePrevTurn = i > 0 ? turns[i - 1] : null;
+    if (immediatePrevTurn && immediatePrevTurn.role === 'tutor') {
+      continue;
+    }
+
     const txt = t.text;
     const isRetryTurn =
       /把這句話翻成中文|翻成中文|再說一次|再完整說一次|重新說一次|再唸一次|整句話|整句說|整句回答|把你的回答|完整的句子|試著用|試著換|換成(我們)?今天|換成另|給你一點提示|提示你一下/.test(
@@ -119,6 +130,12 @@ export function analyzeTurnCorrections(wordTurns = [], targetTraditional = '') {
         prevUserTxt = turns[j].text;
         break;
       }
+    }
+
+    // If the student merely asked the tutor to repeat its last prompt due to road noise (`再說一次` / `Repeat`),
+    // the tutor's repeated prompt is NOT a new mistake or spoiler!
+    if (repeatRequestRe.test(prevUserTxt.trim())) {
+      continue;
     }
 
     const prevUserHadTarget = target ? prevUserTxt.includes(target) : false;
@@ -655,7 +672,7 @@ export class MandarinTutorApp {
     }
     this.els.btnPauseResume.addEventListener('click', () => this.togglePauseSession());
     this.els.btnRepeatPrompt.addEventListener('click', () => {
-      this.pipeline.sendTextCommand('請再用正常語速清楚唸一次這題的英文句子。');
+      this.pipeline.repeatLastTutorPrompt('button');
     });
     this.els.btnHint.addEventListener('click', () => {
       this.pipeline.sendTextCommand(
@@ -1269,9 +1286,9 @@ export class MandarinTutorApp {
       const ordered = [];
       const preferredMatchers = [
         /gemini-2\.5-flash$/i,
-        /gemini-3(\.\d+)?-flash(-preview)?$/i,
-        /gemini-2\.5-flash/i,
         /flash-lite/i,
+        /gemini-2\.5-flash/i,
+        /gemini-3(\.\d+)?-flash(-preview)?$/i,
         /flash/i
       ];
       for (const rx of preferredMatchers) {
@@ -1293,7 +1310,7 @@ export class MandarinTutorApp {
     } finally {
       clearTimeout(timer);
     }
-    return ['models/gemini-2.5-flash', 'models/gemini-3-flash-preview', 'models/gemini-3.1-flash-lite-preview'];
+    return ['models/gemini-2.5-flash', 'models/gemini-3.1-flash-lite-preview', 'models/gemini-3-flash-preview'];
   }
 
   async _requestGradingJsonFromModel(modelName, apiKey, gradingPrompt, signal) {
@@ -1342,10 +1359,11 @@ export class MandarinTutorApp {
     }
 
     const startMs = performance.now();
-    const candidates = await this._discoverFastGradingCandidates(apiKey);
+    const candidates = (await this._discoverFastGradingCandidates(apiKey)).slice();
 
     try {
       const dialogueText = wordTurns
+        .filter((t) => t && String(t.text || '').trim())
         .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
         .join('\n');
 
@@ -1389,10 +1407,11 @@ ${dialogueText}`;
       for (let i = 0; i < Math.min(3, candidates.length); i++) {
         usedModel = candidates[i];
         const modelCtrl = new AbortController();
-        const modelTimer = setTimeout(
-          () => modelCtrl.abort(new Error(`grading_timeout_6s (${usedModel})`)),
-          6000
-        );
+        let timedOut = false;
+        const modelTimer = setTimeout(() => {
+          timedOut = true;
+          modelCtrl.abort(new Error(`grading_timeout_6s (${usedModel})`));
+        }, 6000);
         try {
           parsed = await this._requestGradingJsonFromModel(
             usedModel,
@@ -1404,7 +1423,11 @@ ${dialogueText}`;
           break;
         } catch (errTry) {
           lastErr = errTry;
-          if (errTry.httpStatus === 404 && Array.isArray(this.cachedGradingCandidates)) {
+          if (
+            (errTry.httpStatus === 404 || timedOut) &&
+            Array.isArray(this.cachedGradingCandidates) &&
+            this.cachedGradingCandidates.length > 1
+          ) {
             this.cachedGradingCandidates = this.cachedGradingCandidates.filter(
               (m) => m !== usedModel
             );
@@ -1679,6 +1702,15 @@ ${dialogueText}`;
     if (role === 'discard_last_tutor') {
       const lastIdx = this.transcriptHistory.length - 1;
       if (lastIdx >= 0 && this.transcriptHistory[lastIdx].role === 'tutor') {
+        this.transcriptHistory.pop();
+        this.renderTranscriptFeed();
+      }
+      return;
+    }
+
+    if (role === 'discard_last_user') {
+      const lastIdx = this.transcriptHistory.length - 1;
+      if (lastIdx >= 0 && this.transcriptHistory[lastIdx].role === 'user' && !this.transcriptHistory[lastIdx].finalized) {
         this.transcriptHistory.pop();
         this.renderTranscriptFeed();
       }
