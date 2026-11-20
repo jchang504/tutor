@@ -2,18 +2,20 @@
  * Persistent Structured Debug Logger for Mandarin Driving Tutor (`debug-logger.js`)
  *
  * Designed for hands-free mobile debugging on Pixel 9 without needing USB `chrome://inspect`:
- * - Persists a ring buffer of structured protocol, VAD, tool-call, hidden model-thought,
- *   and WebSocket close/error events in `localStorage` across disconnects and reloads.
+ * - Persists a 400-event ring buffer of structured speech, cellular/network, audio routing,
+ *   utterance replay, steering/button control, and WebSocket events in `localStorage`.
+ * - Tracks live Android Chrome `navigator.connection` (cellular 4G/5G RTT, downlink Mbps,
+ *   online/offline drops) and app visibility transitions for in-car diagnostics.
  * - Strictly redacts API keys, backend secrets, and private Apps Script URLs.
- * - Coalesces streaming transcript & model-thought deltas into single turn entries so
- *   an entire multi-word session fits cleanly in storage and is easy for Gemini to analyze.
- * - Formats a paste-ready Markdown diagnostic bundle for 1-tap sharing with Gemini.
+ * - Coalesces streaming transcript & model-thought deltas and formats a compact, truncation-proof
+ *   Markdown diagnostic bundle (`<18KB`) for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v23';
+export const APP_VERSION = 'v24';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
+const MAX_THOUGHT_TEXT_LEN = 420;
 
 export function redactSecrets(value) {
   if (value === null || value === undefined) return value;
@@ -43,6 +45,51 @@ export function redactSecrets(value) {
   return value;
 }
 
+/**
+ * Captures a compact snapshot of the browser's current network / cellular radio state
+ * (`navigator.onLine` + Android Chrome `NetworkInformation` API).
+ */
+export function getNetworkSnapshot() {
+  if (typeof navigator === 'undefined') {
+    return { online: true };
+  }
+  const snap = {
+    online: navigator.onLine !== false
+  };
+  const conn =
+    navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+  if (conn) {
+    if (conn.type && conn.type !== 'unknown') snap.type = conn.type;
+    if (conn.effectiveType) snap.eff = conn.effectiveType;
+    if (typeof conn.rtt === 'number' && conn.rtt >= 0) snap.rttMs = conn.rtt;
+    if (typeof conn.downlink === 'number' && conn.downlink >= 0) {
+      snap.dlMbps = Number(conn.downlink.toFixed(2));
+    }
+  }
+  return snap;
+}
+
+export function formatNetworkSummary(snap = getNetworkSnapshot()) {
+  if (!snap || snap.online === false) return 'OFFLINE';
+  const parts = ['online'];
+  if (snap.type) parts.push(snap.type);
+  const details = [];
+  if (snap.eff) details.push(snap.eff);
+  if (typeof snap.rttMs === 'number') details.push(`rtt=${snap.rttMs}ms`);
+  if (typeof snap.dlMbps === 'number') details.push(`dl=${snap.dlMbps}Mbps`);
+  return details.length > 0 ? `${parts.join(' · ')} (${details.join(', ')})` : parts.join(' · ');
+}
+
+function shortModelTag(model = '') {
+  const clean = String(model || '').replace(/^models\//, '');
+  if (!clean) return '';
+  if (clean === 'gemini-2.5-flash-native-audio-preview-12-2025') return '2.5-native-1225';
+  if (clean === 'gemini-2.5-flash-native-audio-latest') return '2.5-native-latest';
+  if (clean === 'gemini-3.1-flash-live-preview') return '3.1-flash-live';
+  if (clean === 'gemini-3.8-live') return '3.8-live';
+  return clean.replace(/^gemini-/, '');
+}
+
 class DebugLogger {
   constructor() {
     this.bootPerfMs = typeof performance !== 'undefined' ? performance.now() : 0;
@@ -61,8 +108,19 @@ class DebugLogger {
     this.flushTimer = null;
     this.listeners = new Set();
 
+    this._offlineSincePerfMs = null;
+    this._hiddenSincePerfMs = null;
+    this._lastNetSig = '';
+    this._lastNetLogPerfMs = -10000;
+
     this._loadFromStorage();
     this._installGlobalHandlers();
+  }
+
+  _nowPerfMs() {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
   }
 
   _loadFromStorage() {
@@ -117,7 +175,8 @@ class DebugLogger {
   }
 
   _installGlobalHandlers() {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+
     window.addEventListener('error', (ev) => {
       this.log('error', 'window_error', ev.message || 'Uncaught window error', {
         filename: ev.filename || '',
@@ -125,11 +184,91 @@ class DebugLogger {
         colno: ev.colno || 0
       });
     });
+
     window.addEventListener('unhandledrejection', (ev) => {
       const reason = ev.reason;
-      const msg = reason && reason.message ? reason.message : String(reason || 'Unhandled rejection');
+      const msg =
+        reason && reason.message ? reason.message : String(reason || 'Unhandled rejection');
       this.log('error', 'unhandled_rejection', msg);
     });
+
+    window.addEventListener('offline', () => {
+      this._offlineSincePerfMs = this._nowPerfMs();
+      this.log('warn', 'network_offline', 'Device lost internet connectivity', getNetworkSnapshot());
+    });
+
+    window.addEventListener('online', () => {
+      const offlineMs =
+        this._offlineSincePerfMs !== null
+          ? Math.round(this._nowPerfMs() - this._offlineSincePerfMs)
+          : null;
+      this._offlineSincePerfMs = null;
+      this.log('info', 'network_online', `Device regained internet${offlineMs !== null ? ` after ${offlineMs}ms` : ''}`, {
+        ...(offlineMs !== null ? { offlineMs } : {}),
+        ...getNetworkSnapshot()
+      });
+    });
+
+    if (typeof navigator !== 'undefined') {
+      const conn =
+        navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+      if (conn && typeof conn.addEventListener === 'function') {
+        const initSnap = getNetworkSnapshot();
+        const initDegraded =
+          (typeof initSnap.rttMs === 'number' && initSnap.rttMs >= 450) ||
+          (typeof initSnap.dlMbps === 'number' && initSnap.dlMbps > 0 && initSnap.dlMbps < 0.8) ||
+          initSnap.eff === '2g' ||
+          initSnap.eff === 'slow-2g';
+        this._lastNetSig = `${initSnap.type || ''}:${initSnap.eff || ''}:${initDegraded ? 'deg' : 'ok'}`;
+
+        conn.addEventListener('change', () => {
+          if (this.context.connectionState === 'idle') return;
+          const snap = getNetworkSnapshot();
+          const degraded =
+            !snap.online ||
+            (typeof snap.rttMs === 'number' && snap.rttMs >= 450) ||
+            (typeof snap.dlMbps === 'number' && snap.dlMbps > 0 && snap.dlMbps < 0.8) ||
+            snap.eff === '2g' ||
+            snap.eff === 'slow-2g';
+          const sig = `${snap.type || ''}:${snap.eff || ''}:${degraded ? 'deg' : 'ok'}`;
+          const now = this._nowPerfMs();
+          if (sig === this._lastNetSig || now - this._lastNetLogPerfMs < 2500) return;
+          this._lastNetSig = sig;
+          this._lastNetLogPerfMs = now;
+          this.log(
+            degraded ? 'warn' : 'info',
+            degraded ? 'network_degraded' : 'network_changed',
+            degraded
+              ? `Cellular/network quality degraded (${formatNetworkSummary(snap)})`
+              : `Network state changed (${formatNetworkSummary(snap)})`,
+            snap
+          );
+        });
+      }
+    }
+
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (this.context.connectionState === 'idle') return;
+        if (document.visibilityState === 'hidden') {
+          this._hiddenSincePerfMs = this._nowPerfMs();
+          this.log('info', 'app_visibility', 'App moved to background (hidden)');
+        } else if (document.visibilityState === 'visible') {
+          const hiddenMs =
+            this._hiddenSincePerfMs !== null
+              ? Math.round(this._nowPerfMs() - this._hiddenSincePerfMs)
+              : null;
+          this._hiddenSincePerfMs = null;
+          this.log(
+            'info',
+            'app_visibility',
+            `App returned to foreground${hiddenMs !== null ? ` (${hiddenMs}ms hidden)` : ''}`,
+            hiddenMs !== null ? { hiddenMs } : null
+          );
+        }
+      });
+    }
+
     window.addEventListener('pagehide', () => {
       this._saveToStorageImmediate();
     });
@@ -190,8 +329,9 @@ class DebugLogger {
   appendStream(level, event, deltaText, extraData = null) {
     if (!deltaText) return;
     const cleanDelta = redactSecrets(String(deltaText));
+    const maxLen = event === 'model_thought' ? MAX_THOUGHT_TEXT_LEN : MAX_STREAM_TEXT_LEN;
     const nowIso = new Date().toISOString();
-    const relMs = Math.round((typeof performance !== 'undefined' ? performance.now() : 0) - this.bootPerfMs);
+    const relMs = Math.round(this._nowPerfMs() - this.bootPerfMs);
 
     // Search last 4 entries for an active stream of the same event & word
     for (let i = this.entries.length - 1; i >= Math.max(0, this.entries.length - 4); i--) {
@@ -204,13 +344,18 @@ class DebugLogger {
         candidate.tsEnd = nowIso;
         candidate.relEndMs = relMs;
         candidate.chunks = (candidate.chunks || 1) + 1;
-        candidate.totalChars = (candidate.totalChars || candidate.summary.length) + cleanDelta.length;
-        if (candidate.summary.length < MAX_STREAM_TEXT_LEN) {
-          const remaining = MAX_STREAM_TEXT_LEN - candidate.summary.length;
+        candidate.totalChars =
+          (candidate.totalChars || candidate.summary.length) + cleanDelta.length;
+        if (!candidate._capped && candidate.summary.length < maxLen) {
+          const remaining = maxLen - candidate.summary.length;
           candidate.summary += cleanDelta.slice(0, remaining);
           if (cleanDelta.length > remaining) {
-            candidate.summary += ' …[truncated]';
+            candidate.summary += ' …';
+            candidate._capped = true;
           }
+        }
+        if (extraData) {
+          candidate.data = Object.assign({}, candidate.data || {}, redactSecrets(extraData));
         }
         this._scheduleSave(false);
         this._notify();
@@ -218,6 +363,7 @@ class DebugLogger {
       }
     }
 
+    const cappedOnInit = cleanDelta.length > maxLen;
     const entry = {
       seq: ++this.seq,
       ts: nowIso,
@@ -227,14 +373,14 @@ class DebugLogger {
       word: this.context.wordLabel || null,
       model: this.context.model || null,
       phase: this.context.phase || null,
-      summary:
-        cleanDelta.length > MAX_STREAM_TEXT_LEN
-          ? cleanDelta.slice(0, MAX_STREAM_TEXT_LEN) + ' …[truncated]'
-          : cleanDelta,
+      summary: cappedOnInit ? cleanDelta.slice(0, maxLen) + ' …' : cleanDelta,
       chunks: 1,
       totalChars: cleanDelta.length,
       _streaming: true
     };
+    if (cappedOnInit) {
+      entry._capped = true;
+    }
     if (extraData) {
       entry.data = redactSecrets(extraData);
     }
@@ -250,7 +396,7 @@ class DebugLogger {
 
   log(level, event, summary, data = null) {
     const nowIso = new Date().toISOString();
-    const relMs = Math.round((typeof performance !== 'undefined' ? performance.now() : 0) - this.bootPerfMs);
+    const relMs = Math.round(this._nowPerfMs() - this.bootPerfMs);
 
     const entry = {
       seq: ++this.seq,
@@ -279,21 +425,41 @@ class DebugLogger {
       this.entries.shift();
     }
 
-    const urgent = isIssue || level === 'warn' || event.startsWith('ws_close') || event.startsWith('tool_');
+    const urgent =
+      isIssue || level === 'warn' || event.startsWith('ws_close') || event.startsWith('network_');
     this._scheduleSave(urgent);
     this._notify();
     return entry;
+  }
+
+  _isHighlightEntry(e) {
+    return (
+      e.level === 'error' ||
+      e.level === 'warn' ||
+      e.level === 'thought' ||
+      (e.level === 'tool' && e.data?.cue?.type !== 'complete_word') ||
+      e.event === 'ws_close_unexpected' ||
+      e.event === 'word_completed' ||
+      e.event === 'word_restarted' ||
+      e.event === 'word_skipped' ||
+      e.event === 'word_graded_ai' ||
+      e.event === 'word_graded_heuristic_fallback' ||
+      e.event === 'utterance_audio_replayed' ||
+      e.event === 'repeat_last_prompt' ||
+      e.event === 'no_reply_timer_fired' ||
+      e.event === 'mic_acquired' ||
+      e.event === 'audio_device_changed' ||
+      e.event === 'mic_track_event' ||
+      e.event.startsWith('network_') ||
+      e.event.startsWith('media_session_')
+    );
   }
 
   getEntries(filter = 'all') {
     if (filter === 'highlights') {
       return this.entries.filter(
         (e) =>
-          e.level === 'error' ||
-          e.level === 'warn' ||
-          e.level === 'thought' ||
-          e.level === 'tool' ||
-          e.event.startsWith('ws_') ||
+          this._isHighlightEntry(e) ||
           e.event === 'input_transcript' ||
           e.event === 'output_transcript'
       );
@@ -303,29 +469,37 @@ class DebugLogger {
 
   getSummaryStats() {
     const unexpectedCloses = this.entries.filter((e) => e.event === 'ws_close_unexpected');
-    const lastUnexpected = unexpectedCloses.length > 0 ? unexpectedCloses[unexpectedCloses.length - 1] : null;
+    const lastUnexpected =
+      unexpectedCloses.length > 0 ? unexpectedCloses[unexpectedCloses.length - 1] : null;
     const errors = this.entries.filter((e) => e.level === 'error');
     const lastError = errors.length > 0 ? errors[errors.length - 1] : null;
-    const thoughts = this.entries.filter((e) => e.event === 'model_thought');
+    const countEvent = (ev) => this.entries.filter((e) => e.event === ev).length;
 
     return {
       version: APP_VERSION,
       totalEntries: this.entries.length,
+      wordCompletedCount: countEvent('word_completed'),
+      utteranceReplayCount: countEvent('utterance_audio_replayed'),
+      stalledContinueCount: countEvent('stalled_turn_socket_continue'),
+      wedgedAsrCount: countEvent('wedged_asr_socket_refresh'),
+      setupTimeoutCount: countEvent('ws_setup_timeout'),
+      offlineDropCount: countEvent('network_offline'),
       unexpectedCloseCount: unexpectedCloses.length,
       lastUnexpectedClose: lastUnexpected,
       errorCount: errors.length,
       lastError,
-      thoughtTurnCount: thoughts.length,
+      thoughtTurnCount: countEvent('model_thought'),
       activeModel: this.context.model || 'none',
       activeWord: this.context.wordLabel || 'none',
-      connectionState: this.context.connectionState || 'idle'
+      connectionState: this.context.connectionState || 'idle',
+      networkSummary: formatNetworkSummary()
     };
   }
 
   /**
    * Formats a comprehensive, LLM-friendly Markdown diagnostic bundle ready to paste into Gemini.
    */
-  formatForGemini(maxTimelineEntries = 90, maxTotalChars = 17800) {
+  formatForGemini(maxTimelineEntries = 130, maxTotalChars = 17800) {
     const stats = this.getSummaryStats();
     const ua = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown';
 
@@ -334,11 +508,12 @@ class DebugLogger {
       `- **Exported At:** ${new Date().toISOString()}`,
       `- **App Version:** ${APP_VERSION}`,
       `- **User Agent:** ${ua}`,
+      `- **Network:** ${stats.networkSummary}`,
       `- **Audio Pipeline:** ${this.context.audioSummary || 'not initialized'}`,
       `- **Active / Last Model:** ${stats.activeModel}`,
       `- **Current / Last Word:** ${stats.activeWord}${this.context.wordPrompt ? ` ("${this.context.wordPrompt}")` : ''}`,
       `- **Connection State:** ${stats.connectionState} (Phase: ${this.context.phase || 'n/a'})`,
-      `- **Total Buffered Events:** ${stats.totalEntries} | **Unexpected WS Closes:** ${stats.unexpectedCloseCount} | **Errors:** ${stats.errorCount} | **Hidden Thought Blocks:** ${stats.thoughtTurnCount}`
+      `- **Session Health (${stats.totalEntries} events):** Words=${stats.wordCompletedCount} | Auto-Replays=${stats.utteranceReplayCount} | Stalled-Continues=${stats.stalledContinueCount} | Wedged-ASR=${stats.wedgedAsrCount} | Setup-Timeouts=${stats.setupTimeoutCount} | Offline=${stats.offlineDropCount} | WS-Closes=${stats.unexpectedCloseCount} | Errors=${stats.errorCount}`
     ];
 
     if (stats.lastUnexpectedClose) {
@@ -351,39 +526,29 @@ class DebugLogger {
       lines.push(`- **Last Error:** ${stats.lastError.summary} (${stats.lastError.ts})`);
     }
 
-    // Highlight section: errors, warnings, unexpected closes, word scoring/telemetry, audio hardware routing, and hidden model thoughts
-    const highlights = this.entries.filter(
-      (e) =>
-        e.level === 'error' ||
-        e.level === 'warn' ||
-        e.level === 'thought' ||
-        e.level === 'tool' ||
-        e.event === 'ws_close_unexpected' ||
-        e.event === 'word_completed' ||
-        e.event === 'word_restarted' ||
-        e.event === 'word_skipped' ||
-        e.event === 'word_graded_ai' ||
-        e.event === 'word_graded_heuristic_fallback' ||
-        e.event === 'no_reply_timer_fired' ||
-        e.event === 'mic_acquired' ||
-        e.event === 'audio_devices_enumerated' ||
-        e.event === 'audio_device_changed' ||
-        e.event === 'mic_track_event' ||
-        e.event === 'utterance_audio_replayed' ||
-        e.event === 'repeat_last_prompt' ||
-        e.event.startsWith('media_session_')
-    );
+    const highlights = this.entries.filter((e) => this._isHighlightEntry(e));
+    // Reserve at most 26% of budget for top-level Highlights so the Chronological Timeline gets ~74%
+    const maxHighlightBudget = Math.floor(maxTotalChars * 0.26);
+    const approxTimelineStartIdx = Math.max(0, this.entries.length - 80);
+    const approxTimelineCutoffSeq =
+      this.entries.length > 0 ? this.entries[approxTimelineStartIdx].seq : 0;
 
     if (highlights.length > 0) {
-      lines.push('', '### Key Diagnostic Highlights (Scores, Errors, WS Closes & Audio)');
+      lines.push('', '### Key Diagnostic Highlights (Scores, Network, Audio, Controls & Errors)');
       lines.push('```text');
-      const maxHighlightBudget = Math.floor(maxTotalChars * 0.42);
       const selectedHighlights = [];
       let highlightChars = 0;
-      const candidateHighlights = highlights.slice(-28);
+      const candidateHighlights = highlights.slice(-30);
       for (let i = candidateHighlights.length - 1; i >= 0; i--) {
-        const formatted = this._formatSingleEntryLine(candidateHighlights[i]);
-        if (selectedHighlights.length > 0 && highlightChars + formatted.length + 1 > maxHighlightBudget) {
+        const h = candidateHighlights[i];
+        // Keep `turns` array for older words that scrolled off the timeline; omit for recent words shown in full below
+        const formatted = this._formatSingleEntryLine(h, {
+          omitTurnsArray: h.seq >= approxTimelineCutoffSeq
+        });
+        if (
+          selectedHighlights.length > 0 &&
+          highlightChars + formatted.length + 1 > maxHighlightBudget
+        ) {
           break;
         }
         selectedHighlights.push(formatted);
@@ -400,7 +565,10 @@ class DebugLogger {
     const selectedTimeline = [];
     let timelineChars = 0;
     for (let i = candidateTimeline.length - 1; i >= 0; i--) {
-      const formatted = this._formatSingleEntryLine(candidateTimeline[i]);
+      // Full `input_transcript` and `output_transcript` entries already appear in the timeline, so omit duplicate `turns` array here
+      const formatted = this._formatSingleEntryLine(candidateTimeline[i], {
+        omitTurnsArray: true
+      });
       if (selectedTimeline.length > 0 && timelineChars + formatted.length + 1 > remainingBudget) {
         break;
       }
@@ -420,16 +588,25 @@ class DebugLogger {
     return lines.join('\n');
   }
 
-  _formatSingleEntryLine(e) {
+  _formatSingleEntryLine(e, opts = {}) {
     const timeShort = e.ts ? e.ts.slice(11, 23) : '';
     const wordTag = e.word ? ` [${e.word}]` : '';
     const phaseTag = e.phase ? ` [P${e.phase}]` : '';
-    const modelShort = e.model ? ` [${String(e.model).replace(/^models\//, '')}]` : '';
+    const mShort = e.model ? shortModelTag(e.model) : '';
+    const modelTag = mShort ? ` [${mShort}]` : '';
     const streamMeta =
-      e.chunks && e.chunks > 1 ? ` (${e.chunks} chunks, ${e.totalChars || e.summary.length} chars)` : '';
+      e.chunks && e.chunks > 1
+        ? ` (${e.chunks} chunks, ${e.totalChars || e.summary.length} chars)`
+        : '';
     const cleanSummary = String(e.summary || '').replace(/\s+/g, ' ').trim();
-    const dataStr = e.data ? ` | ${JSON.stringify(e.data)}` : '';
-    return `${timeShort} (+${(e.relMs / 1000).toFixed(2)}s) [${e.level.toUpperCase()}] ${e.event}${wordTag}${phaseTag}${modelShort}: ${cleanSummary}${streamMeta}${dataStr}`;
+    let dataObj = e.data;
+    if (opts.omitTurnsArray && dataObj && Array.isArray(dataObj.turns)) {
+      const { turns: _omitted, ...rest } = dataObj;
+      dataObj = rest;
+    }
+    const dataStr =
+      dataObj && Object.keys(dataObj).length > 0 ? ` | ${JSON.stringify(dataObj)}` : '';
+    return `${timeShort} (+${(e.relMs / 1000).toFixed(2)}s) [${e.level.toUpperCase()}] ${e.event}${wordTag}${phaseTag}${modelTag}: ${cleanSummary}${streamMeta}${dataStr}`;
   }
 }
 

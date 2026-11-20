@@ -1,7 +1,7 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v23):
+ * Key architectural guarantees (v24):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
@@ -18,8 +18,8 @@
  * 5. Smart context- & sentence-completeness-aware endpointing + Clean Bluetooth Call / MediaSession Anchor.
  */
 
-import { debugLogger } from './debug-logger.js?v=23';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=23';
+import { debugLogger, getNetworkSnapshot } from './debug-logger.js?v=24';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=24';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -559,6 +559,9 @@ export class GeminiLiveVoicePipeline {
 
     // Diagnostics, PCM audibility & silent-turn auto-recovery per turn
     this.turnCommitPerfMs = 0;
+    this.turnInterimCount = 0;
+    this.turnFirstAudioTtfaMs = null;
+    this._lastEnumSig = '';
     this.sentAudioChunksInTurn = 0;
     this.turnAudioChunks = 0;
     this.turnAudioSec = 0;
@@ -636,14 +639,24 @@ export class GeminiLiveVoicePipeline {
       this.enumeratedAudioInputs = inputs;
       const hasBluetoothInput = inputs.some((d) => isBluetoothAudioDeviceLabel(d.label));
       const hasSpeakerphoneInput = inputs.some((d) => /speakerphone/i.test(d.label));
+      const enumSig = `${inputs.map((i) => `${i.shortId}:${i.label}`).join('|')}::${outputs
+        .map((o) => `${o.shortId}:${o.label}`)
+        .join('|')}`;
 
-      debugLogger.log('info', 'audio_devices_enumerated', `Enumerated ${inputs.length} mic(s) (${reason})`, {
-        reason,
-        hasBluetoothInput,
-        hasSpeakerphoneInput,
-        inputs: inputs.map((i) => ({ id: i.shortId, label: i.label })),
-        outputs: outputs.map((o) => ({ id: o.shortId, label: o.label }))
-      });
+      if (
+        enumSig !== this._lastEnumSig ||
+        reason === 'manual_scan_btn' ||
+        reason === 'devicechange_hotplug'
+      ) {
+        this._lastEnumSig = enumSig;
+        debugLogger.log('info', 'audio_devices_enumerated', `Enumerated ${inputs.length} mic(s) (${reason})`, {
+          reason,
+          hasBluetoothInput,
+          hasSpeakerphoneInput,
+          inputs: inputs.map((i) => ({ id: i.shortId, label: i.label })),
+          outputs: outputs.map((o) => ({ id: o.shortId, label: o.label }))
+        });
+      }
 
       this.onAudioHardwareUpdate(this.activeMicInfo, this.enumeratedAudioInputs);
       return { inputs, outputs };
@@ -754,10 +767,8 @@ export class GeminiLiveVoicePipeline {
     const frames = this.turnFramesCount;
     const avgRms = frames > 0 ? this.turnRawSumRms / frames : 0;
     return {
-      routingMode: this.audioRoutingMode,
-      micLabel: this.activeMicInfo?.label || 'unknown',
       frames,
-      zeroFrames: this.turnZeroFramesCount,
+      ...(this.turnZeroFramesCount > 0 ? { zeroFrames: this.turnZeroFramesCount } : {}),
       rawMaxRms: Number(this.turnRawMaxRms.toFixed(4)),
       rawAvgRms: Number(avgRms.toFixed(4)),
       noiseFloor: Number(this.noiseFloor.toFixed(4))
@@ -805,6 +816,18 @@ export class GeminiLiveVoicePipeline {
       } catch (_) {
         this.audioCtx = new AudioContextClass({ sampleRate: 24000 });
       }
+      this.audioCtx.onstatechange = () => {
+        if (!this.audioCtx || !this.isActive) return;
+        const st = this.audioCtx.state;
+        if (st !== 'running') {
+          debugLogger.log('warn', 'audio_ctx_state', `AudioContext changed to "${st}" during active session`, {
+            state: st
+          });
+          if (st === 'suspended' && typeof this.audioCtx.resume === 'function') {
+            this.audioCtx.resume().catch(() => {});
+          }
+        }
+      };
       debugLogger.log('info', 'audio_ctx_init', `Initialized WebAudio (${this.audioCtx.sampleRate}Hz)`, {
         sampleRate: this.audioCtx.sampleRate,
         baseLatency: this.audioCtx.baseLatency ?? null,
@@ -1119,12 +1142,11 @@ export class GeminiLiveVoicePipeline {
           this.idlePreRollBuffer = [];
           this.lastVoiceActivityTime = now;
           this.lastCountdownText = '';
+          const wsOpenNow = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
             rawRms: Number(rawRms.toFixed(4)),
-            noiseFloor: Number(this.noiseFloor.toFixed(4)),
             threshold: Number(speechStartThreshold.toFixed(4)),
-            turnExpectation: this.turnExpectation,
-            wsOpen: Boolean(this.ws && this.ws.readyState === WebSocket.OPEN)
+            ...(!wsOpenNow ? { wsOpen: false } : {})
           });
           this._emitState('listening', 'Hearing your Mandarin...');
         }
@@ -1311,7 +1333,6 @@ export class GeminiLiveVoicePipeline {
           }
         })
       );
-      debugLogger.log('ws', 'audio_stream_end_sent', 'Sent realtimeInput.audioStreamEnd');
     } catch (_) {}
   }
 
@@ -1349,8 +1370,9 @@ export class GeminiLiveVoicePipeline {
   commitUserSpeechTurn(reason = 'auto_silence', telemetryExtra = {}) {
     if (!this.isActive || this.tutorTurnActive || this.wordTerminalActionLocked) return;
 
+    const isManualDone = String(reason || '').startsWith('manual_done');
     const hadUserSpeech = this.userSpokeInTurn;
-    if (reason === 'manual_done' && this.listeningForUser && this.pausePreRollBuffer.length > 0) {
+    if (isManualDone && this.listeningForUser && this.pausePreRollBuffer.length > 0) {
       for (const bufferedChunk of this.pausePreRollBuffer) {
         this._recordAndSendAudioChunk(bufferedChunk);
       }
@@ -1368,6 +1390,7 @@ export class GeminiLiveVoicePipeline {
     const wsOpen = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
     const recordedChunks = this.currentTurnPcmChunks.slice();
     const chunksSent = this.sentAudioChunksInTurn;
+    const interimCount = this.turnInterimCount;
     const liveTranscriptSnapshot = this._getCombinedLiveUserTranscript();
     const micStats = this._buildTurnMicTelemetry();
 
@@ -1394,6 +1417,7 @@ export class GeminiLiveVoicePipeline {
     this.consecutiveSpeechFrames = 0;
     this.resumeSpeechFrames = 0;
     this.silenceFramesSentInPause = 0;
+    this.turnInterimCount = 0;
     this.idlePreRollBuffer = [];
     this.pausePreRollBuffer = [];
     this.currentTurnPcmChunks = [];
@@ -1412,14 +1436,14 @@ export class GeminiLiveVoicePipeline {
         this.lastCommittedPcmChunks = null;
       }
       debugLogger.log('info', 'user_turn_committed', `Committed user turn offline (${reason}); queued for replay`, {
-        reason,
         wsOpen: false,
         queuedReplayChunks: this.pendingCommittedReplayChunks
           ? this.pendingCommittedReplayChunks.length
           : 0,
         voicedMs: this.lastCommittedVoicedMs,
-        transcriptSoFar: liveTranscriptSnapshot,
-        micStats
+        interimCount,
+        micStats,
+        net: getNetworkSnapshot()
       });
       this._emitState('connecting', 'Reconnecting & sending your speech...');
       if (!this.isReconnecting) {
@@ -1432,28 +1456,25 @@ export class GeminiLiveVoicePipeline {
     const wsBufferedBytes = this.ws ? this.ws.bufferedAmount || 0 : 0;
 
     debugLogger.log('info', 'user_turn_committed', `Committed user turn (${reason})`, {
-      reason,
-      turnExpectation: this.turnExpectation,
-      speechSegmentsInTurn: this.speechSegmentsInTurn,
+      expect: this.turnExpectation,
+      segs: this.speechSegmentsInTurn,
       voicedMs: this.lastCommittedVoicedMs,
       ...telemetryExtra,
-      audioChunksSent: chunksSent,
-      wsBufferedBytes,
-      transcriptSoFar: liveTranscriptSnapshot,
+      chunksSent,
+      interimCount,
+      ...(wsBufferedBytes > 0 ? { wsBufferedBytes, net: getNetworkSnapshot() } : {}),
       micStats
     });
 
     this._emitState('connecting', 'Processing your Mandarin...');
     this._clearTurnTimers();
 
-    const recoveryReasonTag =
-      reason === 'manual_done' ? 'manual_done_no_reply' : 'no_reply_auto_continue';
-    const recoveryWaitMs =
-      reason === 'manual_done'
-        ? 1500
-        : hadUserSpeech || liveTranscriptSnapshot
-        ? 2800
-        : 1800;
+    const recoveryReasonTag = isManualDone ? 'manual_done_no_reply' : 'no_reply_auto_continue';
+    const recoveryWaitMs = isManualDone
+      ? 1500
+      : hadUserSpeech || liveTranscriptSnapshot
+      ? 2800
+      : 1800;
 
     this._armNoReplyTimer(recoveryWaitMs, recoveryReasonTag, micStats);
 
@@ -1479,7 +1500,7 @@ export class GeminiLiveVoicePipeline {
             'warn',
             'zombie_uplink_stalled',
             `WebSocket TCP send buffer stalled (${curBuffered}/${wsBufferedBytes} bytes un-ACKed); switching socket & replaying speech`,
-            { initialBuffered: wsBufferedBytes, currentBuffered: curBuffered }
+            { initialBuffered: wsBufferedBytes, currentBuffered: curBuffered, net: getNetworkSnapshot() }
           );
           this._recoverStalledTurnOnFreshSocket('zombie_uplink_stalled', micStats);
         } else if (curBuffered > 0) {
@@ -1540,7 +1561,8 @@ export class GeminiLiveVoicePipeline {
         {
           triggerReason,
           userText: committedTurn.text,
-          micStats: stats
+          micStats: stats,
+          net: getNetworkSnapshot()
         }
       );
 
@@ -1562,13 +1584,13 @@ export class GeminiLiveVoicePipeline {
       return true;
     }
 
+    const isManualDoneTrigger = String(triggerReason || '').startsWith('manual_done');
     const canReplaySavedAudio =
       Array.isArray(this.lastCommittedPcmChunks) &&
       this.lastCommittedPcmChunks.length >= 4 &&
       this.utteranceReplayAttempts < 1 &&
       (triggerReason === 'zombie_uplink_stalled' ||
-        triggerReason === 'manual_done_no_reply' ||
-        triggerReason === 'manual_done_force' ||
+        isManualDoneTrigger ||
         Boolean(stats && stats.rawMaxRms >= 0.055 && this.lastCommittedVoicedMs >= 300));
 
     if (canReplaySavedAudio && this.currentWord && this.lastLiveConfig) {
@@ -1586,7 +1608,8 @@ export class GeminiLiveVoicePipeline {
           replayChunks: this.pendingCommittedReplayChunks.length,
           rotationOffset,
           voicedMs: this.lastCommittedVoicedMs,
-          micStats: stats
+          micStats: stats,
+          net: getNetworkSnapshot()
         }
       );
 
@@ -1613,8 +1636,7 @@ export class GeminiLiveVoicePipeline {
     }
 
     const hadAudibleSpeechAttempt =
-      triggerReason === 'manual_done_force' ||
-      triggerReason === 'manual_done_no_reply' ||
+      isManualDoneTrigger ||
       triggerReason === 'replay_no_reply' ||
       Boolean(stats && stats.rawMaxRms >= 0.055 && this.lastCommittedVoicedMs >= 300);
 
@@ -1634,7 +1656,8 @@ export class GeminiLiveVoicePipeline {
           triggerReason,
           rotationOffset,
           voicedMs: this.lastCommittedVoicedMs,
-          micStats: stats
+          micStats: stats,
+          net: getNetworkSnapshot()
         }
       );
       this.playChime('relisten');
@@ -1674,16 +1697,17 @@ export class GeminiLiveVoicePipeline {
     return true;
   }
 
-  finishUserTurnNow() {
+  finishUserTurnNow(source = '') {
     if (!this.isActive || this.wordTerminalActionLocked || this.pendingActionAfterPlayback) {
       return false;
     }
+    const suffix = source ? `_${source}` : '';
     if (this.listeningForUser) {
-      this.commitUserSpeechTurn('manual_done');
+      this.commitUserSpeechTurn(`manual_done${suffix}`);
       return true;
     }
     if (!this.tutorTurnActive && !this.isTutorPlayingAudio() && !this.isReconnecting) {
-      return this._recoverStalledTurnOnFreshSocket('manual_done_force');
+      return this._recoverStalledTurnOnFreshSocket(`manual_done_force${suffix}`);
     }
     return false;
   }
@@ -1760,6 +1784,8 @@ export class GeminiLiveVoicePipeline {
     this.lastCommittedVoicedMs = 0;
     this.lastCommittedMicStats = null;
     this.serverAckedCurrentUserTurn = false;
+    this.turnInterimCount = 0;
+    this.turnFirstAudioTtfaMs = null;
     this.sentAudioChunksInTurn = 0;
     this.turnAudioChunks = 0;
     this.turnAudioSec = 0;
@@ -1781,7 +1807,6 @@ export class GeminiLiveVoicePipeline {
     });
     debugLogger.log('info', 'word_session_start', `Starting word session: ${label}`, {
       id: word.id,
-      traditional: word.traditional,
       english_prompt: word.english_prompt,
       mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || ''
     });
@@ -2093,10 +2118,12 @@ export class GeminiLiveVoicePipeline {
     const useClientContent = targetModel.includes('2.5') && !this.hasSentRealtimeAudioOnSocket;
 
     if (useClientContent) {
-      debugLogger.log('ws', 'client_content_sent', `Sent clientContent (${tag})`, {
-        tag,
-        ...extraLog
-      });
+      if (tag !== 'phase1_kickoff') {
+        debugLogger.log('ws', 'client_content_sent', `Sent clientContent (${tag})`, {
+          tag,
+          ...extraLog
+        });
+      }
       ws.send(
         JSON.stringify({
           clientContent: {
@@ -2106,10 +2133,12 @@ export class GeminiLiveVoicePipeline {
         })
       );
     } else {
-      debugLogger.log('ws', 'realtime_text_sent', `Sent realtimeInput.text (${tag})`, {
-        tag,
-        ...extraLog
-      });
+      if (tag !== 'phase1_kickoff') {
+        debugLogger.log('ws', 'realtime_text_sent', `Sent realtimeInput.text (${tag})`, {
+          tag,
+          ...extraLog
+        });
+      }
       ws.send(
         JSON.stringify({
           realtimeInput: {
@@ -2124,9 +2153,11 @@ export class GeminiLiveVoicePipeline {
     return new Promise((resolve, reject) => {
       this._closeRawSocketOnly();
       let setupCompleted = false;
+      let wsOpenMs = null;
       const connectStartMs = performance.now();
       this.hasUnflushedAudio = false;
       this.hasSentRealtimeAudioOnSocket = false;
+      this.turnFirstAudioTtfaMs = null;
       this.turnAudioChunks = 0;
       this.turnAudioSec = 0;
       this.turnAudibleChunks = 0;
@@ -2142,17 +2173,15 @@ export class GeminiLiveVoicePipeline {
         this._emitState('connecting', `Connecting (${modelId.replace('models/', '')})...`);
       }
 
-      debugLogger.log('ws', 'ws_connecting', `Opening WebSocket for ${modelId}`, {
-        modelId,
-        voiceName,
-        useExtendedConfig,
-        isReconnect
-      });
-
       const setupTimeoutMs = isReconnect ? 5000 : 7000;
       const setupTimeout = setTimeout(() => {
         if (!setupCompleted) {
-          debugLogger.log('warn', 'ws_setup_timeout', `Timeout waiting for setupComplete on ${modelId}`);
+          debugLogger.log('warn', 'ws_setup_timeout', `Timeout waiting for setupComplete on ${modelId}`, {
+            elapsedMs: Math.round(performance.now() - connectStartMs),
+            openMs: wsOpenMs,
+            isReconnect,
+            net: getNetworkSnapshot()
+          });
           try {
             ws.close();
           } catch (_) {}
@@ -2161,6 +2190,7 @@ export class GeminiLiveVoicePipeline {
       }, setupTimeoutMs);
 
       ws.onopen = () => {
+        wsOpenMs = Math.round(performance.now() - connectStartMs);
         const generationConfig = {
           responseModalities: ['AUDIO'],
           speechConfig: {
@@ -2204,14 +2234,6 @@ export class GeminiLiveVoicePipeline {
           };
         }
 
-        debugLogger.log('ws', 'ws_setup_sent', 'Sent BidiGenerateContentSetup (pure audio, zero tools)', {
-          model: modelId,
-          voiceName,
-          useExtendedConfig,
-          thinkingBudget: generationConfig.thinkingConfig ? generationConfig.thinkingConfig.thinkingBudget : 'default',
-          priorTurnsSeeded: isReconnect ? this.wordTurns.length : 0
-        });
-
         ws.send(JSON.stringify({ setup: setupObj }));
       };
 
@@ -2227,10 +2249,18 @@ export class GeminiLiveVoicePipeline {
             setupCompleted = true;
             clearTimeout(setupTimeout);
             const setupLatencyMs = Math.round(performance.now() - connectStartMs);
-            debugLogger.log('ws', 'ws_setup_complete', `setupComplete received in ${setupLatencyMs}ms`, {
-              setupLatencyMs,
-              isReconnect
-            });
+            debugLogger.log(
+              'ws',
+              'ws_ready',
+              `Socket ready in ${setupLatencyMs}ms (open=${wsOpenMs ?? '?'}ms)`,
+              {
+                openMs: wsOpenMs,
+                setupMs: setupLatencyMs,
+                isReconnect,
+                ...(isReconnect ? { seededTurns: this.wordTurns.length } : {}),
+                ...(!useExtendedConfig ? { minimalCfg: true } : {})
+              }
+            );
 
             this._pruneBlankTurns();
             const lastTurn = this.wordTurns.length > 0 ? this.wordTurns[this.wordTurns.length - 1] : null;
@@ -2308,7 +2338,7 @@ export class GeminiLiveVoicePipeline {
                 {
                   chunks: replayChunks.length,
                   replayAttempt: this.utteranceReplayAttempts,
-                  modelId
+                  net: getNetworkSnapshot()
                 }
               );
 
@@ -2384,7 +2414,9 @@ export class GeminiLiveVoicePipeline {
 
       ws.onerror = () => {
         debugLogger.log('warn', 'ws_error_event', `WebSocket error event fired on ${modelId}`, {
-          setupCompleted
+          setupCompleted,
+          openMs: wsOpenMs,
+          net: getNetworkSnapshot()
         });
         if (!setupCompleted) {
           clearTimeout(setupTimeout);
@@ -2408,7 +2440,7 @@ export class GeminiLiveVoicePipeline {
             'warn',
             'ws_close_during_setup',
             `WebSocket closed during setup (${code}: ${reason || 'setup rejected'}) on ${modelId}`,
-            { code, reason, wasClean, modelId, useExtendedConfig }
+            { code, reason, wasClean, openMs: wsOpenMs, useExtendedConfig, net: getNetworkSnapshot() }
           );
           const setupErr = new Error(
             `WebSocket closed (${code}: ${reason || 'setup rejected'}) on ${modelId}`
@@ -2419,11 +2451,6 @@ export class GeminiLiveVoicePipeline {
         }
 
         if (this.wordTerminalActionLocked || this.intentionalClose || !this.isActive) {
-          debugLogger.log('ws', 'ws_close_clean', `WebSocket closed cleanly (${code})`, {
-            code,
-            reason,
-            wasClean
-          });
           return;
         }
 
@@ -2435,11 +2462,13 @@ export class GeminiLiveVoicePipeline {
             code,
             reason,
             wasClean,
-            modelId,
             tutorTurnActive: this.tutorTurnActive,
             listeningForUser: this.listeningForUser,
+            ttfaMs: this.turnFirstAudioTtfaMs,
             turnAudioChunks: this.turnAudioChunks,
-            partialTutorText: this.currentTurnTutorTranscript.trim() || null
+            wsBufferedBytes: ws.bufferedAmount || 0,
+            partialTutorText: this.currentTurnTutorTranscript.trim() || null,
+            net: getNetworkSnapshot()
           }
         );
 
@@ -2478,6 +2507,8 @@ export class GeminiLiveVoicePipeline {
     this.turnRawMaxRms = 0;
     this.turnRawSumRms = 0;
     this.silenceFramesSentInPause = 0;
+    this.turnInterimCount = 0;
+    this.turnFirstAudioTtfaMs = null;
     this.idlePreRollBuffer = [];
     this.pausePreRollBuffer = [];
     this.currentTurnPcmChunks = [];
@@ -2607,6 +2638,9 @@ export class GeminiLiveVoicePipeline {
       }
 
       if (sc.interimInputTranscription && sc.interimInputTranscription.text) {
+        if (sc.interimInputTranscription.text.trim()) {
+          this.turnInterimCount += 1;
+        }
         if (
           sc.interimInputTranscription.text.trim() ||
           this.currentTurnInterimUserTranscript.trim()
@@ -2620,7 +2654,11 @@ export class GeminiLiveVoicePipeline {
         const hasNonSpace = Boolean(text.trim());
         this.currentTurnInterimUserTranscript = '';
         if (hasNonSpace) {
-          debugLogger.appendStream('info', 'input_transcript', text);
+          const lateExtra =
+            !this.listeningForUser && this.turnCommitPerfMs
+              ? { lateMs: Math.round(performance.now() - this.turnCommitPerfMs) }
+              : null;
+          debugLogger.appendStream('info', 'input_transcript', text, lateExtra);
         }
 
         if (this.listeningForUser) {
@@ -2658,22 +2696,14 @@ export class GeminiLiveVoicePipeline {
 
         for (const part of sc.modelTurn.parts) {
           if (part.thought || (typeof part.text === 'string' && part.text.trim())) {
-            debugLogger.appendStream(
-              'thought',
-              'model_thought',
-              part.text || '[thought part]',
-              { thoughtFlag: Boolean(part.thought) }
-            );
+            debugLogger.appendStream('thought', 'model_thought', part.text || '[thought part]');
           }
 
           if (part.inlineData && part.inlineData.data) {
             if (this.turnAudioChunks === 0) {
-              const ttfaMs = this.turnCommitPerfMs
+              this.turnFirstAudioTtfaMs = this.turnCommitPerfMs
                 ? Math.round(performance.now() - this.turnCommitPerfMs)
                 : null;
-              debugLogger.log('info', 'tutor_audio_start', 'First 24kHz audio chunk received', {
-                ttfaMs
-              });
             }
             this._emitState('speaking', 'Tutor speaking...');
             const chunkStats = this._enqueuePcm24kAudio(part.inlineData.data);
@@ -2692,17 +2722,17 @@ export class GeminiLiveVoicePipeline {
         const completedTutorText = this.currentTurnTutorTranscript.trim();
         const totalAudioChunks = this.turnAudioChunks;
         const totalAudioSec = Number(this.turnAudioSec.toFixed(2));
-        const audibleChunks = this.turnAudibleChunks;
         const audibleSec = Number(this.turnAudibleSec.toFixed(2));
+        const ttfaMs = this.turnFirstAudioTtfaMs;
 
         debugLogger.log('info', 'tutor_turn_complete', 'Server signaled turnComplete', {
-          audioChunks: totalAudioChunks,
+          ttfaMs,
           audioSec: totalAudioSec,
-          audibleChunks,
           audibleSec,
           spokenChars: completedTutorText.length
         });
 
+        this.turnFirstAudioTtfaMs = null;
         this.turnAudioChunks = 0;
         this.turnAudioSec = 0;
         this.turnAudibleChunks = 0;

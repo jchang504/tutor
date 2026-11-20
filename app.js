@@ -14,16 +14,28 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=23';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=24';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=23';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=23';
+} from './live-audio.js?v=24';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=24';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function compactRubricSummary(t = {}) {
+  if (!t || typeof t !== 'object') return {};
+  return {
+    recalled: Boolean(t.recalled_target_without_hint),
+    ...(t.used_synonym_first ? { synonymFirst: true } : {}),
+    ...(t.needed_hint ? { hint: true } : {}),
+    ...(t.minor_grammar_or_tone_fix ? { minorFix: true } : {}),
+    ...(t.major_mistake ? { majorMistake: true } : {}),
+    ...(t.notes ? { notes: String(t.notes).slice(0, 90) } : {})
+  };
 }
 
 function hasMorphologicalRootOfTarget(userTxt = '', target = '') {
@@ -667,7 +679,7 @@ export class MandarinTutorApp {
     this.els.btnStartDriving.addEventListener('click', () => this.startDrivingSession());
     if (this.els.btnDoneSpeaking) {
       this.els.btnDoneSpeaking.addEventListener('click', () => {
-        this.pipeline.finishUserTurnNow();
+        this.pipeline.finishUserTurnNow('btn');
       });
     }
     this.els.btnPauseResume.addEventListener('click', () => this.togglePauseSession());
@@ -677,7 +689,7 @@ export class MandarinTutorApp {
     this.els.btnHint.addEventListener('click', () => {
       this.pipeline.sendTextCommand(
         '請用簡單、自然慢速的台灣中文給我一點提示，但先不要直接講出整句答案。',
-        { isHint: true }
+        { isHint: true, tag: 'ask_hint', statusText: 'Asking tutor for a hint...' }
       );
     });
     this.els.btnSkipWord.addEventListener('click', () => this.skipCurrentWord('manual_skip'));
@@ -712,7 +724,7 @@ export class MandarinTutorApp {
           this.showToast(err.message || 'Reconnect failed — tap again when online.', 'error');
         });
       } else if (!this.sessionPaused && this.pipeline.canForceFinishUserTurn()) {
-        this.pipeline.finishUserTurnNow();
+        this.pipeline.finishUserTurnNow('orb');
       } else {
         this.togglePauseSession();
       }
@@ -976,7 +988,7 @@ export class MandarinTutorApp {
    * Calls the bound Google Apps Script Web App (`doPost`) using `text/plain;charset=utf-8`
    * so Chrome never triggers an unanswerable CORS OPTIONS preflight.
    */
-  async callBackend(action, payload = {}) {
+  async callBackend(action, payload = {}, options = {}) {
     const gasUrl = (localStorage.getItem(STORAGE_KEYS.GAS_URL) || '').trim();
     const secret = (localStorage.getItem(STORAGE_KEYS.SECRET) || '').trim();
     if (!gasUrl || !secret) {
@@ -1012,10 +1024,12 @@ export class MandarinTutorApp {
         });
         throw new Error(data.error || 'Apps Script backend error.');
       }
-      debugLogger.log('info', 'backend_rpc_ok', `RPC ${action} succeeded in ${durationMs}ms`, {
-        action,
-        durationMs
-      });
+      if (!options.silentOkLog) {
+        debugLogger.log('info', 'backend_rpc_ok', `RPC ${action} succeeded in ${durationMs}ms`, {
+          action,
+          durationMs
+        });
+      }
       return data;
     } catch (err) {
       if (!String(err.message || '').startsWith('Apps Script')) {
@@ -1060,7 +1074,7 @@ export class MandarinTutorApp {
 
     try {
       this.els.connectionBadge.textContent = 'Syncing Sheet...';
-      const res = await this.callBackend('ping');
+      const res = await this.callBackend('ping', {}, { silentOkLog: !notify });
       const s = res.stats || {};
       this.els.statDue.textContent = String(s.dueCount ?? 0);
       this.els.statNew.textContent = String(s.newCount ?? 0);
@@ -1453,16 +1467,16 @@ ${dialogueText}`;
         word.traditional
       );
       const aiScore = computeDeterministicScore(normalized);
+      const rawScore = computeDeterministicScore(parsed);
 
       debugLogger.log(
         'info',
         'word_graded_ai',
         `Graded ${word.traditional} -> Score ${aiScore} (${scoreLabel(aiScore)}) via ${usedModel.replace(/^models\//, '')} in ${Math.round(performance.now() - startMs)}ms`,
         {
-          model: usedModel,
           finalScore: aiScore,
-          rawAiParsed: parsed,
-          normalized
+          ...(rawScore !== aiScore ? { rawAiScore: rawScore, rawAiParsed: parsed } : {}),
+          rubric: compactRubricSummary(normalized)
         }
       );
       return normalized;
@@ -1493,13 +1507,17 @@ ${dialogueText}`;
     const gasUrl = (localStorage.getItem(STORAGE_KEYS.GAS_URL) || '').trim();
     const secret = (localStorage.getItem(STORAGE_KEYS.SECRET) || '').trim();
     if (gasUrl && secret) {
-      this.callBackend('record_review', {
-        word_id: word.id,
-        traditional: word.traditional,
-        english_prompt: word.english_prompt,
-        mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || '',
-        telemetry: finalTelemetry
-      })
+      this.callBackend(
+        'record_review',
+        {
+          word_id: word.id,
+          traditional: word.traditional,
+          english_prompt: word.english_prompt,
+          mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || '',
+          telemetry: finalTelemetry
+        },
+        { silentOkLog: true }
+      )
         .then(() => this.refreshBackendStatus(false))
         .catch((err) => console.warn('Failed to persist review to Sheet:', err));
     }
@@ -1536,13 +1554,12 @@ ${dialogueText}`;
       'word_completed',
       `Completed ${word.traditional} -> Instant Score ${score} (${scoreLabel(score)}, +${fsrsPreview.intervalDays}d)`,
       {
-        traditional: word.traditional,
         score,
         intervalDays: fsrsPreview.intervalDays,
         turnsCount: wordTurns.length,
-        initialTelemetry,
+        rubric: compactRubricSummary(initialTelemetry),
         turns: wordTurns.map(
-          (t) => `${t.role === 'tutor' ? 'T' : 'U'}:${String(t.text || '').slice(0, 70)}`
+          (t) => `${t.role === 'tutor' ? 'T' : 'U'}:${String(t.text || '').slice(0, 64)}`
         )
       }
     );
@@ -2456,25 +2473,26 @@ ${dialogueText}`;
     if (!this.els.logsViewer || !this.els.logsSummaryBox) return;
 
     const stats = debugLogger.getSummaryStats();
-    let closeNote = 'None (0 unexpected closes)';
+    let closeNote = '0';
     if (stats.lastUnexpectedClose) {
       const d = stats.lastUnexpectedClose.data || {};
-      closeNote = `code=${d.code ?? '?'}${d.reason ? ` ("${this.escapeHtml(d.reason)}")` : ''} (${stats.unexpectedCloseCount} total)`;
+      closeNote = `${stats.unexpectedCloseCount} (last code=${d.code ?? '?'}${d.reason ? `, "${this.escapeHtml(d.reason)}"` : ''})`;
     }
 
     const audioSummary = debugLogger.context?.audioSummary || 'Not initialized yet';
     this.els.logsSummaryBox.innerHTML =
-      `<strong>App ${this.escapeHtml(stats.version)}</strong> · Model: <code>${this.escapeHtml(stats.activeModel)}</code> · Events: <strong>${stats.totalEntries}</strong> · Hidden Thoughts: <strong>${stats.thoughtTurnCount}</strong><br />` +
+      `<strong>App ${this.escapeHtml(stats.version)}</strong> · Model: <code>${this.escapeHtml(stats.activeModel)}</code> · Events: <strong>${stats.totalEntries}</strong><br />` +
       `Audio: <code>${this.escapeHtml(audioSummary)}</code><br />` +
-      `Unexpected WS Closes: <strong>${closeNote}</strong><br />` +
-      `<span style="font-size:0.76rem; color:var(--text-muted);">Tap <strong>Copy Logs for Gemini</strong> below and paste directly into Gemini chat to debug any voice, car audio, or WebSocket issue.</span>`;
+      `Network: <code>${this.escapeHtml(stats.networkSummary)}</code><br />` +
+      `Health: Words: <strong>${stats.wordCompletedCount}</strong> · Auto-Replays: <strong>${stats.utteranceReplayCount}</strong> · Wedged-ASR: <strong>${stats.wedgedAsrCount}</strong> · WS-Closes: <strong>${closeNote}</strong><br />` +
+      `<span style="font-size:0.76rem; color:var(--text-muted);">Tap <strong>Copy Logs for Gemini</strong> below and paste directly into Gemini chat to debug any voice, cellular, car audio, or WebSocket issue.</span>`;
 
     const filter = this.els.selectLogFilter ? this.els.selectLogFilter.value : 'all';
     const entries = debugLogger.getEntries(filter);
     if (entries.length === 0) {
       this.els.logsViewer.textContent =
         filter === 'highlights'
-          ? 'No warnings, errors, tool calls, or model thoughts recorded yet.'
+          ? 'No scores, network changes, audio alerts, or errors recorded yet.'
           : 'No events logged yet.';
       return;
     }
@@ -2490,7 +2508,7 @@ ${dialogueText}`;
   }
 
   async copyLogsForGemini() {
-    const markdownReport = debugLogger.formatForGemini(90, 17800);
+    const markdownReport = debugLogger.formatForGemini(130, 17800);
     let copied = false;
 
     if (navigator.clipboard && navigator.clipboard.writeText) {
