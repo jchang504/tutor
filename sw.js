@@ -1,12 +1,12 @@
-const CACHE_NAME = 'tw-mandarin-tutor-v24';
+const CACHE_NAME = 'tw-mandarin-tutor-v25';
 const ASSETS = [
   './',
   './index.html',
-  './index.css?v=24',
-  './app.js?v=24',
-  './live-audio.js?v=24',
-  './debug-logger.js?v=24',
-  './pinyin-utils.js?v=24',
+  './index.css?v=25',
+  './app.js?v=25',
+  './live-audio.js?v=25',
+  './debug-logger.js?v=25',
+  './pinyin-utils.js?v=25',
   './fsrs.js',
   './sample-vocab.js',
   './manifest.json',

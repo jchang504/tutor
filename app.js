@@ -14,12 +14,12 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=24';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=25';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=24';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=24';
+} from './live-audio.js?v=25';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=25';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
@@ -1713,6 +1713,23 @@ ${dialogueText}`;
     this.els.stageStatusPill.dataset.state = state;
     this.els.voiceOrb.dataset.state = state;
     this.els.voiceOrbLabel.textContent = statusText;
+
+    if (this.els.btnDoneSpeaking) {
+      if (state === 'listening') {
+        this.els.btnDoneSpeaking.disabled = false;
+        this.els.btnDoneSpeaking.textContent = '✓ Done Speaking';
+      } else if (state === 'connecting') {
+        const canNudge = this.pipeline && this.pipeline.canForceFinishUserTurn();
+        this.els.btnDoneSpeaking.disabled = !canNudge;
+        this.els.btnDoneSpeaking.textContent = canNudge ? '✓ Send Now' : 'Sending...';
+      } else if (state === 'speaking') {
+        this.els.btnDoneSpeaking.disabled = true;
+        this.els.btnDoneSpeaking.textContent = 'Tutor Speaking...';
+      } else {
+        this.els.btnDoneSpeaking.disabled = state !== 'disconnected';
+        this.els.btnDoneSpeaking.textContent = '✓ Done Speaking';
+      }
+    }
   }
 
   handleTranscript(role, text) {
@@ -2479,7 +2496,7 @@ ${dialogueText}`;
       closeNote = `${stats.unexpectedCloseCount} (last code=${d.code ?? '?'}${d.reason ? `, "${this.escapeHtml(d.reason)}"` : ''})`;
     }
 
-    const audioSummary = debugLogger.context?.audioSummary || 'Not initialized yet';
+    const audioSummary = stats.audioSummary || 'Not initialized yet';
     this.els.logsSummaryBox.innerHTML =
       `<strong>App ${this.escapeHtml(stats.version)}</strong> · Model: <code>${this.escapeHtml(stats.activeModel)}</code> · Events: <strong>${stats.totalEntries}</strong><br />` +
       `Audio: <code>${this.escapeHtml(audioSummary)}</code><br />` +

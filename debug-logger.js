@@ -11,7 +11,7 @@
  *   Markdown diagnostic bundle (`<18KB`) for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v24';
+export const APP_VERSION = 'v25';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;
@@ -475,6 +475,25 @@ class DebugLogger {
     const lastError = errors.length > 0 ? errors[errors.length - 1] : null;
     const countEvent = (ev) => this.entries.filter((e) => e.event === ev).length;
 
+    let fallbackModel = null;
+    let fallbackWord = null;
+    let fallbackAudio = null;
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i];
+      if (!fallbackModel && e.model) fallbackModel = e.model;
+      if (!fallbackWord && e.word) fallbackWord = e.word;
+      if (!fallbackAudio && e.event === 'mic_acquired' && e.summary) {
+        fallbackAudio = e.summary.replace(/^Microphone ready:\s*/, '');
+      }
+      if (fallbackModel && fallbackWord && fallbackAudio) break;
+    }
+
+    const rawAudio = this.context.audioSummary || '';
+    const effectiveAudio =
+      rawAudio && !rawAudio.includes('Not initialized')
+        ? rawAudio
+        : fallbackAudio || rawAudio || 'not initialized';
+
     return {
       version: APP_VERSION,
       totalEntries: this.entries.length,
@@ -489,8 +508,9 @@ class DebugLogger {
       errorCount: errors.length,
       lastError,
       thoughtTurnCount: countEvent('model_thought'),
-      activeModel: this.context.model || 'none',
-      activeWord: this.context.wordLabel || 'none',
+      activeModel: this.context.model || fallbackModel || 'none',
+      activeWord: this.context.wordLabel || fallbackWord || 'none',
+      audioSummary: effectiveAudio,
       connectionState: this.context.connectionState || 'idle',
       networkSummary: formatNetworkSummary()
     };
@@ -509,7 +529,7 @@ class DebugLogger {
       `- **App Version:** ${APP_VERSION}`,
       `- **User Agent:** ${ua}`,
       `- **Network:** ${stats.networkSummary}`,
-      `- **Audio Pipeline:** ${this.context.audioSummary || 'not initialized'}`,
+      `- **Audio Pipeline:** ${stats.audioSummary}`,
       `- **Active / Last Model:** ${stats.activeModel}`,
       `- **Current / Last Word:** ${stats.activeWord}${this.context.wordPrompt ? ` ("${this.context.wordPrompt}")` : ''}`,
       `- **Connection State:** ${stats.connectionState} (Phase: ${this.context.phase || 'n/a'})`,

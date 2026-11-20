@@ -1,25 +1,25 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v24):
+ * Key architectural guarantees (v25):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
  *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading runs asynchronously
  *    over standard REST JSON in the background after the word ends!
- * 3. Driving Cellular Resilience:
- *    - 500ms local pre-roll ring buffer (zero idle uplink bandwidth while thinking).
- *    - Full local 16kHz PCM utterance capture + automatic audio replay on fresh WebSocket whenever
- *      a cellular handoff / half-open TCP zombie socket (`ws.bufferedAmount` stall) / `1006` drop
- *      loses ASR on real speech — so drivers don't have to repeat themselves!
+ * 3. Driving Cellular & VAD Resilience:
+ *    - Pre-speech 400ms clean digital-silence baseline + 500ms local pre-roll ring buffer so
+ *      server-side AutomaticActivityDetection ALWAYS sees a crisp quiet->speech transition even
+ *      when the user begins speaking 200ms after tutor playback ends.
+ *    - Paced 16kHz PCM utterance replay with in-flight protection + watchdog-backed Repeat/Hint commands.
  *    - Captures speech continuously in memory even while a dropped socket is mid-reconnect.
  * 4. Context-preserving Repeat (`repeatLastTutorPrompt`): repeats ONLY the tutor's last spoken prompt
- *    or follow-up question and continues from the current phase rather than resetting to Phase 1.
+ *    or follow-up question on a guaranteed clean socket (with automatic retry & TTS fallback).
  * 5. Smart context- & sentence-completeness-aware endpointing + Clean Bluetooth Call / MediaSession Anchor.
  */
 
-import { debugLogger, getNetworkSnapshot } from './debug-logger.js?v=24';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=24';
+import { debugLogger, getNetworkSnapshot } from './debug-logger.js?v=25';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=25';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -540,6 +540,12 @@ export class GeminiLiveVoicePipeline {
     this.utteranceReplayAttempts = 0;
     this.consecutiveWedgedRefreshes = 0;
     this.pendingCustomPromptOnConnect = null;
+    this.replayInFlight = false;
+    this.replayStartedPerfMs = 0;
+    this.replayPacerTimer = null;
+    this.pendingManualForceOnConnect = false;
+    this.commandAwaitingReply = false;
+    this.commandWatchdogTimer = null;
     this.lastVoiceActivityTime = 0;
     this.lastCountdownText = '';
     this.noiseFloor = 0.0035;
@@ -732,7 +738,6 @@ export class GeminiLiveVoicePipeline {
       this.isActive &&
       !this.wordTerminalActionLocked &&
       !this.pendingActionAfterPlayback &&
-      !this.isReconnecting &&
       !this.isTutorPlayingAudio() &&
       (this.listeningForUser || !this.tutorTurnActive)
     );
@@ -1126,6 +1131,12 @@ export class GeminiLiveVoicePipeline {
         const requiredFrames =
           rawRms >= Math.max(0.036, speechStartThreshold * 1.4) ? 2 : 3;
         if (this.consecutiveSpeechFrames >= requiredFrames) {
+          const quietLeadFrames = Math.max(
+            0,
+            this.idlePreRollBuffer.length - this.consecutiveSpeechFrames
+          );
+          const padQuietFrames = quietLeadFrames < 3 ? 4 - quietLeadFrames : 0;
+
           this.userSpokeInTurn = true;
           this.utteranceReplayAttempts = 0;
           this.speechSegmentsInTurn = 1;
@@ -1136,6 +1147,11 @@ export class GeminiLiveVoicePipeline {
           this.pausePreRollBuffer = [];
           this.currentTurnPcmChunks = [];
           this.unsentLivePcmQueue = [];
+          // Guarantee server-side AutomaticActivityDetection (`prefixPaddingMs: 300`) ALWAYS sees
+          // >=300-400ms of quiet baseline before loud speech even if the user speaks immediately after TTS!
+          for (let q = 0; q < padQuietFrames; q++) {
+            this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
+          }
           for (const preChunk of this.idlePreRollBuffer) {
             this._recordAndSendAudioChunk(preChunk);
           }
@@ -1146,6 +1162,7 @@ export class GeminiLiveVoicePipeline {
           debugLogger.log('info', 'user_speech_start', 'User started speaking Mandarin', {
             rawRms: Number(rawRms.toFixed(4)),
             threshold: Number(speechStartThreshold.toFixed(4)),
+            ...(padQuietFrames > 0 ? { padQuietFrames } : {}),
             ...(!wsOpenNow ? { wsOpen: false } : {})
           });
           this._emitState('listening', 'Hearing your Mandarin...');
@@ -1208,12 +1225,14 @@ export class GeminiLiveVoicePipeline {
 
     if (silenceElapsed >= thresholdMs) {
       // Transient road-bump / breath / click guard: if a brief <=550ms non-speech sound triggered speech_start
-      // and produced zero interim/final ASR text across the full silence window, reset in 0ms without locking out the mic!
+      // and produced zero interim/final ASR text across the full silence window, flush `audioStreamEnd` cleanly
+      // and reset in 0ms without locking out the mic or leaving an open server audio turn!
       if (
         !this._getCombinedLiveUserTranscript() &&
         this.turnVoicedMs <= 550 &&
         this.turnPeakSpeechRms < 0.095
       ) {
+        this._flushAudioStreamEnd(this.ws);
         debugLogger.log(
           'info',
           'transient_noise_ignored',
@@ -1345,6 +1364,14 @@ export class GeminiLiveVoicePipeline {
       clearTimeout(this.uplinkMonitorTimer);
       this.uplinkMonitorTimer = null;
     }
+    if (this.commandWatchdogTimer) {
+      clearTimeout(this.commandWatchdogTimer);
+      this.commandWatchdogTimer = null;
+    }
+    if (this.replayPacerTimer) {
+      clearTimeout(this.replayPacerTimer);
+      this.replayPacerTimer = null;
+    }
   }
 
   _armNoReplyTimer(waitMs, reasonTag, micStats) {
@@ -1371,7 +1398,27 @@ export class GeminiLiveVoicePipeline {
     if (!this.isActive || this.tutorTurnActive || this.wordTerminalActionLocked) return;
 
     const isManualDone = String(reason || '').startsWith('manual_done');
-    const hadUserSpeech = this.userSpokeInTurn;
+    let hadUserSpeech = this.userSpokeInTurn;
+
+    // If the user spoke a very brief 1-syllable reply (e.g. `對` / `好`) and immediately tapped Done
+    // before `consecutiveSpeechFrames` hit 2-3, flush the pre-roll with a 400ms quiet baseline!
+    if (
+      isManualDone &&
+      this.listeningForUser &&
+      !hadUserSpeech &&
+      this.idlePreRollBuffer.length > 0 &&
+      this.turnRawMaxRms >= 0.015
+    ) {
+      hadUserSpeech = true;
+      for (let q = 0; q < 4; q++) {
+        this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
+      }
+      for (const preChunk of this.idlePreRollBuffer) {
+        this._recordAndSendAudioChunk(preChunk);
+      }
+      this.idlePreRollBuffer = [];
+    }
+
     if (isManualDone && this.listeningForUser && this.pausePreRollBuffer.length > 0) {
       for (const bufferedChunk of this.pausePreRollBuffer) {
         this._recordAndSendAudioChunk(bufferedChunk);
@@ -1379,9 +1426,9 @@ export class GeminiLiveVoicePipeline {
       this.pausePreRollBuffer = [];
     }
 
-    // Pad at most 2 clean 100ms zero frames before `audioStreamEnd`
-    if (this.listeningForUser && hadUserSpeech && this.silenceFramesSentInPause < 2) {
-      const padCount = 2 - this.silenceFramesSentInPause;
+    // Pad up to 3 clean 100ms zero frames before `audioStreamEnd`
+    if (this.listeningForUser && hadUserSpeech && this.silenceFramesSentInPause < 3) {
+      const padCount = 3 - this.silenceFramesSentInPause;
       for (let i = 0; i < padCount; i++) {
         this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
       }
@@ -1466,14 +1513,17 @@ export class GeminiLiveVoicePipeline {
       micStats
     });
 
-    this._emitState('connecting', 'Processing your Mandarin...');
+    this._emitState(
+      'connecting',
+      isManualDone ? 'Sent — waiting for Tutor...' : 'Processing your Mandarin...'
+    );
     this._clearTurnTimers();
 
     const recoveryReasonTag = isManualDone ? 'manual_done_no_reply' : 'no_reply_auto_continue';
     const recoveryWaitMs = isManualDone
       ? 1500
       : hadUserSpeech || liveTranscriptSnapshot
-      ? 2800
+      ? 2500
       : 1800;
 
     this._armNoReplyTimer(recoveryWaitMs, recoveryReasonTag, micStats);
@@ -1532,6 +1582,8 @@ export class GeminiLiveVoicePipeline {
       return false;
     }
     this._clearTurnTimers();
+    this.replayInFlight = false;
+    this.pendingManualForceOnConnect = false;
     this._commitPendingUserTranscriptToTurns();
     this._pruneBlankTurns();
 
@@ -1597,7 +1649,8 @@ export class GeminiLiveVoicePipeline {
       this.pendingCommittedReplayChunks = this.lastCommittedPcmChunks;
       this.lastCommittedPcmChunks = null;
       this.consecutiveWedgedRefreshes += 1;
-      const rotationOffset = this.consecutiveWedgedRefreshes >= 2 ? 1 : 0;
+      // Keep primary Gemini 2.5 Native Audio unless 3+ consecutive socket refreshes all failed
+      const rotationOffset = this.consecutiveWedgedRefreshes >= 3 ? 1 : 0;
 
       debugLogger.log(
         'warn',
@@ -1646,7 +1699,7 @@ export class GeminiLiveVoicePipeline {
 
     if (hadAudibleSpeechAttempt && this.currentWord && this.lastLiveConfig) {
       this.consecutiveWedgedRefreshes += 1;
-      const rotationOffset = this.consecutiveWedgedRefreshes >= 2 ? 1 : 0;
+      const rotationOffset = this.consecutiveWedgedRefreshes >= 3 ? 1 : 0;
 
       debugLogger.log(
         'warn',
@@ -1702,13 +1755,49 @@ export class GeminiLiveVoicePipeline {
       return false;
     }
     const suffix = source ? `_${source}` : '';
+
     if (this.listeningForUser) {
+      this.playChime('ack');
       this.commitUserSpeechTurn(`manual_done${suffix}`);
       return true;
     }
-    if (!this.tutorTurnActive && !this.isTutorPlayingAudio() && !this.isReconnecting) {
+
+    // Protect an active automatic PCM replay (`Case 2B`) from being prematurely aborted
+    // if the user taps Done Speaking within the first 3.6 seconds while Gemini is still transcribing it!
+    if (this.replayInFlight && performance.now() - this.replayStartedPerfMs < 3600) {
+      this.playChime('ack');
+      debugLogger.log(
+        'info',
+        'manual_done_during_replay',
+        `User tapped Done (${source || 'ui'}) while audio replay is in flight; keeping replay active`,
+        { replayElapsedMs: Math.round(performance.now() - this.replayStartedPerfMs) }
+      );
+      this._emitState('connecting', 'Processing your recorded speech...');
+      return true;
+    }
+
+    if (this.isReconnecting) {
+      this.playChime('ack');
+      this.pendingManualForceOnConnect = true;
+      debugLogger.log(
+        'info',
+        'manual_done_queued_reconnect',
+        `Queued manual Done (${source || 'ui'}) while socket is reconnecting`
+      );
+      this._emitState('connecting', 'Sending as soon as connected...');
+      return true;
+    }
+
+    if (!this.tutorTurnActive && !this.isTutorPlayingAudio()) {
+      this.playChime('ack');
       return this._recoverStalledTurnOnFreshSocket(`manual_done_force${suffix}`);
     }
+
+    debugLogger.log(
+      'info',
+      'manual_done_ignored',
+      `Ignored Done tap (${source || 'ui'}) while tutor is ${this.isTutorPlayingAudio() ? 'speaking' : 'responding'}`
+    );
     return false;
   }
 
@@ -1728,6 +1817,12 @@ export class GeminiLiveVoicePipeline {
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
         osc.start(now);
         osc.stop(now + 0.29);
+      } else if (type === 'ack') {
+        osc.frequency.setValueAtTime(659.25, now); // E5 crisp confirmation tick
+        gain.gain.setValueAtTime(0.07, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.085);
+        osc.start(now);
+        osc.stop(now + 0.09);
       } else if (type === 'complete') {
         osc.frequency.setValueAtTime(587.33, now); // D5
         osc.frequency.setValueAtTime(880.0, now + 0.12); // A5
@@ -1781,6 +1876,10 @@ export class GeminiLiveVoicePipeline {
     this.utteranceReplayAttempts = 0;
     this.consecutiveWedgedRefreshes = 0;
     this.pendingCustomPromptOnConnect = null;
+    this.replayInFlight = false;
+    this.replayStartedPerfMs = 0;
+    this.pendingManualForceOnConnect = false;
+    this.commandAwaitingReply = false;
     this.lastCommittedVoicedMs = 0;
     this.lastCommittedMicStats = null;
     this.serverAckedCurrentUserTurn = false;
@@ -2272,9 +2371,11 @@ export class GeminiLiveVoicePipeline {
               this.isPhase1InitialTurn = false;
               this.tutorTurnActive = true;
               this.listeningForUser = false;
+              this.commandAwaitingReply = true;
               this.turnCommitPerfMs = performance.now();
               this._emitState('speaking', custom.statusText || 'Tutor speaking...');
               this._sendPromptTurn(ws, modelId, custom.text, custom.tag || 'custom_prompt', custom.extra || {});
+              this._armCommandWatchdog(custom);
               resolve();
               return;
             }
@@ -2326,6 +2427,8 @@ export class GeminiLiveVoicePipeline {
               this.tutorTurnActive = false;
               this.listeningForUser = false;
               this.serverAckedCurrentUserTurn = false;
+              this.replayInFlight = true;
+              this.replayStartedPerfMs = performance.now();
               this.sentAudioChunksInTurn = 0;
               this.turnCommitPerfMs = performance.now();
 
@@ -2343,13 +2446,54 @@ export class GeminiLiveVoicePipeline {
               );
 
               this._emitState('connecting', 'Processing your Mandarin...');
-              for (const chunk of replayChunks) {
-                this._sendRawAudioChunkOnSocket(ws, chunk);
+
+              // Always guarantee >= 400ms of clean digital silence at the start of the stream so
+              // Gemini's server-side AutomaticActivityDetection initializes noise_floor = 0.000!
+              const alreadyHasQuietHeader =
+                replayChunks.length >= 4 &&
+                replayChunks[0] === ZERO_PCM16_100MS_BASE64 &&
+                replayChunks[1] === ZERO_PCM16_100MS_BASE64 &&
+                replayChunks[2] === ZERO_PCM16_100MS_BASE64;
+              if (!alreadyHasQuietHeader) {
+                for (let z = 0; z < 4; z++) {
+                  this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
+                }
               }
-              this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
-              this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
-              this._flushAudioStreamEnd(ws);
-              this._armNoReplyTimer(3400, 'replay_no_reply', this.lastCommittedMicStats);
+
+              const finishReplayStream = () => {
+                if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+                for (let z = 0; z < 4; z++) {
+                  this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
+                }
+                this._flushAudioStreamEnd(ws);
+                this._armNoReplyTimer(4400, 'replay_no_reply', this.lastCommittedMicStats);
+              };
+
+              if (replayChunks.length <= 28) {
+                for (const chunk of replayChunks) {
+                  this._sendRawAudioChunkOnSocket(ws, chunk);
+                }
+                finishReplayStream();
+              } else {
+                // Pace long recordings (e.g. 5–10s sentences) in 16-chunk micro-batches every 15ms
+                // so we don't dump 400KB+ into a single 0ms WebSocket frame burst!
+                let idx = 0;
+                const sendNextBatch = () => {
+                  this.replayPacerTimer = null;
+                  if (!this.isActive || this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+                  const end = Math.min(replayChunks.length, idx + 16);
+                  for (; idx < end; idx++) {
+                    this._sendRawAudioChunkOnSocket(ws, replayChunks[idx]);
+                  }
+                  if (idx < replayChunks.length) {
+                    this.replayPacerTimer = setTimeout(sendNextBatch, 15);
+                  } else {
+                    finishReplayStream();
+                  }
+                };
+                sendNextBatch();
+              }
+
               resolve();
               return;
             }
@@ -2358,6 +2502,8 @@ export class GeminiLiveVoicePipeline {
             if (isReconnect && lastTurn && lastTurn.role === 'tutor') {
               this.isPhase1InitialTurn = false;
               this.turnExpectation = deriveTurnExpectationFromHistory(this.wordTurns);
+              const forceCommitAfterFlush = this.pendingManualForceOnConnect;
+              this.pendingManualForceOnConnect = false;
 
               // If the driver ALREADY started speaking while the socket was mid-reconnect,
               // flush their queued live PCM chunks without resetting their in-progress utterance!
@@ -2367,6 +2513,9 @@ export class GeminiLiveVoicePipeline {
               ) {
                 const queuedCount = this.unsentLivePcmQueue.length;
                 const queued = this.unsentLivePcmQueue.splice(0, queuedCount);
+                for (let z = 0; z < 4; z++) {
+                  this._sendRawAudioChunkOnSocket(ws, ZERO_PCM16_100MS_BASE64);
+                }
                 for (const qChunk of queued) {
                   this._sendRawAudioChunkOnSocket(ws, qChunk);
                 }
@@ -2376,7 +2525,11 @@ export class GeminiLiveVoicePipeline {
                   `Flushed ${queuedCount} live speech chunks captured during reconnect`,
                   { queuedCount, turnExpectation: this.turnExpectation }
                 );
-                this._emitState('listening', 'Hearing your Mandarin...');
+                if (forceCommitAfterFlush) {
+                  this.commitUserSpeechTurn('manual_done_queued');
+                } else {
+                  this._emitState('listening', 'Hearing your Mandarin...');
+                }
                 resolve();
                 return;
               }
@@ -2496,6 +2649,8 @@ export class GeminiLiveVoicePipeline {
     this.listeningForUser = true;
     this.userSpokeInTurn = false;
     this.serverAckedCurrentUserTurn = false;
+    this.replayInFlight = false;
+    this.commandAwaitingReply = false;
     this.activeUserTurnIndex = -1;
     this.consecutiveSpeechFrames = 0;
     this.resumeSpeechFrames = 0;
@@ -2517,7 +2672,8 @@ export class GeminiLiveVoicePipeline {
     this.currentTurnUserTranscript = '';
     this.currentTurnInterimUserTranscript = '';
     this.lastCountdownText = '';
-    this.postPlaybackCooldownUntil = skipCooldown ? 0 : performance.now() + 180;
+    // 280ms post-playback cooldown blocks Phone Speakerphone room reverb / AGC release from falsely triggering speech onset
+    this.postPlaybackCooldownUntil = skipCooldown ? 0 : performance.now() + 280;
 
     this._emitState('listening', customLabel || this._defaultListeningLabel());
   }
@@ -2563,6 +2719,8 @@ export class GeminiLiveVoicePipeline {
 
   _markTutorTurnStartedFromServer() {
     this.serverAckedCurrentUserTurn = true;
+    this.replayInFlight = false;
+    this.commandAwaitingReply = false;
     this._clearTurnTimers();
     this.lastCommittedPcmChunks = null;
     this.pendingCommittedReplayChunks = null;
@@ -2654,6 +2812,7 @@ export class GeminiLiveVoicePipeline {
         const hasNonSpace = Boolean(text.trim());
         this.currentTurnInterimUserTranscript = '';
         if (hasNonSpace) {
+          this.replayInFlight = false;
           const lateExtra =
             !this.listeningForUser && this.turnCommitPerfMs
               ? { lateMs: Math.round(performance.now() - this.turnCommitPerfMs) }
@@ -2944,6 +3103,9 @@ export class GeminiLiveVoicePipeline {
     if (!this.isActive || this.wordTerminalActionLocked || !this.currentWord) {
       return false;
     }
+    if (source === 'button') {
+      this.playChime('ack');
+    }
 
     this._pruneBlankTurns();
     let lastTutorText = '';
@@ -2978,25 +3140,100 @@ export class GeminiLiveVoicePipeline {
       ? `請直接用自然慢速的台灣華語，清楚重複你剛才最後對我說的那句話或問題：「${lastTutorText}」。絕對不要退回第一階段重新唸英文題目，重複完後請維持目前的練習進度繼續等待我回答！`
       : `請再用正常英文語速與自然慢速台灣華語，清楚重複一次這題的英文句子與提示：\n${this.currentWord.english_prompt} 請試著把這句話翻成中文。`;
 
+    const fallbackSpeechText = isBeyondInitialPrompt
+      ? lastTutorText
+      : `${this.currentWord.english_prompt} 請試著把這句話翻成中文。`;
+
     this.sendTextCommand(repeatInstruction, {
       tag: 'repeat_last_prompt',
       statusText: 'Repeating last prompt...',
-      discardPendingUser: true
+      discardPendingUser: true,
+      fallbackSpeechText
     });
     return true;
   }
 
+  _armCommandWatchdog(cmdSpec) {
+    if (this.commandWatchdogTimer) {
+      clearTimeout(this.commandWatchdogTimer);
+    }
+    this.commandWatchdogTimer = setTimeout(() => {
+      this.commandWatchdogTimer = null;
+      if (
+        !this.isActive ||
+        this.wordTerminalActionLocked ||
+        !this.commandAwaitingReply ||
+        this.serverAckedCurrentUserTurn ||
+        this.isTutorPlayingAudio()
+      ) {
+        return;
+      }
+
+      const attempt = (cmdSpec.retryCount || 0) + 1;
+      if (attempt === 1 && this.currentWord && this.lastLiveConfig) {
+        const nextOffset = String(this.activeModelId || '').includes('3.1') ? 0 : 1;
+        debugLogger.log(
+          'warn',
+          'button_command_timeout_retry',
+          `No tutor audio 3800ms after ${cmdSpec.tag}; retrying on clean socket`,
+          { tag: cmdSpec.tag, nextOffset, net: getNetworkSnapshot() }
+        );
+        this.sendTextCommand(cmdSpec.text, {
+          tag: cmdSpec.tag,
+          statusText: cmdSpec.statusText,
+          discardPendingUser: true,
+          fallbackSpeechText: cmdSpec.fallbackSpeechText || null,
+          _retryCount: 1,
+          _retryOffset: nextOffset,
+          _isAutoRetry: true
+        });
+        return;
+      }
+
+      this.commandAwaitingReply = false;
+      this.tutorTurnActive = false;
+      if (cmdSpec.fallbackSpeechText) {
+        debugLogger.log(
+          'warn',
+          'repeat_fallback_tts',
+          `Live socket unresponsive for ${cmdSpec.tag}; speaking cached prompt via browser TTS`,
+          { tag: cmdSpec.tag, net: getNetworkSnapshot() }
+        );
+        this._emitState('speaking', 'Repeating last prompt...');
+        this._speakBrowserFallbackIfAvailable(cmdSpec.fallbackSpeechText, () => {
+          if (this.isActive && !this.wordTerminalActionLocked) {
+            this._beginListeningTurn(null, true);
+          }
+        });
+      } else {
+        debugLogger.log(
+          'warn',
+          'button_command_gave_up',
+          `Live socket unresponsive after retry for ${cmdSpec.tag}; resuming listening`,
+          { tag: cmdSpec.tag, net: getNetworkSnapshot() }
+        );
+        this._beginListeningTurn('Ready — please speak in Mandarin', true);
+      }
+    }, 3800);
+  }
+
   /**
    * Sends a text command into the active Live session (e.g., if the user taps "Repeat" or "Hint").
-   * Automatically opens a clean same-model socket when `realtimeInput.audio` has already streamed
-   * on Gemini 2.5 or when the current socket is disconnected/backed-up, guaranteeing 100% audible output.
+   * Always opens a clean socket whenever ANY `realtimeInput.audio` has already streamed on the
+   * current socket (on BOTH Gemini 2.5 and 3.1) or when a previous command is awaiting reply,
+   * and arms a 3.8s watchdog timer with automatic clean-socket retry + TTS fallback.
    */
   sendTextCommand(text, options = {}) {
     if (!this.isActive || this.wordTerminalActionLocked) return;
     if (options.isHint) {
       this.usedHintInWord = true;
+      if (!options._isAutoRetry) {
+        this.playChime('ack');
+      }
     }
     this._clearTurnTimers();
+    this.replayInFlight = false;
+    this.pendingManualForceOnConnect = false;
 
     if (options.discardPendingUser) {
       this.currentTurnUserTranscript = '';
@@ -3017,25 +3254,40 @@ export class GeminiLiveVoicePipeline {
     this.silentTurnRetries = 0;
     this.listeningForUser = false;
     this.userSpokeInTurn = false;
+    this.serverAckedCurrentUserTurn = false;
     this.tutorTurnActive = true;
     this.turnCommitPerfMs = performance.now();
 
     const tag = options.tag || 'user_button_command';
     const statusText = options.statusText || 'Requesting from tutor...';
+    const cmdSpec = {
+      text,
+      tag,
+      statusText,
+      fallbackSpeechText: options.fallbackSpeechText || null,
+      retryCount: options._retryCount || 0
+    };
 
     const socketHealthyForDirectPrompt =
+      !options._isAutoRetry &&
       Boolean(this.ws && this.ws.readyState === WebSocket.OPEN) &&
       (this.ws.bufferedAmount || 0) === 0 &&
-      !(String(this.activeModelId || '').includes('2.5') && this.hasSentRealtimeAudioOnSocket);
+      !this.hasSentRealtimeAudioOnSocket &&
+      !this.hasUnflushedAudio &&
+      !this.commandAwaitingReply &&
+      !this.isReconnecting;
 
     if (socketHealthyForDirectPrompt) {
+      this.commandAwaitingReply = true;
       this._emitState('connecting', statusText);
       this._sendPromptTurn(this.ws, this.activeModelId, text, tag);
+      this._armCommandWatchdog(cmdSpec);
       return;
     }
 
     if (this.currentWord && this.lastLiveConfig) {
-      this.pendingCustomPromptOnConnect = { text, tag, statusText };
+      this.commandAwaitingReply = false;
+      this.pendingCustomPromptOnConnect = cmdSpec;
       this.isReconnecting = true;
       this._closeRawSocketOnly();
       this._emitState('connecting', statusText);
@@ -3043,7 +3295,7 @@ export class GeminiLiveVoicePipeline {
         this.currentWord,
         this.lastLiveConfig,
         this.wordTurns.length > 0,
-        0
+        options._retryOffset || 0
       )
         .then(() => {
           this.isReconnecting = false;
@@ -3051,7 +3303,15 @@ export class GeminiLiveVoicePipeline {
         .catch((err) => {
           this.isReconnecting = false;
           debugLogger.log('error', 'button_command_socket_failed', err.message || String(err));
-          this._attemptAutoReconnect(1006, tag);
+          if (cmdSpec.fallbackSpeechText) {
+            this._speakBrowserFallbackIfAvailable(cmdSpec.fallbackSpeechText, () => {
+              if (this.isActive && !this.wordTerminalActionLocked) {
+                this._beginListeningTurn(null, true);
+              }
+            });
+          } else {
+            this._attemptAutoReconnect(1006, tag);
+          }
         });
     }
   }
@@ -3157,6 +3417,9 @@ export class GeminiLiveVoicePipeline {
     this.listeningForUser = false;
     this.tutorTurnActive = false;
     this.userSpokeInTurn = false;
+    this.replayInFlight = false;
+    this.pendingManualForceOnConnect = false;
+    this.commandAwaitingReply = false;
     this.pendingActionAfterPlayback = null;
     this.interruptedTutorPartialText = '';
     this.idlePreRollBuffer = [];
