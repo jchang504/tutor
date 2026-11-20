@@ -11,7 +11,7 @@
  *   Markdown diagnostic bundle (`<18KB`) for 1-tap sharing with Gemini.
  */
 
-export const APP_VERSION = 'v25';
+export const APP_VERSION = 'v26';
 const LOG_STORAGE_KEY = 'tw_tutor_debug_logs_v1';
 const MAX_LOG_ENTRIES = 400;
 const MAX_STREAM_TEXT_LEN = 1600;

@@ -686,7 +686,7 @@ function buildMandarinFirstPromptText_(wordsChunk) {
     '',
     'Exact 5 columns per line (separated by a single TAB character `\\t` — generate left-to-right in this exact order):',
     'Col 1: traditional — Exact Traditional Chinese headword from input.',
-    'Col 2: mandarin_sentence — Write this FIRST: a short, natural everyday Taiwanese Mandarin sentence in Traditional Chinese (6 to 14 characters) using the exact Col 1 word. Use Taiwan usage (e.g. 餐廳, 計程車, 公車, 捷運, 早上, 平常, 順便). Every OTHER word in the sentence must be simple beginner/elementary everyday vocabulary (TOCFL 1-2). If input Col 5 has a previous sentence, write a DIFFERENT sentence.',
+    'Col 2: mandarin_sentence — Write this FIRST: a short, natural everyday Taiwanese Mandarin sentence in Traditional Chinese (6 to 14 characters) using the exact Col 1 word. Use Taiwan usage (e.g. 餐廳, 計程車, 公車, 捷運, 早上, 平常, 順便). Every OTHER word in the sentence must be simple beginner/elementary everyday vocabulary (TOCFL 1-2). If input Col 5 lists any previous sentence(s), write a brand-new sentence in a clearly DIFFERENT everyday setting, topic, and subject so the learner practices the word in varied contexts.',
     'Col 3: english_sentence — Translate Col 2 SECOND into a simple, natural everyday English sentence (5 to 11 words) with the exact meaning of Col 2. Never put Chinese characters or Pinyin in Col 3.',
     'Col 4: english_gloss — Concise English meaning of the word (keep input Col 4 if already clear).',
     'Col 5: common_synonyms — Comma-separated close Taiwanese Mandarin synonyms (or leave empty after tab if none).',
@@ -1253,56 +1253,91 @@ function handleRecordReview_(body) {
 
   const fsrsNext = computeFsrsV5_(targetRow, score, desiredRetention);
 
-  // Pre-generate a brand-new Mandarin sentence -> English translation right now so the NEXT review starts instantly!
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vocabSheet = ss.getSheetByName(TAB_VOCAB);
+  const logSheet = ss.getSheetByName(TAB_LOG);
+  const rowIdx = targetRow._rowIndex;
+
+  // Pre-generate (or accept client-pregenerated) brand-new Mandarin sentence -> English translation
+  // in a fresh context so the NEXT review practices the word in a different scenario!
   let nextPrompt = practicedPrompt;
   let nextMandarin = practicedMandarin;
   let nextSynonyms = String(targetRow.common_synonyms || '').trim();
   let generatedGloss = '';
-  try {
-    const apiKey = getGeminiApiKey_();
-    const primaryModel = resolveFastBatchModel_(settings);
-    const singleWord = [{
-      traditional: targetRow.traditional,
-      pinyin: targetRow.pinyin || '',
-      tocfl_level: targetRow.tocfl_level || 2,
-      english_gloss: targetRow.english_gloss || '',
-      previous_mandarin: practicedMandarin
-    }];
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
-    const resp = UrlFetchApp.fetch(url, {
-      method: 'post',
-      contentType: 'application/json',
-      payload: buildSentenceRequestPayload_(singleWord, true),
-      muteHttpExceptions: true
-    });
-    let genMap = null;
-    if (resp.getResponseCode() === 200) {
-      const data = JSON.parse(resp.getContentText());
-      const text = data.candidates &&
-        data.candidates[0] &&
-        data.candidates[0].content &&
-        data.candidates[0].content.parts &&
-        data.candidates[0].content.parts[0] &&
-        data.candidates[0].content.parts[0].text;
-      genMap = parseSentenceBatchResponseText_(text);
-    } else {
-      genMap = generateSingleChunkWithFallback_(singleWord, apiKey, primaryModel, false).map;
-    }
-    const gen = genMap && genMap[targetRow.traditional];
-    if (gen && gen.english_sentence && gen.mandarin_sentence) {
-      nextPrompt = String(gen.english_sentence).trim();
-      nextMandarin = String(gen.mandarin_sentence).trim();
-      nextSynonyms = String(gen.common_synonyms || nextSynonyms).trim();
-      generatedGloss = String(gen.english_gloss || '').trim();
-    }
-  } catch (e) {
-    // Non-fatal: keep previous sentence pair if background generation fails
-  }
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const vocabSheet = ss.getSheetByName(TAB_VOCAB);
-  const rowIdx = targetRow._rowIndex;
+  const clientNextEn = String(body.next_english_prompt || '').trim();
+  const clientNextZh = String(body.next_mandarin_sentence || '').trim();
+  const clientNextSyns = String(body.next_common_synonyms || '').trim();
+
+  if (
+    clientNextEn &&
+    clientNextZh &&
+    clientNextZh.indexOf(targetRow.traditional) !== -1 &&
+    !/[\u4e00-\u9fff]/.test(clientNextEn) &&
+    /[a-zA-Z]{2,}/.test(clientNextEn)
+  ) {
+    nextPrompt = clientNextEn;
+    nextMandarin = clientNextZh;
+    if (clientNextSyns) nextSynonyms = clientNextSyns;
+  } else {
+    try {
+      // Collect up to 4 recent Mandarin sentences for this word from ReviewLog so we vary contexts over time
+      const prevSentences = [];
+      if (practicedMandarin) prevSentences.push(practicedMandarin);
+      if (logSheet && logSheet.getLastRow() > 1) {
+        const logRows = logSheet.getDataRange().getValues();
+        for (let r = logRows.length - 1; r >= 1 && prevSentences.length < 4; r--) {
+          if (String(logRows[r][2] || '').trim() === String(targetRow.traditional).trim()) {
+            const oldZh = String(logRows[r][16] || '').trim();
+            if (oldZh && prevSentences.indexOf(oldZh) === -1) {
+              prevSentences.push(oldZh);
+            }
+          }
+        }
+      }
+
+      const apiKey = getGeminiApiKey_();
+      const candidateModels = discoverFastGeminiModels_(apiKey, settings);
+      const primaryModel = candidateModels[0];
+      const singleWord = [{
+        traditional: targetRow.traditional,
+        pinyin: targetRow.pinyin || '',
+        tocfl_level: targetRow.tocfl_level || 2,
+        english_gloss: targetRow.english_gloss || '',
+        previous_mandarin: prevSentences.join(' / ')
+      }];
+      const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+        encodeURIComponent(primaryModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+      const resp = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: buildSentenceRequestPayload_(singleWord, primaryModel, false),
+        muteHttpExceptions: true
+      });
+      let genMap = null;
+      if (resp && resp.getResponseCode() === 200) {
+        const text = extractGeminiResponseText_(resp.getContentText());
+        genMap = parseSentenceBatchResponseText_(text);
+      }
+      if (!genMap || !genMap[targetRow.traditional]) {
+        genMap = generateSingleChunkWithFallback_(
+          singleWord,
+          apiKey,
+          candidateModels,
+          resp && resp.getResponseCode() === 400 ? primaryModel : ''
+        ).map;
+      }
+      const gen = genMap && genMap[targetRow.traditional];
+      if (gen && gen.english_sentence && gen.mandarin_sentence) {
+        nextPrompt = String(gen.english_sentence).trim();
+        nextMandarin = String(gen.mandarin_sentence).trim();
+        nextSynonyms = String(gen.common_synonyms || nextSynonyms).trim();
+        generatedGloss = String(gen.english_gloss || '').trim();
+      }
+    } catch (e) {
+      // Non-fatal: keep previous sentence pair if background generation fails
+    }
+  }
 
   if (!String(targetRow.english_gloss || '').trim() && generatedGloss) {
     vocabSheet.getRange(rowIdx, 6).setValue(generatedGloss);
@@ -1327,8 +1362,8 @@ function handleRecordReview_(body) {
     nextSynonyms
   ]]);
 
-  const logSheet = ss.getSheetByName(TAB_LOG);
-  logSheet.appendRow([
+  if (logSheet) {
+    logSheet.appendRow([
     fsrsNext.nowIso,
     targetRow.id,
     targetRow.traditional,
@@ -1347,6 +1382,7 @@ function handleRecordReview_(body) {
     telemetry.notes || '',
     practicedMandarin
   ]);
+  }
 
   return {
     ok: true,

@@ -1,25 +1,24 @@
 /**
  * Gemini Live WebSocket + WebAudio PCM 16kHz/24kHz Streaming Engine (`live-audio.js`)
  *
- * Key architectural guarantees (v25):
+ * Key architectural guarantees (v26):
  * 1. Fresh WebSocket connection per vocabulary word (zero multi-word context drift).
  * 2. ZERO `tools` / `functionDeclarations` on the Live Audio WebSocket:
  *    Uses deterministic spoken sign-off phrases (`「好，我們看下一題！」`, `「好，我們跳過這題！」`,
- *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading runs asynchronously
- *    over standard REST JSON in the background after the word ends!
+ *    etc.) detected from `outputAudioTranscription`, while FSRS v5 grading & next-sentence
+ *    generation run asynchronously over standard REST JSON after the word ends!
  * 3. Driving Cellular & VAD Resilience:
- *    - Pre-speech 400ms clean digital-silence baseline + 500ms local pre-roll ring buffer so
- *      server-side AutomaticActivityDetection ALWAYS sees a crisp quiet->speech transition even
- *      when the user begins speaking 200ms after tutor playback ends.
+ *    - Pre-speech 400ms clean digital-silence baseline + 500ms local pre-roll ring buffer.
+ *    - Patient mid-sentence hesitation endpointing (~2.5–2.6s when halfway through a thought,
+ *      paired with server `END_SENSITIVITY_LOW` + `silenceDurationMs: 2000`) so learners aren't cut off.
  *    - Paced 16kHz PCM utterance replay with in-flight protection + watchdog-backed Repeat/Hint commands.
- *    - Captures speech continuously in memory even while a dropped socket is mid-reconnect.
  * 4. Context-preserving Repeat (`repeatLastTutorPrompt`): repeats ONLY the tutor's last spoken prompt
  *    or follow-up question on a guaranteed clean socket (with automatic retry & TTS fallback).
- * 5. Smart context- & sentence-completeness-aware endpointing + Clean Bluetooth Call / MediaSession Anchor.
+ * 5. Clean Bluetooth Call / MediaSession Anchor for car steering-wheel Previous & Next buttons.
  */
 
-import { debugLogger, getNetworkSnapshot } from './debug-logger.js?v=25';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=25';
+import { debugLogger, getNetworkSnapshot } from './debug-logger.js?v=26';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=26';
 
 const LIVE_WS_ENDPOINT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -269,9 +268,11 @@ export function hasCompletedReplyAndQuestionBack(transcript = '', speechSegments
 
 /**
  * Intelligent context- and sentence-completeness-aware post-speech silence calculator:
- * - Responds snappily (~850–1100ms, matching consumer Gemini Live) when a sentence is complete.
- * - Holds longer (~1850–1950ms) when the user pauses mid-sentence (short fragment, filler, or dangling word).
- * - Preserves `'reply_and_ask_back'` (~2650ms) and `'ask_question_only'` branches when `ENABLE_USER_ASK_BACK_FLOW` is enabled.
+ * - Waits patiently (~2500–2600ms) when the learner hesitates mid-sentence (short fragment, filler,
+ *   determiner/adverb/preposition/verb tail, or incomplete clause) so the tutor doesn't jump in early.
+ * - Responds smoothly (~1350–1550ms) once a full Mandarin sentence is complete (and the user can always
+ *   tap Done Speaking for 0ms instant commit).
+ * - Preserves `'reply_and_ask_back'` and `'ask_question_only'` branches when `ENABLE_USER_ASK_BACK_FLOW` is enabled.
  */
 export function computeSmartSilenceThresholdMs({
   transcript = '',
@@ -295,13 +296,16 @@ export function computeSmartSilenceThresholdMs({
 
   const hasTerminalPunct = /[。！？!?]\s*$/.test(raw);
   const hasTrailingCommaOrFiller =
-    /[，,、…—-]\s*$/.test(raw) || /(?:嗯|呃|那個|就是|然後)\s*[。，,、…]*$/.test(raw);
+    /[，,、…—-]\s*$/.test(raw) || /(?:嗯|呃|啊|喔|那個|這個|就是|然後|所以說)\s*[。，,、…]*$/.test(raw);
   const hasAlwaysDanglingWord =
-    /(?:因為|所以|如果|要是|雖然|但是|可是|不過|而且|還是|或者|的時候|的話|我覺得|我想|我要|我打算|我準備|正在|試著|在|從|離|把|被|給|跟|對|比|往)\s*[。，,、…]*$/.test(
+    /(?:因為|所以|如果|要是|雖然|但是|可是|不過|而且|還是|或者|的時候|的話|我覺得|我想|我要|我打算|我準備|我喜歡|我希望|正在|試著|在|從|離|把|被|給|跟|和|對|比|往|向|用|坐|搭|騎|開|很|非常|比較|特別|太|更|最|真|滿|蠻|還|剛|剛剛|已經|一直|常常|經常|平常|有時候|這個|那個|哪個|一個|兩個|每個|這間|那間|這家|那家|的|得|地)\s*[。，,、…]*$/.test(
       raw
     );
   const hasUnpunctuatedAuxiliaryTail =
-    !hasTerminalPunct && /(?:去|到|要|想|會|能|可以|應該|可能|喜歡|開始|繼續)\s*$/.test(raw);
+    !hasTerminalPunct &&
+    /(?:去|到|要|想|會|能|可以|應該|可能|喜歡|開始|繼續|有|沒有|是|不是|吃|喝|買|看|聽|說|做|學|住|去過)\s*$/.test(
+      raw
+    );
 
   const isTrailingIncomplete =
     Boolean(raw) &&
@@ -313,24 +317,24 @@ export function computeSmartSilenceThresholdMs({
       !isTrailingIncomplete &&
       hasCompletedReplyAndQuestionBack(raw, speechSegmentsInTurn)
     ) {
-      return { thresholdMs: 950, reason: 'reply_and_question_complete' };
+      return { thresholdMs: 1300, reason: 'reply_and_question_complete' };
     }
     return {
-      thresholdMs: isTrailingIncomplete ? 2850 : 2650,
+      thresholdMs: isTrailingIncomplete ? 3100 : 2850,
       reason: 'awaiting_followup_question'
     };
   }
 
   // 3. Preserved standalone question turn (`ENABLE_USER_ASK_BACK_FLOW = true`)
   if (turnExpectation === 'ask_question_only') {
-    if (!isTrailingIncomplete && containsMandarinQuestion(raw) && hanziCount >= 3) {
-      return { thresholdMs: 950, reason: 'question_complete' };
+    if (!isTrailingIncomplete && containsMandarinQuestion(raw) && hanziCount >= 4) {
+      return { thresholdMs: 1300, reason: 'question_complete' };
     }
     if (isTrailingIncomplete || (raw && !containsMandarinQuestion(raw))) {
-      return { thresholdMs: 1850, reason: 'forming_question' };
+      return { thresholdMs: 2450, reason: 'forming_question' };
     }
     return {
-      thresholdMs: voicedMs >= 1300 ? 1500 : 1850,
+      thresholdMs: voicedMs >= 1400 ? 1950 : 2400,
       reason: 'question_acoustic'
     };
   }
@@ -339,36 +343,34 @@ export function computeSmartSilenceThresholdMs({
   const effectiveExpectedMin = turnExpectation === 'answer_followup' ? 0 : expectedMinHanzi;
   const minCompleteHanzi =
     effectiveExpectedMin >= 5
-      ? Math.max(4, Math.ceil(effectiveExpectedMin * 0.6))
-      : turnExpectation === 'answer_followup'
-      ? 3
-      : 4;
+      ? Math.max(5, Math.ceil(effectiveExpectedMin * 0.68))
+      : 5;
 
   if (raw) {
     if (
       isTrailingIncomplete ||
       (effectiveExpectedMin >= 6 &&
         hanziCount > 0 &&
-        hanziCount < Math.ceil(effectiveExpectedMin * 0.52))
+        hanziCount < Math.ceil(effectiveExpectedMin * 0.58))
     ) {
-      return { thresholdMs: 1950, reason: 'incomplete_sentence_fragment' };
+      return { thresholdMs: 2600, reason: 'incomplete_sentence_fragment' };
     }
     if (hasTerminalPunct && hanziCount >= minCompleteHanzi) {
-      return { thresholdMs: 950, reason: 'sentence_complete_punctuated' };
+      return { thresholdMs: 1350, reason: 'sentence_complete_punctuated' };
     }
-    if (hanziCount >= minCompleteHanzi && voicedMs >= 950) {
-      return { thresholdMs: 1100, reason: 'sentence_complete_length' };
+    if (hanziCount >= minCompleteHanzi && voicedMs >= 1100) {
+      return { thresholdMs: 1550, reason: 'sentence_complete_length' };
     }
-    // Under spotty cellular latency, ASR may have only emitted the first 1-2 characters (`有`)
-    // of a longer spoken sentence — give 1900ms so we don't cut the driver off mid-thought!
-    return { thresholdMs: 1900, reason: 'short_partial_transcript' };
+    // Under cellular latency or mid-sentence hesitation, ASR may have only emitted the first 1-4 chars:
+    // wait 2500ms so we never cut the learner off while they are still forming the rest of their sentence!
+    return { thresholdMs: 2500, reason: 'short_partial_transcript' };
   }
 
   // Acoustic fallback when interim/final transcript has not arrived yet (e.g. mobile cellular latency in car):
-  if (voicedMs >= 1350) {
-    return { thresholdMs: 1650, reason: 'acoustic_sentence_complete' };
+  if (voicedMs >= 1500) {
+    return { thresholdMs: 2150, reason: 'acoustic_sentence_complete' };
   }
-  return { thresholdMs: 1950, reason: 'acoustic_short_utterance' };
+  return { thresholdMs: 2500, reason: 'acoustic_short_utterance' };
 }
 
 export function buildWordSystemInstruction(
@@ -390,8 +392,8 @@ export function buildWordSystemInstruction(
       .map((t) => `${t.role === 'tutor' ? '老師' : '學生'}：${t.text}`)
       .join('\n');
     const resumeEndHint = enableAskBack
-      ? '若學生已回答或反問問題，請同樣嚴格檢查他的發音、聲調與語法：若有錯誤或夾雜英文請先糾正並請他重說整句；若整句已經完全自然正確且已完成問答，請簡短回答一句並說出固定結尾口令「好，我們看下一題！」。'
-      : '若你已經問過延伸問題且學生剛才已回答，請同樣先嚴格檢查他剛才那句回答的發音、聲調與語法：若有錯誤、夾雜英文或只說了單詞片段，請先糾正並停下來等待他重說整句回答；只有當整句回答已經完全自然正確時，才簡短自然回應一句並說出固定結尾口令「好，我們看下一題！」。';
+      ? '若學生已回答或反問問題，請同樣嚴格檢查他的發音、聲調與語法：若有錯誤或夾雜英文請先糾正並請他重說整句；若整句已經完全自然正確且已完成問答，請用 1 句簡短的陳述句回應（嚴禁在結尾反問任何新問題！）並說出固定結尾口令「好，我們看下一題！」。'
+      : '若你已經問過延伸問題且學生剛才已回答，請同樣先嚴格檢查他剛才那句回答的發音、聲調與語法：若有錯誤、夾雜英文或只說了單詞片段，請先糾正並停下來等待他重說整句回答；只有當整句回答已經完全自然正確時，才用 1 句簡短的肯定或相關陳述句回應（絕對禁止再問任何問題或反問句！）並說出固定結尾口令「好，我們看下一題！」。';
     resumeSection = `\n\n【本題目前已完成的對話紀錄（剛才網路短暫重連，請直接從最後一句自然接續，絕對不要重頭出題或重複已經說過的話！）】\n${formattedTurns}\n請根據上述對話進度直接接續目前的練習階段；${resumeEndHint}`;
   }
 
@@ -401,12 +403,12 @@ export function buildWordSystemInstruction(
   2. 請用與階段一完全相同的標準，非常仔細地檢查學生回答與提問的發音、聲調、用詞與語法（若夾雜英文單字請告訴他台灣華語怎麼說；局部錯誤請只糾正該詞或聲調而不要直接洩漏整句，整體語法錯誤則可示範完整自然句）。只要有任何錯誤，請務必請他把修正後的完整句子重說一次並停下來等待，反覆修正直到整句完全正確為止！
   3. **關鍵規則**：當回答句子完全正確後，如果學生還沒反問你問題，**請絕對不要再問他新的問題**！請先簡短回應他一句，然後明確請他問你一個問題（例如：「聽起來不錯！現在換你問我一個問題吧！」），並對他的提問同樣把關直到整句正確後再進入階段四。
 
-- **階段四（老師簡短回答並說出固定換題口令）**：
-  當學生親口完整說出正確自然的提問後，請用簡單、自然慢速的台灣華語**簡短回答他的問題（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+- **階段四（老師簡短陳述回答並說出固定換題口令——嚴禁反問問題！）**：
+  當學生親口完整說出正確自然的提問後，請用簡單、自然慢速的台灣華語**用 1 句簡短陳述句回答他的問題（絕對不要反問學生任何問題！）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
   （注意：在階段一至階段三未全部完成且句子完全正確前，絕對不可以說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
 
   // Active default Phase 3 block (`ENABLE_USER_ASK_BACK_FLOW = false` — no ask-back question required)
-  const answerOnlyFlowPhases = `- **階段三（學生回答延伸問題、嚴格把關母語者自然度與發音聲調、直到整句回答完全正確 → 老師簡短回應並說出固定換題口令）**：
+  const answerOnlyFlowPhases = `- **階段三（學生回答延伸問題、嚴格把關母語者自然度與發音聲調、直到整句回答完全正確 → 老師用陳述句肯定回應並說出固定換題口令）**：
   1. 學生會用中文回答你的延伸問題（**不需要**請學生反問你問題；回答內容只要自然合情理即可，不強制一定要包含目標詞，但必須是一句**語意完整的自然中文句子**）。
   2. **對學生的回答進行與階段一完全相同的嚴格母語者把關（Strict Native Speaker Check — 極重要）**：
      - **非常仔細地檢查發音、聲調與語法**：只要學生的回答有任何地方跟台灣母語者自然的說法不一樣——包含**任何一個字的聲調或發音不準、用詞不道地、量詞錯誤、語序不自然、漏字，或是只回答了單一詞語而非完整句子**——都請務必明確指出來糾正，不要放水帶過！
@@ -418,8 +420,9 @@ export function buildWordSystemInstruction(
      - **關鍵鐵律**：只要你給了**任何發音/聲調糾正、語法/用詞修正、或英文詞翻譯**，請務必請學生**把修正後的「整句回答」重新完整說一次**，然後**立刻停下來等待學生開口**！**絕對不可以**在同一輪糾正裡直接結束並說出「好，我們看下一題！」！
      - 如果學生只單獨唸了那一個詞、沒有說完整句話，請肯定那個詞對了，並請他**把整句回答完整連起來說一次**。
      - 如果學生重說時還有其他發音、聲調或語法小錯誤，請**繼續針對錯誤糾正並請他重說整句回答**，反覆練習直到他親口完整說出一句自然、語法正確且發音標準的中文回答為止！
-  4. **整句回答完全正確後，簡短回應並切換下一題**：
-     - 當學生的回答一開始就完全自然正確，或者經過修正後終於親口完整說出正確自然的句子時，請用簡單、自然慢速的台灣華語**簡短自然回應他的回答（1 句短句即可）**，並在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+  4. **整句回答完全正確後，用「肯定／相關陳述句」簡短回應並切換下一題（嚴禁在結尾問問題！）**：
+     - 當學生的回答一開始就完全自然正確，或者經過修正後終於親口完整說出正確自然的句子時，請用簡單、自然慢速的台灣華語針對他的回答給予 **1 句簡短自然的肯定或相關感想陳述句（acknowledgment / statement）**（例如：「自己在家煮飯真的很健康又省錢！」或「聽起來很棒，週末這樣放鬆真的很舒服！」），接著直接在最後一字不差地說出固定換題口令：**「好，我們看下一題！」**。
+     - **絕對禁止在結尾追問任何問題（極重要）**：每題練習你最多只問階段二的**那一個**延伸問題！在準備說「好，我們看下一題！」之前的那句回應，**絕對不可以是問句或反問句**（嚴禁出現「嗎？／呢？／對不對？／是不是？／什麼／哪裡／為什麼」等任何疑問語氣），以免讓學生誤以為還要繼續回答問題卻馬上被切到下一題！
      - （注意：在階段一「翻譯句子整句完全正確」與階段三「延伸問題的回答整句完全正確」都完成之前，絕對不可以提前說出「我們看下一題」；一說出「好，我們看下一題！」系統就會自動計分並切換到下一個單字！）`;
 
   return `你是一位專業、親切、有耐心且聽力極敏銳的台灣華語（Taiwanese Mandarin）口語家教。學生正在進行全免持（hands-free）口說練習。
@@ -1269,13 +1272,13 @@ export class GeminiLiveVoicePipeline {
     // During a pause BEFORE thresholdMs is reached:
     // - Frames 1–4 (400ms): send real mic tail so soft trailing syllables / neutral-tone suffixes
     //   (like `子` in `這樣子`, `了`, `嗎`, `的`) are preserved 100% intact!
-    // - Frames 5–11 (700ms): send clean digital-zero PCM so server ASR emits `inputTranscription` promptly
-    //   while keeping the 100ms stream continuously clocked below server `silenceDurationMs` (1500ms)!
-    // - Frames >= 12: hold silence locally (keeping a 300ms pre-roll ring buffer) during longer pauses.
+    // - Frames 5–9 (500ms): send clean digital-zero PCM so server ASR emits `inputTranscription` promptly
+    //   while staying well below server `silenceDurationMs` (2000ms) so the server never cuts in early!
+    // - Frames >= 10: hold silence locally (keeping a 300ms pre-roll ring buffer) during longer thinking pauses.
     if (this.silenceFramesSentInPause < 4) {
       this._recordAndSendAudioChunk(pcm16Base64);
       this.silenceFramesSentInPause += 1;
-    } else if (this.silenceFramesSentInPause < 11) {
+    } else if (this.silenceFramesSentInPause < 9) {
       this._recordAndSendAudioChunk(ZERO_PCM16_100MS_BASE64);
       this.silenceFramesSentInPause += 1;
     } else {
@@ -2325,7 +2328,8 @@ export class GeminiLiveVoicePipeline {
           setupObj.realtimeInputConfig = {
             automaticActivityDetection: {
               prefixPaddingMs: 300,
-              silenceDurationMs: 1500
+              endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+              silenceDurationMs: 2000
             }
           };
           setupObj.contextWindowCompression = {

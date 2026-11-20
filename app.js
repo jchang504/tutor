@@ -14,16 +14,37 @@
  */
 
 import { computeDeterministicScore, computeFsrsV5, scoreLabel } from './fsrs.js';
-import { APP_VERSION, debugLogger } from './debug-logger.js?v=25';
+import { APP_VERSION, debugLogger } from './debug-logger.js?v=26';
 import {
   ENABLE_USER_ASK_BACK_FLOW,
   GeminiLiveVoicePipeline
-} from './live-audio.js?v=25';
-import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=25';
+} from './live-audio.js?v=26';
+import { numberedPinyinToToneMarks } from './pinyin-utils.js?v=26';
 import { SAMPLE_TAIWAN_BATCH } from './sample-vocab.js';
 
 function escapeRegExp(str = '') {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function isValidFreshSentencePair(
+  word,
+  nextMandarin,
+  nextEnglish,
+  prevMandarin = '',
+  prevEnglish = ''
+) {
+  const target = String(word?.traditional || '').trim();
+  const zh = String(nextMandarin || '').trim();
+  const en = String(nextEnglish || '').trim();
+  if (!target || !zh || !en) return false;
+  if (!zh.includes(target)) return false;
+  const cjkCount = (zh.match(/[\u4e00-\u9fff]/g) || []).length;
+  if (cjkCount < 4) return false;
+  if (prevMandarin && zh === String(prevMandarin).trim()) return false;
+  if (!/[a-zA-Z]{2,}/.test(en)) return false;
+  if (/[\u4e00-\u9fff]/.test(en)) return false;
+  if (prevEnglish && en.toLowerCase() === String(prevEnglish).trim().toLowerCase()) return false;
+  return true;
 }
 
 export function compactRubricSummary(t = {}) {
@@ -505,7 +526,8 @@ const STORAGE_KEYS = {
   VOICE_NAME: 'tw_tutor_voice_name',
   PREFERRED_LIVE_MODEL: 'tw_tutor_preferred_live_model',
   AUDIO_ROUTING_MODE: 'tw_tutor_audio_routing_mode',
-  MIC_DEVICE_ID: 'tw_tutor_mic_device_id'
+  MIC_DEVICE_ID: 'tw_tutor_mic_device_id',
+  WORD_SENTENCE_CACHE: 'tw_tutor_word_sentences_v1'
 };
 
 export class MandarinTutorApp {
@@ -1139,10 +1161,75 @@ export class MandarinTutorApp {
     }
   }
 
+  _wordCacheKey(word) {
+    return String(word?.id || word?.traditional || '').trim();
+  }
+
+  _readWordSentenceCache() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEYS.WORD_SENTENCE_CACHE);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  _writeWordSentenceCache(cache) {
+    try {
+      const entries = Object.entries(cache || {});
+      if (entries.length > 500) {
+        entries.sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0));
+        const trimmed = {};
+        for (const [k, v] of entries.slice(0, 500)) trimmed[k] = v;
+        localStorage.setItem(STORAGE_KEYS.WORD_SENTENCE_CACHE, JSON.stringify(trimmed));
+      } else {
+        localStorage.setItem(STORAGE_KEYS.WORD_SENTENCE_CACHE, JSON.stringify(cache || {}));
+      }
+    } catch (_) {
+      // Ignore storage quota errors
+    }
+  }
+
+  _applyCachedFreshSentenceIfNeeded(word, cacheObj = null) {
+    if (!word || typeof word !== 'object') return word;
+    const cache = cacheObj || this._readWordSentenceCache();
+    const entry =
+      cache[this._wordCacheKey(word)] ||
+      (word.traditional ? cache[String(word.traditional).trim()] : null);
+    const pending = entry?.pendingNext;
+    if (!pending) return word;
+
+    const curPrompt = String(word.english_prompt || '').trim();
+    const replacedSet = new Set(
+      [
+        ...(Array.isArray(pending.replacesPrompts) ? pending.replacesPrompts : []),
+        pending.replacesPrompt || ''
+      ]
+        .map((s) => String(s || '').trim())
+        .filter(Boolean)
+    );
+
+    if (
+      (!curPrompt || replacedSet.has(curPrompt)) &&
+      isValidFreshSentencePair(word, pending.mandarin_sentence, pending.english_prompt)
+    ) {
+      return Object.assign({}, word, {
+        english_prompt: pending.english_prompt,
+        mandarin_sentence: pending.mandarin_sentence,
+        sample_mandarin: pending.mandarin_sentence,
+        ...(pending.common_synonyms ? { common_synonyms: pending.common_synonyms } : {})
+      });
+    }
+    return word;
+  }
+
   async loadNextBatch() {
     const gasUrl = (localStorage.getItem(STORAGE_KEYS.GAS_URL) || '').trim();
     const secret = (localStorage.getItem(STORAGE_KEYS.SECRET) || '').trim();
     const directKey = (localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) || '').trim();
+    const sentenceCache = this._readWordSentenceCache();
 
     if (gasUrl && secret) {
       const batchSize = Number(localStorage.getItem(STORAGE_KEYS.BATCH_SIZE) || 20);
@@ -1157,7 +1244,10 @@ export class MandarinTutorApp {
       });
 
       this.batch = (res.batch || []).map((w) =>
-        Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') })
+        this._applyCachedFreshSentenceIfNeeded(
+          Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') }),
+          sentenceCache
+        )
       );
       if (res.liveAuth && res.liveAuth.apiKey) {
         this.liveAuth = Object.assign({}, this.liveAuth, res.liveAuth, {
@@ -1180,7 +1270,10 @@ export class MandarinTutorApp {
     } else if (directKey) {
       this.liveAuth.apiKey = directKey;
       this.batch = SAMPLE_TAIWAN_BATCH.map((w) =>
-        Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') })
+        this._applyCachedFreshSentenceIfNeeded(
+          Object.assign({}, w, { pinyin: numberedPinyinToToneMarks(w.pinyin || '') }),
+          sentenceCache
+        )
       );
       debugLogger.log('info', 'batch_loaded_sample', 'Loaded 5 sample words (Direct Key Mode)');
       this.showToast('Loaded 5 sample Taiwanese Mandarin words (Direct Key Mode).', 'info');
@@ -1327,9 +1420,9 @@ export class MandarinTutorApp {
     return ['models/gemini-2.5-flash', 'models/gemini-3.1-flash-lite-preview', 'models/gemini-3-flash-preview'];
   }
 
-  async _requestGradingJsonFromModel(modelName, apiKey, gradingPrompt, signal) {
+  async _requestGradingJsonFromModel(modelName, apiKey, gradingPrompt, signal, temperature = 0.1) {
     const generationConfig = {
-      temperature: 0.1,
+      temperature,
       responseMimeType: 'application/json'
     };
     if (modelName.includes('2.5')) {
@@ -1490,18 +1583,174 @@ ${dialogueText}`;
     }
   }
 
+  async generateFreshSentencePair(word) {
+    const apiKey = (
+      (this.liveAuth && this.liveAuth.apiKey) ||
+      localStorage.getItem(STORAGE_KEYS.DIRECT_API_KEY) ||
+      ''
+    ).trim();
+    if (!apiKey || !word || !String(word.traditional || '').trim()) {
+      return null;
+    }
+
+    const curMandarin = String(word.mandarin_sentence || word.sample_mandarin || '').trim();
+    const curEnglish = String(word.english_prompt || '').trim();
+    const cache = this._readWordSentenceCache();
+    const cacheEntry =
+      cache[this._wordCacheKey(word)] ||
+      cache[String(word.traditional).trim()] ||
+      null;
+
+    const prevMandarinList = [];
+    for (const s of [curMandarin, ...(Array.isArray(cacheEntry?.recentMandarin) ? cacheEntry.recentMandarin : [])]) {
+      const clean = String(s || '').trim();
+      if (clean && !prevMandarinList.includes(clean) && prevMandarinList.length < 4) {
+        prevMandarinList.push(clean);
+      }
+    }
+
+    const candidates = (await this._discoverFastGradingCandidates(apiKey)).slice();
+    const prevBlock =
+      prevMandarinList.length > 0
+        ? `- Previously practiced sentence(s) for "${word.traditional}" (DO NOT reuse the same topic, setting, or grammatical subject — pick a clearly DIFFERENT everyday life scenario!): ${prevMandarinList.map((s) => `"${s}"`).join(' / ')}`
+        : '- Choose a vivid, relatable everyday Taiwan scenario (commuting, work, family, dining, travel, weekend plans, weather, health, or shopping).';
+
+    const promptText = `Write ONE brand-new Taiwanese Mandarin (繁體中文) practice sentence for the target vocabulary word "${word.traditional}" (${word.pinyin || ''}, meaning "${word.english_gloss || ''}") and translate it into natural everyday English. Return ONLY a JSON object with these exact keys:
+{
+  "mandarin_sentence": "Traditional Chinese sentence (Taiwan usage, 6-14 characters, MUST include exact word ${word.traditional})",
+  "english_prompt": "Natural everyday English translation of mandarin_sentence (5-12 words, ZERO Chinese characters or Pinyin)",
+  "common_synonyms": "comma-separated Traditional Chinese synonyms in Taiwan Mandarin if any, else empty string"
+}
+
+Rules:
+- STEP 1 (MANDARIN FIRST): Write "mandarin_sentence" FIRST in natural, idiomatic Taiwanese Mandarin (繁體中文: 計程車, 捷運, 便當, 早上, 週末, 餐廳, 辦公室, etc. — never Mainlandisms like 打車, 盒飯, 挺...的).
+- It MUST contain the exact target characters "${word.traditional}" used naturally.
+- Keep ALL OTHER surrounding words simple (TOCFL Level 1-2 everyday vocabulary) so ONLY "${word.traditional}" is challenging.
+${prevBlock}
+- STEP 2 (ENGLISH TRANSLATION): Translate your "mandarin_sentence" accurately into natural spoken English ("english_prompt"). Never include Chinese characters or Pinyin inside "english_prompt".`;
+
+    for (let i = 0; i < Math.min(3, candidates.length); i++) {
+      const usedModel = candidates[i];
+      const modelCtrl = new AbortController();
+      const modelTimer = setTimeout(() => {
+        modelCtrl.abort(new Error(`next_sentence_timeout_6s (${usedModel})`));
+      }, 6000);
+      try {
+        const parsed = await this._requestGradingJsonFromModel(
+          usedModel,
+          apiKey,
+          promptText,
+          modelCtrl.signal,
+          0.75
+        );
+        const nextZh = String(parsed?.mandarin_sentence || '').trim();
+        const nextEn = String(parsed?.english_prompt || '').trim();
+        const nextSyns = String(parsed?.common_synonyms || '').trim();
+
+        if (isValidFreshSentencePair(word, nextZh, nextEn, curMandarin, curEnglish)) {
+          debugLogger.log(
+            'info',
+            'next_sentence_generated',
+            `Pre-generated fresh sentence for ${word.traditional} via ${usedModel.replace(/^models\//, '')}`,
+            { nextEn, nextZh }
+          );
+          return {
+            mandarin_sentence: nextZh,
+            english_prompt: nextEn,
+            common_synonyms: nextSyns
+          };
+        }
+      } catch (errTry) {
+        if (errTry.httpStatus === 401 || errTry.httpStatus === 403) {
+          break;
+        }
+      } finally {
+        clearTimeout(modelTimer);
+      }
+    }
+    return null;
+  }
+
   async persistAndGradeWordReview(word, wordTurns, heuristicTelemetry, forceNeededHint) {
-    const finalTelemetry = await this.gradeWordTranscriptWithFlash(
-      word,
-      wordTurns,
-      heuristicTelemetry,
-      forceNeededHint
-    );
+    const practicedPrompt = String(word.english_prompt || '').trim();
+    const practicedMandarin = String(word.mandarin_sentence || word.sample_mandarin || '').trim();
+
+    const [finalTelemetry, freshPair] = await Promise.all([
+      this.gradeWordTranscriptWithFlash(word, wordTurns, heuristicTelemetry, forceNeededHint),
+      this.generateFreshSentencePair(word)
+    ]);
     const finalScore = computeDeterministicScore(finalTelemetry);
     const finalFsrs = computeFsrsV5(word, finalScore, 0.90);
 
     if (this.lastScoredWordId === word.id) {
       this._renderScoreBanner(word, finalScore, finalFsrs.intervalDays, finalTelemetry.notes);
+    }
+
+    // Record practiced sentence history and cache the freshly generated next-review sentence
+    // so the next session ALWAYS gets a fresh context (even before Apps Script is redeployed or in Direct Key mode).
+    const cacheKey = this._wordCacheKey(word);
+    if (cacheKey) {
+      const cache = this._readWordSentenceCache();
+      const prevEntry = cache[cacheKey] || {};
+      const recentMandarin = [];
+      for (const s of [
+        freshPair?.mandarin_sentence || '',
+        practicedMandarin,
+        ...(Array.isArray(prevEntry.recentMandarin) ? prevEntry.recentMandarin : [])
+      ]) {
+        const clean = String(s || '').trim();
+        if (clean && !recentMandarin.includes(clean) && recentMandarin.length < 4) {
+          recentMandarin.push(clean);
+        }
+      }
+
+      const nextEntry = {
+        recentMandarin,
+        updatedAt: Date.now(),
+        ...(prevEntry.pendingNext ? { pendingNext: prevEntry.pendingNext } : {})
+      };
+
+      if (freshPair) {
+        const oldPending = prevEntry.pendingNext || {};
+        const replacesPrompts = [];
+        for (const p of [
+          practicedPrompt,
+          oldPending.replacesPrompt || '',
+          ...(Array.isArray(oldPending.replacesPrompts) ? oldPending.replacesPrompts : [])
+        ]) {
+          const cleanP = String(p || '').trim();
+          if (
+            cleanP &&
+            cleanP !== freshPair.english_prompt &&
+            !replacesPrompts.includes(cleanP) &&
+            replacesPrompts.length < 10
+          ) {
+            replacesPrompts.push(cleanP);
+          }
+        }
+        nextEntry.pendingNext = {
+          english_prompt: freshPair.english_prompt,
+          mandarin_sentence: freshPair.mandarin_sentence,
+          common_synonyms: freshPair.common_synonyms || '',
+          replacesPrompt: practicedPrompt,
+          replacesPrompts,
+          updatedAt: Date.now()
+        };
+
+        // Also update the word object in memory if it appears again later
+        const idx = this.batch.findIndex((w) => w && (w.id === word.id || w.traditional === word.traditional));
+        if (idx !== -1 && idx !== this.currentIndex) {
+          this.batch[idx] = Object.assign({}, this.batch[idx], {
+            english_prompt: freshPair.english_prompt,
+            mandarin_sentence: freshPair.mandarin_sentence,
+            sample_mandarin: freshPair.mandarin_sentence,
+            ...(freshPair.common_synonyms ? { common_synonyms: freshPair.common_synonyms } : {})
+          });
+        }
+      }
+
+      cache[cacheKey] = nextEntry;
+      this._writeWordSentenceCache(cache);
     }
 
     const gasUrl = (localStorage.getItem(STORAGE_KEYS.GAS_URL) || '').trim();
@@ -1512,9 +1761,16 @@ ${dialogueText}`;
         {
           word_id: word.id,
           traditional: word.traditional,
-          english_prompt: word.english_prompt,
-          mandarin_sentence: word.mandarin_sentence || word.sample_mandarin || '',
-          telemetry: finalTelemetry
+          english_prompt: practicedPrompt,
+          mandarin_sentence: practicedMandarin,
+          telemetry: finalTelemetry,
+          ...(freshPair
+            ? {
+                next_english_prompt: freshPair.english_prompt,
+                next_mandarin_sentence: freshPair.mandarin_sentence,
+                next_common_synonyms: freshPair.common_synonyms || ''
+              }
+            : {})
         },
         { silentOkLog: true }
       )
